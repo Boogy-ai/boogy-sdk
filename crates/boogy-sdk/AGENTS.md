@@ -454,6 +454,8 @@ violations surface as `ConstraintViolation`.
 |---|---|
 | `Result<_, StoreError>` (the typed helpers: `get_row`, `find_all_rows`, `find_row_by`, `find_rows`, `find_rows_by`) | Use bare `?` — the `From<StoreError> for ApiError` conversion preserves the semantic class (404 / 409 / 500). |
 | `Result<_, store::StoreError>` (raw WIT calls: `store::insert`, `store::update`, `store::delete`, plus everything on the `Transaction` resource) | The host carries a typed `store-error` variant; bare `?` into an `ApiError`-returning handler preserves the semantic class (quota → 507, conflict → 409, …) via the macro-emitted `From<store::StoreError> for ApiError`. `.map_err(ApiError::internal)` still works (flattens to 500) if you want that. Inside a tx closure the error type is `String`; bare `?` lifts WIT errors to it lossily. |
+| `Result<_, PeerError>` (`peer_fetch`) | Bare `?` — `From<PeerError> for ApiError` lifts a dependency failure (`TargetNotFound`/`Denied`/`Timeout`/`DepthExceeded`/`Internal`) to **502 `/errors/upstream`**, and a *this-service* misconfig (`CapabilityDenied`/`InvalidTarget`) to **500**. Match the variant before `?` if you want a different status (e.g. treat the callee's 404 as your own resource's 404). |
+| `Result<_, serde_json::Error>` (`PeerRequest::body_json`, `resp.json()`, `serde_json::to_*` on bodies you construct) | Bare `?` — `From<serde_json::Error> for ApiError` lifts to **500** (framing failure: a body the service itself built/parsed). Client-supplied bodies should go through `parse_body`/`validate_body` instead, which map malformed input to 400/422. |
 
 Use `match` on `StoreError` variants when you need to react — e.g. retrying
 on a unique-index collision for collision-prone slug generation. Convert the
@@ -788,7 +790,11 @@ let resp = peer_fetch("boogy://alice/services/notes-api", &PeerRequest::get("/ap
 let notes: Vec<Note> = resp.json()?;
 ```
 
-Requires `peer = true` in the manifest's `[capabilities]`. Manifest
+Both `?`s are infallible-to-write: `From<PeerError> for ApiError` lifts a
+failed call to **502 upstream** (misconfig → 500), and `From<serde_json::Error>
+for ApiError` lifts `body_json`/`resp.json()` to **500**. No `.map_err`
+boilerplate at the call site; match the variant first only if you want a
+non-default status. Requires `peer = true` in the manifest's `[capabilities]`. Manifest
 `[ingress.delegation]` controls on-behalf-of (OBO) flow when one service
 calls another carrying an end-user identity.
 

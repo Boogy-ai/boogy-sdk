@@ -369,6 +369,50 @@ impl From<RpcError> for ApiError {
     }
 }
 
+/// Lift a cross-service call failure into an `ApiError`. This impl
+/// exists so handlers returning `Result<_, ApiError>` can use `?`
+/// directly on `peer_fetch` / `PeerRequest::body_json` chains instead
+/// of `.map_err` boilerplate at every call site.
+///
+/// Mapping: failures of the *dependency* (not found, denied by its
+/// ingress policy, timeout, depth, its internal error) surface as
+/// **502** `/errors/upstream` — the caller's request failed because an
+/// upstream service did. Failures that mean *this* service is
+/// misconfigured (peer capability not granted, malformed target URI)
+/// surface as **500** internal. Handlers that want a different status
+/// for a specific variant should still match on it explicitly before
+/// `?` (e.g. treat `TargetNotFound` as a 404 of their own resource).
+impl From<crate::peer::PeerError> for ApiError {
+    fn from(e: crate::peer::PeerError) -> Self {
+        use crate::peer::PeerError as P;
+        match e {
+            P::CapabilityDenied | P::InvalidTarget(_) => ApiError::internal(e.to_string()),
+            P::TargetNotFound(_)
+            | P::Denied(_)
+            | P::Timeout(_)
+            | P::DepthExceeded
+            | P::Internal(_) => ApiError {
+                kind: "/errors/upstream".to_string(),
+                title: "Upstream error".to_string(),
+                status: 502,
+                detail: Some(e.to_string()),
+                errors: Default::default(),
+            },
+        }
+    }
+}
+
+/// Lift a serde_json failure into an `ApiError::internal`. Serializing
+/// a request/response body the service itself constructed is a framing
+/// failure, not a domain error — same rationale as `From<String>`.
+/// (Client-supplied bodies go through `parse_body`/`validate_body`,
+/// which map malformed input to 400/422 instead.)
+impl From<serde_json::Error> for ApiError {
+    fn from(e: serde_json::Error) -> Self {
+        ApiError::internal(format!("json: {e}"))
+    }
+}
+
 /// Parse + validate a JSON body in one call.
 ///
 /// Returns the parsed `T` on success. On failure returns a structured
@@ -422,6 +466,51 @@ where
 
 #[cfg(test)]
 mod tests {
+    // ── From<PeerError> / From<serde_json::Error> regression tests ──
+    // (added with the impls: handlers must be able to `?` peer calls
+    //  and body construction; see the skills/AGENTS taught patterns)
+
+    #[test]
+    fn peer_error_dependency_failures_map_to_502_upstream() {
+        use crate::peer::PeerError as P;
+        for e in [
+            P::TargetNotFound("x".into()),
+            P::Denied("x".into()),
+            P::Timeout("x".into()),
+            P::DepthExceeded,
+            P::Internal("x".into()),
+        ] {
+            let a: super::ApiError = e.into();
+            assert_eq!(a.status, 502);
+            assert_eq!(a.kind, "/errors/upstream");
+        }
+    }
+
+    #[test]
+    fn peer_error_misconfig_maps_to_500_internal() {
+        use crate::peer::PeerError as P;
+        for e in [P::CapabilityDenied, P::InvalidTarget("x".into())] {
+            let a: super::ApiError = e.into();
+            assert_eq!(a.status, 500);
+        }
+    }
+
+    #[test]
+    fn question_mark_compiles_for_peer_and_json_errors() {
+        // The whole point: `?` lifts both error types in an
+        // ApiError-returning handler body.
+        fn handler_shaped() -> Result<(), super::ApiError> {
+            let _v = serde_json::to_value(42)?; // serde_json::Error → ApiError
+            let r: Result<(), crate::peer::PeerError> =
+                Err(crate::peer::PeerError::Timeout("t".into()));
+            r?;
+            Ok(())
+        }
+        let err = handler_shaped().unwrap_err();
+        assert_eq!(err.status, 502);
+    }
+
+
     use super::*;
 
     #[test]
