@@ -7,7 +7,7 @@ package boogy:platform@0.1.0;
 //
 // The complementary caller-side interface (`background-jobs`) — which
 // wasm components import to enqueue jobs from their HTTP handlers —
-// is added in slice 3 alongside the SDK's `jobs::enqueue` helper.
+// pairs with the SDK's `jobs::enqueue` helper.
 //
 // See `docs/background-jobs-design.md` (WIT surface section) for the
 // full design rationale.

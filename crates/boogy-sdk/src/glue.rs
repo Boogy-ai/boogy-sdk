@@ -1635,7 +1635,7 @@ macro_rules! wit_glue {
         // made idempotent by the framework — authors should write naturally
         // idempotent backfills (e.g. update_where that sets a value to a
         // known constant). The runner already wraps each migration in one
-        // FDB tx, so backfills are atomic with the schema changes; no
+        // store tx, so backfills are atomic with the schema changes; no
         // additional tx wrapping is needed or meaningful.
 
         /// Context passed to each migration's `up` closure. Provides
@@ -1651,7 +1651,7 @@ macro_rules! wit_glue {
         /// re-run and will pick up where it left off.
         ///
         /// Data backfills run inside the migration's transaction (the runner wraps
-        /// each migration in one FDB tx), so they are already atomic with the schema
+        /// each migration in one store tx), so they are already atomic with the schema
         /// changes and the version-row write. Authors should still prefer naturally
         /// idempotent backfills (e.g. `update_where` to a fixed default) so a
         /// migration is safe to re-run after a transient commit conflict.
@@ -1836,14 +1836,14 @@ macro_rules! wit_glue {
 
             /// Run a closure as a grouped step within the migration's transaction.
             ///
-            /// The entire migration already runs as ONE atomic FDB transaction (the
+            /// The entire migration already runs as ONE atomic store transaction (the
             /// `migrations()` runner opens it), so this is purely a structural grouping
             /// helper: the closure's writes join the migration tx and commit/roll back
             /// with it.
             ///
             /// Do NOT call `begin`/`commit`/`rollback` inside a migration: the host has
             /// no nested transactions, so an inner `commit_transaction` commits the
-            /// partial migration state as a finished FDB tx, after which further writes
+            /// partial migration state as a finished store tx, after which further writes
             /// start a NEW tx the runner never commits — breaking migration atomicity.
             ///
             /// If the closure returns `Err`, the error propagates and the runner rolls
@@ -1889,11 +1889,11 @@ macro_rules! wit_glue {
         ///
         /// Maintains a per-service `__boogy_schema_version` table that
         /// records which migrations have run. For each pending migration
-        /// (version > max applied), the entire migration runs as one FDB
+        /// (version > max applied), the entire migration runs as one store
         /// transaction: schema DDL + backfill + version-row insert commit or
-        /// roll back together. FDB-only — `begin_transaction` returns
-        /// `unsupported` on other engines (→ `Err`); bounded by the FDB
-        /// ~5 s / 10 MB transaction envelope.
+        /// roll back together. If the store signals the operation is
+        /// unavailable, `begin_transaction` returns `unsupported` (→ `Err`);
+        /// bounded by the store's ~5 s / 10 MB transaction envelope.
         ///
         /// # Re-run safety
         ///
@@ -1908,7 +1908,7 @@ macro_rules! wit_glue {
         /// Data backfills authored in the `up` fn should be idempotent
         /// (e.g. `ctx.update_where(...)` setting a column to a fixed default
         /// is naturally idempotent) — they already run inside the migration's
-        /// FDB transaction and are atomic with the schema changes.
+        /// store transaction and are atomic with the schema changes.
         ///
         /// # Concurrency note
         ///
@@ -1984,10 +1984,10 @@ macro_rules! wit_glue {
                 if m.version <= max_applied {
                     continue;
                 }
-                // Each migration is ONE atomic FDB transaction: schema DDL +
+                // Each migration is ONE atomic store transaction: schema DDL +
                 // backfill + the version row commit or roll back together.
-                // Requires the FDB engine — begin_transaction surfaces
-                // `unsupported` on other engines. Bounded by the FDB ~5 s /
+                // If the store can't open a transaction, begin_transaction
+                // surfaces `unsupported`. Bounded by the store's ~5 s /
                 // 10 MB transaction envelope.
                 $bindings::boogy::platform::store::begin_transaction()
                     .map_err(::std::string::String::from)?;
@@ -2027,15 +2027,15 @@ macro_rules! wit_glue {
 
         /// Run a closure inside a database transaction. All `store::*` calls made while
         /// the closure runs — locally AND across any `peer::fetch` — join one atomic
-        /// FDB transaction. On `Ok` the transaction commits; on `Err` it rolls back.
+        /// store transaction. On `Ok` the transaction commits; on `Err` it rolls back.
         /// If the closure panics, the unwinding request is torn down by the host, which
         /// discards the open transaction (it is never committed). `outbound_http` and
         /// `background_jobs` are denied inside the closure (they surface as their
         /// capability/backend errors — peer/outbound calls return a capability-denied
         /// error and job enqueue/cancel return backend-unavailable — because the host
-        /// refuses them while a transaction is open). Requires the FDB engine; other
-        /// engines return the typed `unsupported` store error (→ HTTP 501 once it lifts
-        /// into `ApiError`). Must run as the transaction owner: calling `tx` from a
+        /// refuses them while a transaction is open). If the store can't open a
+        /// transaction it returns the typed `unsupported` store error (→ HTTP 501 once it
+        /// lifts into `ApiError`). Must run as the transaction owner: calling `tx` from a
         /// handler already enrolled as a peer participant of a caller's transaction
         /// fails at commit (only the originating request commits).
         ///
@@ -2051,7 +2051,7 @@ macro_rules! wit_glue {
         /// survives; variant flattens).
         ///
         /// `begin`/`commit` errors are mapped through `E::from(store_error)` as well, so
-        /// a commit `Conflict` (FDB serialization abort) or a non-FDB `Unsupported`
+        /// a commit `Conflict` (store serialization abort) or an `Unsupported`
         /// reaches the client as 409 / 501 when `E = ApiError`. A handler returning
         /// `Result<_, ApiError>` writes `tx(|| ...)?` and the existing
         /// `From<store::StoreError> for ApiError` maps the variant to the correct status

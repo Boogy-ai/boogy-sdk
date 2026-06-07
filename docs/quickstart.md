@@ -233,3 +233,6 @@ boogy remove <owner-user-id> <service-id>
 - **Handler reference**: [`../crates/boogy-sdk/AGENTS.md`](../crates/boogy-sdk/AGENTS.md) — the canonical guide for writing handlers, guards, store access, auth patterns, MCP tools, and more. Feed this to your coding agent before writing service code.
 - **Manifest reference**: [`manifest.md`](manifest.md) — every manifest field, all ingress modes, outbound HTTP policy, secrets, background jobs, and common errors.
 - **`smoke/` template**: [`../smoke/`](../smoke/) in this repo — the working template this quickstart is based on.
+- Install the Boogy agent skills (`boogy skills install`) — guided
+  workflows for service design, data modeling, auth, jobs, and more:
+  https://github.com/Boogy-ai/boogy-superpowers

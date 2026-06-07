@@ -30,7 +30,7 @@
 //! ## Storage
 //!
 //! All keys for a given service live in `__boogy_api_keys` inside the
-//! service's own per-service store (FoundationDB) — same isolation model
+//! service's own per-service store — same isolation model
 //! as user tables.
 //! The table prefix is reserved (`__boogy_*`) so collisions are
 //! impossible without explicit user intent.

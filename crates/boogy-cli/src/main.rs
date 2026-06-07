@@ -2,6 +2,7 @@ mod build;
 mod deploy;
 mod manage;
 mod provision;
+mod skills;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -68,6 +69,28 @@ enum Commands {
         /// Service ID to remove
         service_id: String,
     },
+    /// Vendor the Boogy skills into this project (.claude/skills/boogy)
+    /// so coding agents pick them up automatically
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillsAction {
+    /// Install the skills into the current project
+    Install {
+        /// Destination directory (default: .claude/skills/boogy)
+        #[arg(long)]
+        dest: Option<String>,
+    },
+    /// Refresh a previously installed copy
+    Update {
+        /// Destination directory (default: .claude/skills/boogy)
+        #[arg(long)]
+        dest: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -114,6 +137,10 @@ async fn main() -> anyhow::Result<()> {
             let token = resolve_token(&cli.token)?;
             manage::remove(&cli.host, &token, &owner, &service_id).await?
         }
+        Commands::Skills { action } => match action {
+            SkillsAction::Install { dest } => skills::run(dest.as_deref(), "installed")?,
+            SkillsAction::Update { dest } => skills::run(dest.as_deref(), "updated")?,
+        },
     }
 
     Ok(())

@@ -1,6 +1,6 @@
 //! Boogy SDK — building blocks for hand-written and generated APIs.
 //!
-//! See [README](https://github.com/Gelotto/boogy/tree/main/crates/boogy-sdk)
+//! See [README](https://github.com/Boogy-ai/boogy-sdk/tree/main/crates/boogy-sdk)
 //! for the full authoring guide. The short version:
 //!
 //! ```ignore

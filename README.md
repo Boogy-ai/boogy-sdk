@@ -45,8 +45,12 @@ from your SDK version.
 
 ## For coding agents
 
-`crates/boogy-sdk/AGENTS.md` is the canonical handler-authoring
-reference — feed it to your agent before writing service code.
+Install the Boogy skills into your project so your agent builds with
+expert workflows: `boogy skills install` (vendors
+[boogy-superpowers](https://github.com/Boogy-ai/boogy-superpowers) into
+`.claude/skills/boogy/` — auto-discovered by Claude Code, readable by any
+agent). `crates/boogy-sdk/AGENTS.md` remains the canonical handler-authoring
+reference.
 
 ## License
 

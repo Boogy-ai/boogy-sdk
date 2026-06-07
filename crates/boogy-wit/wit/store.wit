@@ -258,8 +258,8 @@ interface store {
     // SAME transaction. `commit-transaction` commits it (owner only); a failed
     // participant poisons the tx and commit then errors. `rollback-transaction`
     // (or dropping the request) discards it. `outbound-http` and
-    // `background-jobs` are denied while a transaction is open. Cross-service
-    // transactions require the FDB engine; other engines return `unsupported`.
+    // `background-jobs` are denied while a transaction is open. If the store
+    // can't open a transaction it returns `unsupported`.
     begin-transaction:    func() -> result<_, store-error>;
     commit-transaction:   func() -> result<_, store-error>;
     rollback-transaction: func() -> result<_, store-error>;

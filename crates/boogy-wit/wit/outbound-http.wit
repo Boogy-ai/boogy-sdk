@@ -4,9 +4,9 @@ package boogy:platform@0.1.0;
 ///
 /// Every call is mediated by the host: capability gate, egress
 /// allowlist, SSRF firewall (RFC1918 / loopback / link-local
-/// default-deny), body-size + timeout caps, secret injection (slice 2;
-/// slice 1 returns `unknown-secret` for any non-empty
-/// `secret-headers`), telemetry. See
+/// default-deny), body-size + timeout caps, secret injection (not yet
+/// active; any non-empty `secret-headers` returns `unknown-secret`),
+/// telemetry. See
 /// [`docs/outbound-http-design.md`](../../../docs/outbound-http-design.md)
 /// and [`docs/data-protection.md`](../../../docs/data-protection.md).
 ///
@@ -45,9 +45,9 @@ interface outbound-http {
         /// `(header-name, secret-ref)` where `secret-ref` is the
         /// name declared in the manifest's `[secrets]` block.
         ///
-        /// Slice 1 status: any non-empty entry returns
-        /// `unknown-secret(<ref>)` — the storage backend lands in
-        /// slice 2.
+        /// Not yet active: any non-empty entry returns
+        /// `unknown-secret(<ref>)` until the secret storage backend
+        /// is wired up.
         secret-headers: list<tuple<string, string>>,
     }
 
@@ -97,9 +97,9 @@ interface outbound-http {
         request-too-large(string),
         /// Caller referenced a secret name not declared in the
         /// manifest's `[secrets]` block, or the named secret has no
-        /// value bound for this deployment. (In slice 1, ANY
-        /// non-empty `secret-headers` returns this — the storage
-        /// backend lands in slice 2.)
+        /// value bound for this deployment. (Currently ANY
+        /// non-empty `secret-headers` returns this — the secret
+        /// storage backend is not yet wired up.)
         unknown-secret(string),
         /// Internal host error (TLS error not covered above, panic,
         /// pool exhausted, etc.). String for human consumption only.
