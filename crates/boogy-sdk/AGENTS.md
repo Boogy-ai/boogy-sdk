@@ -600,9 +600,10 @@ request (the owner)** commits. Any participant failure **poisons** the
 transaction so commit refuses — rollback only. The whole call tree shares
 one 5s / 10MB store transaction envelope.
 
-**Denied inside a tx:** `outbound_http` and `background_jobs`
-(enqueue/cancel) are refused while a transaction is open (they surface as
-their capability/backend errors).
+**Denied inside a tx:** `outbound_http` and `background_jobs` cancel/status
+are refused while a transaction is open (they surface as their
+capability/backend errors). `background_jobs` enqueue is allowed inside a
+transaction — the job is submitted only if the transaction commits.
 
 The built-in engine is the sole per-service store engine, so `tx` is always
 available.

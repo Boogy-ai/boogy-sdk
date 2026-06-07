@@ -257,8 +257,10 @@ interface store {
     // and any `peer::fetch` call enrolls the callee's whole subtree into the
     // SAME transaction. `commit-transaction` commits it (owner only); a failed
     // participant poisons the tx and commit then errors. `rollback-transaction`
-    // (or dropping the request) discards it. `outbound-http` and
-    // `background-jobs` are denied while a transaction is open. If the store
+    // (or dropping the request) discards it. `outbound-http` is denied while
+    // a transaction is open. For `background-jobs`: `enqueue` is allowed —
+    // the job is staged and submitted only if the transaction commits — but
+    // `cancel` and `status` are denied inside a transaction. If the store
     // can't open a transaction it returns `unsupported`.
     begin-transaction:    func() -> result<_, store-error>;
     commit-transaction:   func() -> result<_, store-error>;

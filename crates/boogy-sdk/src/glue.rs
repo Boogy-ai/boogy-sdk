@@ -2029,13 +2029,14 @@ macro_rules! wit_glue {
         /// the closure runs — locally AND across any `peer::fetch` — join one atomic
         /// store transaction. On `Ok` the transaction commits; on `Err` it rolls back.
         /// If the closure panics, the unwinding request is torn down by the host, which
-        /// discards the open transaction (it is never committed). `outbound_http` and
-        /// `background_jobs` are denied inside the closure (they surface as their
-        /// capability/backend errors — peer/outbound calls return a capability-denied
-        /// error and job enqueue/cancel return backend-unavailable — because the host
-        /// refuses them while a transaction is open). If the store can't open a
-        /// transaction it returns the typed `unsupported` store error (→ HTTP 501 once it
-        /// lifts into `ApiError`). Must run as the transaction owner: calling `tx` from a
+        /// discards the open transaction (it is never committed). `outbound_http` is
+        /// denied inside the closure (peer/outbound calls return a capability-denied
+        /// error). For `background_jobs`: `enqueue` is allowed inside a transaction —
+        /// the job is submitted only if the transaction commits — but `cancel` and
+        /// `status` are unavailable inside a transaction (they return
+        /// backend-unavailable). If the store can't open a transaction it returns the
+        /// typed `unsupported` store error (→ HTTP 501 once it lifts into `ApiError`).
+        /// Must run as the transaction owner: calling `tx` from a
         /// handler already enrolled as a peer participant of a caller's transaction
         /// fails at commit (only the originating request commits).
         ///
