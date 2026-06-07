@@ -1,0 +1,39 @@
+package boogy:platform@0.1.0;
+
+interface auth {
+    /// The caller's resolved identity.
+    ///
+    /// `principal` is opaque to wasm and may be either:
+    /// - `agent_<uuid>` — a human or AI agent acting in their own
+    ///   right.
+    /// - `boogy://<owner>/<api>` — a workload calling on its
+    ///   own behalf (cross-API peer call with no agent context).
+    ///
+    /// Discriminate by prefix when the distinction matters.
+    /// Resource authorization typically keys off `principal` regardless.
+    ///
+    /// `actor` is set only on delegated (on-behalf-of) calls. It
+    /// names the calling workload that's acting on behalf of the
+    /// principal. When `actor` is `none`, the principal is also the
+    /// caller; when `some`, an upstream workload is delivering the
+    /// request and the resource's data still belongs to the
+    /// `principal`. Delegation-aware policy keys off `actor`;
+    /// host-minted on-behalf-of tokens populate this field.
+    ///
+    /// `scopes` carry whatever grants the issuer attached to the
+    /// session. On PASETO-backed sessions this is the token's
+    /// `scope` claim — intersected at each delegation hop.
+    record identity {
+        principal: string,
+        actor: option<string>,
+        scopes: list<string>,
+    }
+
+    /// Returns the caller's identity if any was resolved by the
+    /// host. `none` means the request is anonymous.
+    current-identity: func() -> option<identity>;
+
+    /// Convenience: returns true iff the caller's session carries
+    /// `scope` in its grant set.
+    has-scope: func(scope: string) -> bool;
+}

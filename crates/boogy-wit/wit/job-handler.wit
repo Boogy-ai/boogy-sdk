@@ -1,0 +1,56 @@
+package boogy:platform@0.1.0;
+
+// Background-job handler export. Implemented by wasm components that
+// declare handlers in their manifest's `[background_jobs.handlers.*]`
+// blocks. The worker (`boogy-jobworker`) calls `handle-job` once
+// per claimed job after instantiation + identity replay.
+//
+// The complementary caller-side interface (`background-jobs`) — which
+// wasm components import to enqueue jobs from their HTTP handlers —
+// is added in slice 3 alongside the SDK's `jobs::enqueue` helper.
+//
+// See `docs/background-jobs-design.md` (WIT surface section) for the
+// full design rationale.
+
+interface job-handler {
+    // Per-invocation context the worker passes alongside the payload.
+    // Stays minimal — anything the handler needs about *its own*
+    // identity (current_principal, scopes) flows through the existing
+    // `auth` capability with the replayed Identity injected by the
+    // worker.
+    record job-context {
+        // Stable across retries of the same logical job. Threaded
+        // into upstream `Idempotency-Key` headers when the handler
+        // makes non-idempotent external calls (Pattern B in the
+        // design doc's Storage and outgoing I/O section).
+        job-id: string,
+        // The handler name from `[background_jobs.handlers.<name>]`.
+        // Useful when a wasm component implements multiple handlers
+        // and wants a single entrypoint that dispatches by name.
+        handler: string,
+        // 1-based count: 1 on first attempt, 2 on first retry, etc.
+        attempts: u32,
+        // Unix timestamp (seconds) of the job's not_before. Lets a
+        // handler short-circuit ("this is too stale, skip the
+        // upstream call") if relevant.
+        not-before-unix-s: u64,
+    }
+
+    // Failure shape returned by the handler. Distinguishes retryable
+    // from terminal so the worker can map cleanly onto
+    // `complete_retry` vs `complete_terminal` in jobs-core.
+    variant handler-error {
+        // Soft-fail: the worker increments attempts and re-queues
+        // with backoff (or DLQs once max-attempts is reached).
+        retry(string),
+        // Hard-fail: the worker sends the job straight to dead_letter
+        // without further retries.
+        terminal(string),
+    }
+
+    // The dispatch entry point. The wasm trap path (panic, OOM,
+    // epoch deadline exceeded) is treated like `retry` with
+    // `last_error_kind = handler_trap` and counted against
+    // max_attempts.
+    handle-job: func(ctx: job-context, payload: list<u8>) -> result<list<u8>, handler-error>;
+}

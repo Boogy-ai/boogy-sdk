@@ -1,0 +1,22 @@
+[package]
+name = "boogy-sdk-macros"
+version = "0.1.0"
+edition = "2021"
+description = "Procedural macros for boogy-sdk (the #[derive(Model)] derive, and future SDK macros)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Boogy-ai/boogy-sdk"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[dev-dependencies]
+# Dev-dependency cycle (allowed by Cargo): the derive's integration
+# tests need the Model/Field traits + Id/Decimal/Timestamp from boogy-sdk.
+boogy-sdk = { path = "../boogy-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

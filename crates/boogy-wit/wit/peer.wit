@@ -1,0 +1,64 @@
+package boogy:platform@0.1.0;
+
+/// Cross-API HTTP-style fetch.
+///
+/// The host mediates each call: it identifies the caller component,
+/// constructs a synthetic request bearing the caller's workload
+/// identity, and dispatches to the target API through the same
+/// routing pipeline external HTTP requests use. Targets see the
+/// caller as `Principal::Workload { uri: "boogy://<owner>/<api>" }`
+/// in their auth capability.
+///
+/// Dispatch is in-process — there is no localhost HTTP roundtrip and
+/// no port binding involved. As a consequence:
+/// - The caller cannot forge a different workload identity; the host
+///   sets it from the running component's manifest.
+/// - The target's ingress policy is enforced before the call reaches
+///   the wasm handler. A target with `mode = "allowlist"` (agent
+///   allowlist) will reject internal callers; `internal` mode gates
+///   explicitly on workload origins (lands separately).
+interface peer {
+    /// Outbound HTTP-style request. Distinct from
+    /// `http-handler.http-request` (which carries inbound-only
+    /// fields like path-params) so the cross-interface type-sharing
+    /// stays narrow.
+    record peer-request {
+        method: string,
+        path: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+
+    record peer-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+
+    /// Errors a fetch can fail with. The `string` payload is for
+    /// human consumption only — programmatic discrimination should
+    /// use the variant.
+    variant fetch-error {
+        /// `target` did not parse as `boogy://<owner>/<api>`.
+        invalid-target(string),
+        /// No deployed API matches the target workload URI.
+        target-not-found(string),
+        /// The target's ingress policy denied the call.
+        denied(string),
+        /// Per-call timeout elapsed without a response.
+        timeout(string),
+        /// Recursion depth limit exceeded — A → B → … → A.
+        depth-exceeded,
+        /// Caller's manifest does not grant the `peer` capability.
+        capability-denied,
+        /// Internal error (target panicked, store unavailable, etc.).
+        internal(string),
+    }
+
+    /// Make a request to another Boogy API.
+    ///
+    /// `target` is a workload URI: `boogy://<owner>/<api-id>`.
+    /// `request.path` is interpreted relative to the target's
+    /// configured base path — leading `/` allowed.
+    fetch: func(target: string, request: peer-request) -> result<peer-response, fetch-error>;
+}

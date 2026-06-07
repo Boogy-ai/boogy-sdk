@@ -1,0 +1,22 @@
+[package]
+name = "smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal Boogy service — the consumer-path template and regression test for this workspace."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+boogy-sdk = { path = "../crates/boogy-sdk" }
+wit-bindgen = { workspace = true }
+serde = { workspace = true }
+# Required: wit_glue! uses ::serde_json absolute paths that resolve in
+# the caller's crate scope, so every service crate must depend on it.
+serde_json = { workspace = true }
+
+[build-dependencies]
+# Build-dep so build.rs can locate the WIT files matching this exact
+# SDK revision. External consumers use the same pattern with a git dep.
+boogy-wit = { path = "../crates/boogy-wit" }

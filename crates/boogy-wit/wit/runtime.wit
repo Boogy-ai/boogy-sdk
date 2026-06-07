@@ -1,0 +1,7 @@
+package boogy:platform@0.1.0;
+
+interface runtime {
+    now-millis: func() -> u64;
+    random-bytes: func(len: u32) -> list<u8>;
+    log: func(level: string, message: string);
+}

@@ -1,0 +1,39 @@
+package boogy:platform@0.1.0;
+
+// Default world — HTTP-only APIs. Existing components target this.
+// All worlds import the same capabilities including `background-jobs`
+// — any API can enqueue jobs (caller side); only some implement
+// handlers (callee side, see `api-with-jobs` below).
+world service {
+    export http-handler;
+
+    import store;
+    import auth;
+    import runtime;
+    import peer;
+    import outbound-http;
+    import background-jobs;
+    import vector;
+}
+
+// Superset world for APIs that also process background jobs. Targets
+// this world by setting `world: "api-with-jobs"` in their wit_bindgen
+// macro. Imports are identical — same host capabilities. The only
+// difference is the additional `job-handler` export, which the
+// `boogy-jobworker` binary calls per claimed job.
+//
+// Components that don't declare any `[background_jobs.handlers.*]`
+// blocks in their manifest stay on the `api` world; the worker won't
+// dispatch to them since their handler registry is empty.
+world service-with-jobs {
+    export http-handler;
+    export job-handler;
+
+    import store;
+    import auth;
+    import runtime;
+    import peer;
+    import outbound-http;
+    import background-jobs;
+    import vector;
+}

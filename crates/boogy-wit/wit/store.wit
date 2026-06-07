@@ -1,0 +1,292 @@
+package boogy:platform@0.1.0;
+
+interface store {
+    // -- Typed values --
+    variant value {
+        null,
+        text(string),
+        integer(s64),
+        real(f64),
+        blob(list<u8>),
+        boolean(bool),
+    }
+
+    /// Errors a store operation can fail with. The `string` payload is
+    /// for human consumption only — programmatic discrimination should
+    /// use the variant arm. Mirrors peer.wit's `fetch-error`.
+    variant store-error {
+        quota-exceeded(string),
+        not-found(string),
+        conflict(string),
+        constraint-violation(string),
+        invalid-argument(string),
+        unsupported(string),
+        timeout(string),
+        version-mismatch(string),
+        /// Transient: too many concurrent transactions; retry later. → HTTP 503.
+        resource-exhausted(string),
+        internal(string),
+    }
+
+    record column {
+        name: string,
+        val: value,
+    }
+
+    record row {
+        columns: list<column>,
+    }
+
+    // One row's update in a batch `update-many`: the primary key + the columns to set.
+    record row-update {
+        id: u64,
+        columns: list<column>,
+    }
+
+    // -- Filtering --
+    enum filter-op {
+        eq,
+        neq,
+        gt,
+        gte,
+        lt,
+        lte,
+        like,
+        not-like,
+        is-null,
+        is-not-null,
+        in,
+    }
+
+    record filter {
+        column: string,
+        op: filter-op,
+        val: value,
+        /// Only used when op == in. Contains the set of values to match against.
+        in-values: option<list<value>>,
+    }
+
+    // -- Sorting & Pagination --
+    enum sort-dir { asc, desc }
+
+    record sort-by {
+        column: string,
+        dir: sort-dir,
+    }
+
+    record page {
+        limit: u32,
+        offset: u32,
+    }
+
+    record find-options {
+        filters: list<filter>,
+        sort: list<sort-by>,
+        page: option<page>,
+        /// OR-of-AND clause layered on top of `filters`. A row matches when
+        /// ALL(filters) AND (or-groups is empty OR ANY(group: ALL(group))).
+        /// Empty `or-groups` (the default) is exactly the filters-only
+        /// behavior — fully backward compatible.
+        or-groups: list<list<filter>>,
+        /// Explicit opt-in to permit a full table scan for this query,
+        /// suppressing the strict-mode full-scan guardrail. Defaults to
+        /// `false`. No behavioral effect yet — a later task consumes it.
+        allow-full-scan: bool,
+        /// Skip computing `total-count` (the host returns 0). Set by callers
+        /// that discard the total — keyset/`fetch-page`, `fetch-all`,
+        /// `fetch-one` — so the host can avoid the count entirely on the
+        /// index-walk fast path, where it would otherwise be a separate count
+        /// over the table for a value nobody reads. Defaults to `false` (the
+        /// total is computed) — counts and total-bearing fetches leave it off.
+        skip-total: bool,
+    }
+
+    record find-result {
+        rows: list<row>,
+        total-count: u64,
+    }
+
+    // One independent query in a batch `find-many`: a table + the same
+    // find-options a single `find` takes.
+    record find-query {
+        table: string,
+        options: find-options,
+    }
+
+    // -- Schema management --
+    enum column-type { text, integer, real, blob, boolean }
+
+    enum cascade-action {
+        no-action,
+        restrict,
+        cascade,
+        set-null,
+    }
+
+    record foreign-key {
+        references-table: string,
+        references-column: string,
+        on-delete: cascade-action,
+        on-update: cascade-action,
+    }
+
+    record column-def {
+        name: string,
+        col-type: column-type,
+        nullable: bool,
+        unique: bool,
+        references: option<foreign-key>,
+        default: option<value>,
+    }
+
+    record column-info {
+        name: string,
+        col-type: column-type,
+        nullable: bool,
+    }
+
+    /// Lightweight per-table introspection. Counts are derived metadata;
+    /// callers who want full schema use list-columns / list-indexes.
+    record table-info {
+        name: string,
+        column-count: u32,
+        index-count: u32,
+    }
+
+    // Per-table encryption setting. An enum (not a bool) so future modes
+    // (e.g. app-held keys) extend without changing the signature.
+    //
+    // DORMANT: encrypted tables are on hold. `none` is the default and the only
+    // functional value; `enabled` is currently rejected by the host on every
+    // engine (no backend implements encryption). The option is kept wired so the
+    // feature can be revived without a WIT change. See
+    // docs/superpowers/specs/2026-05-26-encrypted-tables-design.md.
+    enum encryption-mode {
+        none,       // plaintext at rest (default; today's behavior) — functional
+        enabled,    // platform-managed encryption at rest — DORMANT, rejected today
+    }
+
+    // Options for create-table. A record so future options add fields,
+    // not parameters.
+    record create-table-options {
+        encryption: encryption-mode,
+    }
+
+    create-table: func(
+        table: string,
+        columns: list<column-def>,
+        options: create-table-options,
+    ) -> result<_, store-error>;
+    drop-table: func(table: string) -> result<_, store-error>;
+    list-tables: func() -> result<list<table-info>, store-error>;
+
+    record index-def {
+        name: string,
+        columns: list<string>,
+        unique: bool,
+        /// Covering index: the index entry stores a copy of the row payload, so
+        /// an index walk reads the row directly from the index (no separate
+        /// fetch). Trades write cost + storage for read speed on hot read paths.
+        /// Defaults to `false`.
+        covering: bool,
+    }
+
+    create-index: func(table: string, index: index-def) -> result<_, store-error>;
+    drop-index: func(table: string, name: string) -> result<_, store-error>;
+    list-indexes: func(table: string) -> result<list<index-def>, store-error>;
+
+    add-column: func(table: string, column: column-def) -> result<_, store-error>;
+    rename-column: func(table: string, old: string, new: string) -> result<_, store-error>;
+    drop-column: func(table: string, name: string) -> result<_, store-error>;
+    list-columns: func(table: string) -> result<list<column-info>, store-error>;
+
+    // -- Raw SQL (parameterized) --
+    execute: func(sql: string, params: list<value>) -> result<u64, store-error>;
+    query: func(sql: string, params: list<value>) -> result<list<row>, store-error>;
+
+    // -- Structured CRUD --
+    insert: func(table: string, data: list<column>) -> result<u64, store-error>;
+    insert-many: func(table: string, rows: list<list<column>>) -> result<list<u64>, store-error>;
+
+    get: func(table: string, id: u64) -> result<option<row>, store-error>;
+    // Batch get by primary key, pipelined host-side. One entry per id,
+    // positional; a missing row is none.
+    get-many: func(table: string, ids: list<u64>) -> result<list<option<row>>, store-error>;
+    find: func(table: string, options: find-options) -> result<find-result, store-error>;
+    // Batch of independent `find` queries (possibly different tables),
+    // pipelined host-side in autocommit; sequential inside an ambient tx.
+    // One find-result per query, positional.
+    find-many: func(queries: list<find-query>) -> result<list<find-result>, store-error>;
+    count: func(table: string, filters: list<filter>) -> result<u64, store-error>;
+
+    update: func(table: string, id: u64, fields: list<column>) -> result<bool, store-error>;
+    update-where: func(table: string, filters: list<filter>, fields: list<column>) -> result<u64, store-error>;
+    // Batch update/delete by primary key, pipelined host-side in one tx per
+    // chunk. Return = count of rows that existed and were affected.
+    update-many: func(table: string, updates: list<row-update>) -> result<u64, store-error>;
+    delete-many: func(table: string, ids: list<u64>) -> result<u64, store-error>;
+
+    // Atomic keyed counter: `counter += delta` (delta must be integer or
+    // real), upserting the row identified by the composite `key`. On first
+    // call the row is inserted with `counter = delta` and the `set` columns;
+    // on subsequent calls the counter is incremented and the `set` columns
+    // are overwritten. Requires a unique index on the `key` columns
+    // (the upsert conflict target). Returns the row id.
+    upsert-increment: func(table: string, key: list<column>, counter: string, delta: value, set: list<column>) -> result<u64, store-error>;
+
+    /// Atomic insert-or-update keyed on a unique index. If a row exists
+    /// whose `key` columns match (under a unique index that covers those
+    /// columns; column order in the index doesn't matter), update `set`
+    /// columns on it (key columns untouched unless `set` also lists them,
+    /// in which case `set` wins via field-merge). Otherwise insert a new
+    /// row with `key + set`. Returns the row id (existing or newly-
+    /// inserted).
+    ///
+    /// PRECONDITION: the `key` columns must correspond to an existing
+    /// unique index on the table. Otherwise the host errors with a
+    /// SchemaMismatch identifying the missing index.
+    upsert: func(table: string, key: list<column>, set: list<column>) -> result<u64, store-error>;
+
+    delete: func(table: string, id: u64) -> result<bool, store-error>;
+    delete-where: func(table: string, filters: list<filter>) -> result<u64, store-error>;
+
+    // -- Transactions --
+    //
+    // `begin-transaction` opens an ambient transaction bound to THIS request.
+    // While it is open, every store op below runs inside it (no per-op commit),
+    // and any `peer::fetch` call enrolls the callee's whole subtree into the
+    // SAME transaction. `commit-transaction` commits it (owner only); a failed
+    // participant poisons the tx and commit then errors. `rollback-transaction`
+    // (or dropping the request) discards it. `outbound-http` and
+    // `background-jobs` are denied while a transaction is open. Cross-service
+    // transactions require the FDB engine; other engines return `unsupported`.
+    begin-transaction:    func() -> result<_, store-error>;
+    commit-transaction:   func() -> result<_, store-error>;
+    rollback-transaction: func() -> result<_, store-error>;
+
+    // -- Bounded-memory streaming cursor --
+    //
+    // `open-cursor` returns a stateless `row-cursor` over `table`,
+    // applying `options.filters` + `options.or-groups` per row and
+    // walking in `order`. `options.sort` / `options.page` are ignored
+    // (the cursor's own `order` + `next-batch(max)` drive ordering and
+    // batching). `column = none` walks primary-key (`_id`) order; a
+    // `column` walks a keyset on `(column, _id)` over the secondary index
+    // of that name.
+    //
+    // `next-batch(max)` returns the next ≤`max` rows, strictly AFTER
+    // the previously-returned rows (exclusive resume), in `order`.
+    // Looping until it returns an empty list visits every matching row
+    // exactly once, in order, with no gaps or duplicates. An empty (or
+    // short) batch with no more rows means exhausted; subsequent calls
+    // keep returning empty.
+    record scan-order {
+        // none = primary-key (`_id`) order.
+        column: option<string>,
+        dir: sort-dir,
+    }
+    resource row-cursor {
+        next-batch: func(max: u32) -> result<list<row>, store-error>;
+    }
+    open-cursor: func(table: string, options: find-options, order: scan-order) -> result<row-cursor, store-error>;
+}

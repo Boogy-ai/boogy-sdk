@@ -1,0 +1,110 @@
+package boogy:platform@0.1.0;
+
+/// Outbound HTTP from a wasm API to an arbitrary URL.
+///
+/// Every call is mediated by the host: capability gate, egress
+/// allowlist, SSRF firewall (RFC1918 / loopback / link-local
+/// default-deny), body-size + timeout caps, secret injection (slice 2;
+/// slice 1 returns `unknown-secret` for any non-empty
+/// `secret-headers`), telemetry. See
+/// [`docs/outbound-http-design.md`](../../../docs/outbound-http-design.md)
+/// and [`docs/data-protection.md`](../../../docs/data-protection.md).
+///
+/// Distinct from `peer` so each capability surface can grow its own
+/// shape without coupling. Conceptually: peer is "fetch but to a
+/// Boogy workload"; outbound-http is "fetch but to any URL with
+/// host-mediated policy."
+interface outbound-http {
+    record outbound-request {
+        /// HTTP method. Validated against RFC 7230 token rules at
+        /// the host edge; invalid characters return
+        /// `internal("invalid method")`.
+        method: string,
+        /// Full URL including scheme. Only `http` and `https` are
+        /// accepted; other schemes return `invalid-url`. URL length
+        /// is hard-capped at 8 KiB.
+        url: string,
+        /// Headers to attach. Reserved headers (authorization,
+        /// cookie, x-boogy-caller, x-boogy-workload,
+        /// x-boogy-request-id, host) are stripped. Header names
+        /// and values are validated against HTTP token / value rules;
+        /// CRLF in either is rejected.
+        headers: list<tuple<string, string>>,
+        /// Optional request body. Capped at the manifest's
+        /// `max_request_bytes`; over-cap returns
+        /// `request-too-large`.
+        body: option<list<u8>>,
+        /// Per-call timeout in milliseconds. Capped by the manifest's
+        /// `max_timeout_ms`; values larger than that ceiling are
+        /// silently clamped to the ceiling. None → use manifest
+        /// `default_timeout_ms`.
+        timeout-ms: option<u32>,
+        /// Manifest-declared secret references to inject as headers
+        /// just before the request goes on the wire. The wasm
+        /// component never sees the secret value. Each tuple is
+        /// `(header-name, secret-ref)` where `secret-ref` is the
+        /// name declared in the manifest's `[secrets]` block.
+        ///
+        /// Slice 1 status: any non-empty entry returns
+        /// `unknown-secret(<ref>)` — the storage backend lands in
+        /// slice 2.
+        secret-headers: list<tuple<string, string>>,
+    }
+
+    record outbound-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+
+    /// Distinct from `peer.fetch-error` so each capability surface
+    /// can grow its own variants without coupling. 4xx / 5xx HTTP
+    /// statuses are NOT errors — they come back as
+    /// `Ok(outbound-response { status: 4xx, .. })`. This variant
+    /// covers transport-level outcomes only.
+    variant fetch-error {
+        /// Caller's manifest does not grant the `outbound_http`
+        /// capability.
+        capability-denied,
+        /// URL didn't parse as an absolute http(s) URL, or exceeded
+        /// the 8 KiB hard length cap.
+        invalid-url(string),
+        /// Manifest egress allowlist did not admit the host.
+        host-not-allowed(string),
+        /// Resolved IP fell into a blocked range (RFC1918, loopback,
+        /// link-local, multicast, ::1, fc00::/7, etc.) and the
+        /// manifest did not opt out of the SSRF firewall via
+        /// `[outbound.allow_loopback] enabled = true`.
+        blocked-address(string),
+        /// HTTPS-only enforcement: scheme was http:// without
+        /// `[outbound] allow_plaintext = true`.
+        plaintext-denied,
+        /// Per-call timeout elapsed without a complete response.
+        timeout(string),
+        /// DNS resolution failed.
+        dns(string),
+        /// TCP / TLS / handshake refused.
+        connection-refused(string),
+        /// Response body exceeded `[outbound] max_response_bytes`
+        /// before the stream completed.
+        response-too-large(string),
+        /// Per-API rate cap exceeded (manifest
+        /// `[outbound.rate_limit]`).
+        rate-limited,
+        /// Request body, header set, or URL exceeded the manifest's
+        /// `max_request_bytes` / hard URL length / hard header
+        /// total. The string identifies which limit was hit.
+        request-too-large(string),
+        /// Caller referenced a secret name not declared in the
+        /// manifest's `[secrets]` block, or the named secret has no
+        /// value bound for this deployment. (In slice 1, ANY
+        /// non-empty `secret-headers` returns this — the storage
+        /// backend lands in slice 2.)
+        unknown-secret(string),
+        /// Internal host error (TLS error not covered above, panic,
+        /// pool exhausted, etc.). String for human consumption only.
+        internal(string),
+    }
+
+    fetch: func(request: outbound-request) -> result<outbound-response, fetch-error>;
+}

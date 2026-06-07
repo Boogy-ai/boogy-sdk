@@ -1,0 +1,105 @@
+package boogy:platform@0.1.0;
+
+// Caller-side capability for the background-jobs subsystem. Wasm
+// components import this to enqueue / cancel / observe jobs from
+// inside their HTTP handlers (or from inside other job handlers,
+// for self-targeted chaining).
+//
+// The complementary callee-side interface (`job-handler` — what
+// the worker dispatches *into*) is in `job-handler.wit`. Most APIs
+// import this caller interface; only APIs that process jobs export
+// `job-handler` (and target `world: api-with-jobs` in their
+// wit_bindgen invocation).
+//
+// All operations are pinned to the calling workload's identity at
+// host-call time. There's no way to enqueue a job for a different
+// owner / api — cross-API workflows go through `peer::fetch` to
+// the receiver, which then enqueues its own job. See
+// `docs/background-jobs-design.md` (Constraints already settled —
+// "WIT capability `background_jobs`, self-targeted only").
+
+interface background-jobs {
+    // What the caller hands to enqueue. The host pins owner/api from
+    // the calling workload identity and captures the current Identity
+    // for replay; those fields are not in this record.
+    record job-spec {
+        // Manifest-declared handler name. Must match a row in
+        // `job_handlers` for the calling (owner, api).
+        handler: string,
+        // Opaque bytes the worker hands verbatim to handle-job.
+        payload: list<u8>,
+        // Optional delay: if set, the job stays `pending` until this
+        // unix-seconds timestamp passes. None = run as soon as a
+        // worker picks it up.
+        not-before-unix-s: option<u64>,
+        // Override the manifest's default max_attempts. None inherits.
+        max-attempts: option<u32>,
+        // Caller-supplied dedup key. Combined with (owner, api,
+        // handler) in the `job_idempotency` table, prevents duplicate
+        // enqueues during the active+terminal window.
+        idempotency-key: option<string>,
+    }
+
+    // Info bundled into queue-full so callers can decide whether to
+    // back off, escalate, or shed.
+    record tenant-depth-info {
+        depth: u32,
+        cap: u32,
+    }
+
+    // Enqueue failures. Caller should pattern-match.
+    variant enqueue-error {
+        // Tenant's pending+running count is at or above the depth
+        // cap. Caller should retry later (or shed).
+        queue-full(tenant-depth-info),
+        // (owner, api, handler) not in `job_handlers`. Caller's
+        // manifest doesn't declare this handler. Not retryable.
+        invalid-handler(string),
+        // Caller-supplied spec failed validation (payload too large,
+        // negative max-attempts, etc.). Not retryable.
+        invalid-spec(string),
+        // Transient PG / control-plane failure.
+        backend-unavailable,
+    }
+
+    // Result of a cancel call when the caller is authorized.
+    variant cancel-outcome {
+        // Job was pending; transitioned immediately.
+        cancelled,
+        // Job was running; flag set. The worker will observe on next
+        // heartbeat (≤ lease_dur/3) and trap. Caller can poll status.
+        cancellation-requested,
+        // Job already in a terminal state. No-op.
+        already-terminal,
+    }
+
+    // Cancel + status failures. NotFound covers both "no such row"
+    // and "wrong tenant" (deny-by-existence-mask, consistent with the
+    // SDK's auth::owns_resource posture).
+    variant cancel-error {
+        not-found,
+        backend-unavailable,
+    }
+
+    // Status snapshot for a job.
+    variant job-status-info {
+        pending,
+        running,
+        succeeded,
+        // String carries last_error; empty if none.
+        failed(string),
+        dead-letter(string),
+        cancelled,
+    }
+
+    // Enqueue a new job for the calling workload. Returns the
+    // job-id (UUID v7 as a string) on success.
+    enqueue: func(spec: job-spec) -> result<string, enqueue-error>;
+
+    // Cancel a job. If pending → cancelled; if running → request
+    // sent (caller polls status to confirm).
+    cancel: func(job-id: string) -> result<cancel-outcome, cancel-error>;
+
+    // Look up a job's current status.
+    status: func(job-id: string) -> result<job-status-info, cancel-error>;
+}

@@ -1,0 +1,32 @@
+[package]
+name = "boogy-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "SDK for building Boogy Wasm components"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Boogy-ai/boogy-sdk"
+
+[dependencies]
+wit-bindgen = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+matchit = { workspace = true }
+uuid = { workspace = true }
+# Format-level auth primitives (api_key + error) — the public, wasm-clean
+# core. The full boogy-auth (PASETO, key files) is host-side only and
+# stays out of the SDK dep graph entirely.
+boogy-auth-core = { path = "../boogy-auth-core" }
+garde = { workspace = true }
+# JsonSchema derive used by `McpServer::tool_typed` to derive tool
+# `inputSchema` from typed Rust structs. The derive macro emits
+# absolute `::schemars::*` paths so this is a direct dep.
+schemars = { workspace = true }
+# Backs `Req::parse_query::<T>()` — the same struct-driven extractor
+# pattern as `validate_body`, but for `?cursor=...&limit=...` query
+# strings. Pure-Rust, no I/O, wasm-friendly.
+serde_urlencoded = { workspace = true }
+# Backs `boogy_sdk::ids::IdCodec` — deterministic u64↔opaque-string
+# codec via raw AES-128 single-block cipher. Pure-Rust, wasm-friendly.
+aes = "0.8"
+base64 = "0.22"
+boogy-sdk-macros = { path = "../boogy-sdk-macros" }

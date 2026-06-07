@@ -1,0 +1,20 @@
+package boogy:platform@0.1.0;
+
+interface http-handler {
+    record http-request {
+        method: string,
+        path: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+        path-params: list<tuple<string, string>>,
+        query-params: list<tuple<string, string>>,
+    }
+
+    record http-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+
+    handle: func(req: http-request) -> http-response;
+}

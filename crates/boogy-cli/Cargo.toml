@@ -1,0 +1,20 @@
+[package]
+name = "boogy-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool for building and deploying Boogy components"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Boogy-ai/boogy-sdk"
+
+[[bin]]
+name = "boogy"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
