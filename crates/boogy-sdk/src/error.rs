@@ -382,22 +382,35 @@ impl From<RpcError> for ApiError {
 /// surface as **500** internal. Handlers that want a different status
 /// for a specific variant should still match on it explicitly before
 /// `?` (e.g. treat `TargetNotFound` as a 404 of their own resource).
+///
+/// Two audiences, two channels: the **wire** detail carries only the
+/// failure CLASS — `PeerError` messages can embed workload URIs and
+/// ingress-policy text, which must not cross the boundary to this
+/// service's clients. The **full error** goes to the service's own
+/// log stream (request-correlated, owner-visible) so the developer
+/// debugging the service loses nothing. Handlers wanting a specific
+/// response can still match the variant before `?`.
 impl From<crate::peer::PeerError> for ApiError {
     fn from(e: crate::peer::PeerError) -> Self {
         use crate::peer::PeerError as P;
-        match e {
-            P::CapabilityDenied | P::InvalidTarget(_) => ApiError::internal(e.to_string()),
-            P::TargetNotFound(_)
-            | P::Denied(_)
-            | P::Timeout(_)
-            | P::DepthExceeded
-            | P::Internal(_) => ApiError {
-                kind: "/errors/upstream".to_string(),
-                title: "Upstream error".to_string(),
-                status: 502,
-                detail: Some(e.to_string()),
-                errors: Default::default(),
-            },
+        let class = match &e {
+            P::TargetNotFound(_) => "target not found",
+            P::Denied(_) => "denied",
+            P::Timeout(_) => "timeout",
+            P::DepthExceeded => "depth exceeded",
+            P::Internal(_) => "internal",
+            P::CapabilityDenied | P::InvalidTarget(_) => {
+                crate::log::error!("peer call misconfigured: {e} -> returned to client as 500");
+                return ApiError::internal("peer call misconfigured");
+            }
+        };
+        crate::log::warn!("peer call failed: {e} -> returned to client as 502 upstream ({class})");
+        ApiError {
+            kind: "/errors/upstream".to_string(),
+            title: "Upstream error".to_string(),
+            status: 502,
+            detail: Some(format!("upstream call failed: {class}")),
+            errors: Default::default(),
         }
     }
 }
@@ -407,9 +420,14 @@ impl From<crate::peer::PeerError> for ApiError {
 /// failure, not a domain error — same rationale as `From<String>`.
 /// (Client-supplied bodies go through `parse_body`/`validate_body`,
 /// which map malformed input to 400/422 instead.)
+/// The serde message (field names, types, positions) is deliberately
+/// NOT included — it can disclose schema details if a handler
+/// mistakenly `?`s deserialization of client input here instead of
+/// going through `parse_body`/`validate_body`.
 impl From<serde_json::Error> for ApiError {
     fn from(e: serde_json::Error) -> Self {
-        ApiError::internal(format!("json: {e}"))
+        crate::log::error!("json (de)serialization failed: {e} -> returned to client as 500");
+        ApiError::internal("failed to (de)serialize JSON")
     }
 }
 
@@ -474,24 +492,28 @@ mod tests {
     fn peer_error_dependency_failures_map_to_502_upstream() {
         use crate::peer::PeerError as P;
         for e in [
-            P::TargetNotFound("x".into()),
-            P::Denied("x".into()),
-            P::Timeout("x".into()),
+            P::TargetNotFound("SECRET-INNER".into()),
+            P::Denied("SECRET-INNER".into()),
+            P::Timeout("SECRET-INNER".into()),
             P::DepthExceeded,
-            P::Internal("x".into()),
+            P::Internal("SECRET-INNER".into()),
         ] {
             let a: super::ApiError = e.into();
             assert_eq!(a.status, 502);
             assert_eq!(a.kind, "/errors/upstream");
+            // Leak guard: inner strings (target URIs, policy text)
+            // must never reach the response detail.
+            assert!(!a.detail.as_deref().unwrap_or("").contains("SECRET-INNER"));
         }
     }
 
     #[test]
     fn peer_error_misconfig_maps_to_500_internal() {
         use crate::peer::PeerError as P;
-        for e in [P::CapabilityDenied, P::InvalidTarget("x".into())] {
+        for e in [P::CapabilityDenied, P::InvalidTarget("SECRET-INNER".into())] {
             let a: super::ApiError = e.into();
             assert_eq!(a.status, 500);
+            assert!(!a.detail.as_deref().unwrap_or("").contains("SECRET-INNER"));
         }
     }
 
