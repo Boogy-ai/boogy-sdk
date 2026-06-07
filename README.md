@@ -8,10 +8,6 @@ MCP surface for LLM clients.
 > **Status: early development.** APIs change without notice. Pin a git
 > `rev` in your `Cargo.toml`. Published to crates.io once stable.
 
-This repository is a read-only mirror of the SDK crates from the Boogy
-monorepo (synced automatically; commit messages reference the source
-revision). Issues are welcome here; PRs are imported manually for now.
-
 ## What's here
 
 | Crate | Purpose |
