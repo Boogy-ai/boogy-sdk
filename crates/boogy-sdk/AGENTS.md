@@ -251,7 +251,7 @@ Available column types: `.text`, `.nullable_text`, `.integer`,
 `.on_update(CascadeAction::*)`. Indexes: `.index(name, &cols)` and
 `.unique_index(name, &cols)`.
 
-**Composite + unique indexes are fully enforced.** `Table::unique_index(name, &cols)` (and the raw `IndexDef { columns, unique: true }`) creates a real composite unique constraint in the FDB store. Duplicate rows that violate the constraint are rejected at insert time with a `StoreError::Conflict`. The enforcement is required by `upsert_increment` — always create a unique index on the key columns first.
+**Composite + unique indexes are fully enforced.** `Table::unique_index(name, &cols)` (and the raw `IndexDef { columns, unique: true }`) creates a real composite unique constraint in the built-in store. Duplicate rows that violate the constraint are rejected at insert time with a `StoreError::Conflict`. The enforcement is required by `upsert_increment` — always create a unique index on the key columns first.
 
 ### Column + table names go in constants, not string literals
 
@@ -304,7 +304,7 @@ use crate::cols::Things;
 
 // PK lookup: use get_row(table, id), NOT find_row_by(table, "_id", ...).
 // `find_row_by` filters on a named column; the auto-PK is not a column
-// the FDB find-scan recognises, so PK lookups go through the dedicated
+// the store find-scan recognises, so PK lookups go through the dedicated
 // get-by-id helper.
 let row = get_row(Things::TABLE, id)?;
 row.as_ref().map(|r| r.text(Things::NAME))
@@ -354,7 +354,7 @@ row.to_json(&["title", "body"])  // serde_json::Value, includes id
 | `find_rows(table, filters, sort, page)` | `Result<(Vec<Row>, u64), StoreError>` | General-purpose composite query: multi-filter, composite sort, optional page. `filters` is `Vec<store::Filter>`, `sort` is `Vec<store::SortBy>`. Composite sort lets you tiebreak (e.g. `created_at DESC, _id ASC`). For one-filter cases prefer `find_rows_by`; for an OR clause use `find_rows_grouped`. |
 | `find_rows_grouped(table, filters, or_groups, sort, page)` | `Result<(Vec<Row>, u64), StoreError>` | Like `find_rows` but with an OR-of-AND clause: a row matches when `ALL(filters) AND (or_groups empty OR ANY(group: ALL(group)))`. `or_groups` is `Vec<Vec<store::Filter>>` — each inner `Vec` is one AND-group, groups are ORed. Use for composite keyset pagination (see below). Empty `or_groups` == `find_rows`. |
 | `upsert_increment(table, key, counter, delta, set)` | `Result<u64, StoreError>` | Atomic keyed counter: inserts the row (counter = delta + set columns) if it doesn't exist, or increments the counter and overwrites the set columns if it does. `key` is `&[store::Column]` identifying the unique key. `counter` is the column name. `delta` must be `store::Value::Integer` or `store::Value::Real` — the host rejects other types. `set` is `&[store::Column]` for extra columns to write on every call. Returns the row id. **Requires a `unique_index` on the key columns** — the operation is undefined without it. Use for per-key aggregations (e.g. view counts, score accumulators, per-tag event counts). |
-| `for_each_batch(table, filters, or_groups, order_col, dir, batch_size, f)` | `Result<(), StoreError>` | Bounded-memory ordered streaming over a table. Opens a stateless `row-cursor`, calls `f(&[Row])` once per batch of up to `batch_size` rows, and loops until the table is exhausted. Every matching row is visited exactly once, in `order_col` / `dir` order — **on the FDB engine `order_col` is an *index name*, not a column name**: pass a declared index's name, or `None` for primary-key order (a bare column name errors with `NotFound`) — with no gaps or duplicates, no offset re-scan. **Read-committed, not snapshot-isolated**: rows inserted or modified after the cursor opens may or may not appear depending on timing. **Cannot be called inside `tx(...)`** — the FDB transaction view has no cursor, so it returns `Unsupported` (501); gather the ids you need before opening the tx, or use `find_rows` inside it. This is the bounded-memory alternative to `find_all_rows` / offset pagination for large-table batch jobs (e.g. decay sweeps, export pipelines, fan-out tasks): only `batch_size` rows are ever in memory at a time. If `f` returns `Err`, iteration stops and the error propagates. |
+| `for_each_batch(table, filters, or_groups, order_col, dir, batch_size, f)` | `Result<(), StoreError>` | Bounded-memory ordered streaming over a table. Opens a stateless `row-cursor`, calls `f(&[Row])` once per batch of up to `batch_size` rows, and loops until the table is exhausted. Every matching row is visited exactly once, in `order_col` / `dir` order — **on the built-in engine `order_col` is an *index name*, not a column name**: pass a declared index's name, or `None` for primary-key order (a bare column name errors with `NotFound`) — with no gaps or duplicates, no offset re-scan. **Read-committed, not snapshot-isolated**: rows inserted or modified after the cursor opens may or may not appear depending on timing. **Cannot be called inside `tx(...)`** — the transaction view has no cursor, so it returns `Unsupported` (501); gather the ids you need before opening the tx, or use `find_rows` inside it. This is the bounded-memory alternative to `find_all_rows` / offset pagination for large-table batch jobs (e.g. decay sweeps, export pipelines, fan-out tasks): only `batch_size` rows are ever in memory at a time. If `f` returns `Err`, iteration stops and the error propagates. |
 | `filter_eq(column, val)` | `store::Filter` | One-liner builder for `column = val`. One of a family (see below) — never hand-write the `Filter { column, op, val, in_values }` literal. |
 | `sort_asc(col)` / `sort_desc(col)` | `store::SortBy` | Build a sort key without spelling out `SortBy { column, dir }`. Compose into the `Vec<SortBy>` for `find_rows`. |
 | `page(limit, offset)` | `store::Page` | Build a `Page`; wrap in `Some(...)`. First page = `page(n, 0)`. |
@@ -390,7 +390,7 @@ let (page_rows, _total) = find_rows_grouped(
 )?;
 ```
 
-The FDB store applies the OR-of-AND natively. Note: when `or_groups` is non-empty the query can't use the single-column index/scan fast paths, so the AND-prefix `filters` is what keeps it cheap — keep a selective prefix where you can.
+The built-in store applies the OR-of-AND natively. Note: when `or_groups` is non-empty the query can't use the single-column index/scan fast paths, so the AND-prefix `filters` is what keeps it cheap — keep a selective prefix where you can.
 
 **`upsert_increment` — atomic keyed counter.** Requires a unique composite index on the key columns. First call inserts; subsequent calls increment and overwrite the set columns atomically. Returns the row id (same id across all calls for the same key).
 
@@ -500,14 +500,14 @@ fn init_tables() {
 }
 ```
 
-`migrations()` wraps each migration in one FDB transaction. FoundationDB is
-the sole per-service store engine, so transactions (and therefore migrations
-and `tx`) are always available.
+`migrations()` wraps each migration in one store transaction. The built-in
+engine is the sole per-service store engine, so transactions (and therefore
+migrations and `tx`) are always available.
 
 Each migration runs inside its own transaction: the `up` closure (schema DDL
 + any data backfill) executes first, then the version-table insert, all
 committing atomically. A failed migration rolls back and the next request
-retries — never half-applied. **The whole migration is bounded by the FDB
+retries — never half-applied. **The whole migration is bounded by the store's
 ~5s / 10MB transaction envelope**: a backfill that touches a very large table
 can exceed it and roll back perpetually — split such backfills across smaller
 migrations (or a two-step "add column with default now, backfill later via a
@@ -537,7 +537,7 @@ Conventions:
 Multi-row atomic writes go through a **no-arg closure** — `tx(|| { ... })`.
 There is **no transaction handle**: inside the closure you call the *same*
 `store::*` / `db_*` / `find_row_by` free functions you call outside a
-transaction. They transparently join the host's ambient FDB transaction. On
+transaction. They transparently join the host's ambient store transaction. On
 `Ok` the host commits; on `Err` it rolls back; on **panic** the host tears
 the request down and discards the (never-committed) transaction.
 
@@ -592,23 +592,23 @@ transaction's own writes and close the TOCTOU window, because they run on
 the same ambient transaction as the writes.
 
 **Cross-service: peer calls join the transaction.** Any `peer::fetch` made
-inside an open tx **enrolls the callee's entire subtree into the SAME FDB
+inside an open tx **enrolls the callee's entire subtree into the SAME
 transaction** — the callee's `store::*` ops auto-join, and the callee does
 *not* call `tx` itself (calling `tx` from a handler already
 enrolled as a peer participant fails at commit). Only the **originating
 request (the owner)** commits. Any participant failure **poisons** the
 transaction so commit refuses — rollback only. The whole call tree shares
-one 5s / 10MB FDB envelope.
+one 5s / 10MB store transaction envelope.
 
 **Denied inside a tx:** `outbound_http` and `background_jobs`
 (enqueue/cancel) are refused while a transaction is open (they surface as
 their capability/backend errors).
 
-FoundationDB is the sole per-service store engine, so `tx` is always
+The built-in engine is the sole per-service store engine, so `tx` is always
 available.
 
 **Error → status (via `tx::<_, _, ApiError>`):** a commit
-**conflict** (FDB serialization abort) → `StoreError::Conflict` → HTTP
+**conflict** (store serialization abort) → `StoreError::Conflict` → HTTP
 **409** (no auto-retry — the client retries the whole request). These flow
 through correctly because the helper carries the typed `store::StoreError`,
 not a flattened String.
@@ -622,7 +622,7 @@ fan-out tagging).
 handle passed to a `migration(version, name, |t| { ... })` `up` closure) is
 a *separate, unchanged* surface: `-> Result<R, String>`, DDL-oriented, no
 HTTP-status semantics. The handler-facing `tx` above is the
-ambient-FDB transaction API.
+ambient store transaction API.
 
 ### Writing rows
 
@@ -803,7 +803,7 @@ and use the `vector::*` functions exposed by `wit_glue!`.
 vector = true
 ```
 
-Vector collections live in the per-service FoundationDB store (the sole store
+Vector collections live in the per-service store (the sole store
 engine); no `[store] engine` selection is needed.
 
 **SDK functions** (available unqualified after `wit_glue!`):

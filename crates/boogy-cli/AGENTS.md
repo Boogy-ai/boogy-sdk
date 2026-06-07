@@ -211,8 +211,8 @@ Rules enforced at deploy time:
   (see example above).
 - `[capabilities] outbound_http = true` requires a non-empty `[outbound]`
   block with `allowed_hosts`.
-- The `[store]` section has no `engine` knob — FoundationDB is the sole
-  per-service store engine. The section is reserved for future store config.
+- The `[store]` section has no `engine` knob — the platform provides a single
+  built-in per-service store engine. The section is reserved for future store config.
   See `CLAUDE.md`.
 
 Full schema: see the Boogy documentation for the authoritative manifest field reference, including ingress modes and delegation.
