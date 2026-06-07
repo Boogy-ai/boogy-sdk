@@ -45,9 +45,11 @@ interface outbound-http {
         /// `(header-name, secret-ref)` where `secret-ref` is the
         /// name declared in the manifest's `[secrets]` block.
         ///
-        /// Not yet active: any non-empty entry returns
-        /// `unknown-secret(<ref>)` until the secret storage backend
-        /// is wired up.
+        /// The host validates the ref against the manifest's
+        /// `[secrets]` declaration + usage, resolves the value, and
+        /// injects it at the wire edge — the component never sees it.
+        /// Undeclared, unbound, or unresolvable refs fail closed as
+        /// `unknown-secret(<ref>)`.
         secret-headers: list<tuple<string, string>>,
     }
 
