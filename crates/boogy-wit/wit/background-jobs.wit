@@ -8,7 +8,7 @@ package boogy:platform@0.1.0;
 // The complementary callee-side interface (`job-handler` — what
 // the worker dispatches *into*) is in `job-handler.wit`. Most APIs
 // import this caller interface; only APIs that process jobs export
-// `job-handler` (and target `world: api-with-jobs` in their
+// `job-handler` (and target `world: service-with-jobs` in their
 // wit_bindgen invocation).
 //
 // All operations are pinned to the calling workload's identity at

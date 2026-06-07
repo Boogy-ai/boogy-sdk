@@ -3014,7 +3014,7 @@ macro_rules! wit_glue {
     // `<MyApi as Api>::build_job_router()`.
     //
     // Only use this form when the consumer's `wit_bindgen::generate!` declares
-    // `world: "api-with-jobs"`.  HTTP-only consumers (world: "service") must use
+    // `world: "service-with-jobs"`.  HTTP-only consumers (world: "service") must use
     // the two-argument form — the `job_handler` export does not exist in their
     // generated bindings and the impl block would fail to compile.
     // -----------------------------------------------------------------------
