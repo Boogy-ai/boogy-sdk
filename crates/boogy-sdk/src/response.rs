@@ -149,8 +149,27 @@ pub fn raw(status: u16, body: &[u8], content_type: &str) -> HttpResponse {
 /// to control how a domain value serializes onto the wire — `impl
 /// IntoResponse for User { ... }` is enough to make a handler that
 /// returns `User` work directly.
+///
+/// **Schema capture:** the built-in [`Json<T>`] and [`Created<T>`]
+/// wrappers require `T: schemars::JsonSchema` so the route's response
+/// shape lands in the generated `…/openapi.json`. If you hit
+/// `the trait bound …: JsonSchema is not satisfied` on a handler
+/// registration, add `#[derive(schemars::JsonSchema)]` to the payload
+/// struct (one line; `schemars = { workspace = true }` or `"0.8"` in
+/// your Cargo.toml).
 pub trait IntoResponse {
     fn into_response(self) -> HttpResponse;
+
+    /// Spec-capture hook: what does this response type look like on the
+    /// wire? `None` = undescribable (raw `HttpResponse`, custom types
+    /// that don't override). Called at route-registration time by
+    /// `IntoHandler::describe()` — never on the request path.
+    fn describe() -> Option<crate::spec::ResponseSpec>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 impl IntoResponse for HttpResponse {
@@ -164,6 +183,10 @@ impl IntoResponse for () {
     fn into_response(self) -> HttpResponse {
         no_content()
     }
+
+    fn describe() -> Option<crate::spec::ResponseSpec> {
+        Some(crate::spec::ResponseSpec { status: 204, schema: None })
+    }
 }
 
 /// `Some(t)` is `t`; `None` is 404. Convenience for handlers that
@@ -174,6 +197,10 @@ impl<T: IntoResponse> IntoResponse for Option<T> {
             Some(t) => t.into_response(),
             None => ApiError::not_found().into(),
         }
+    }
+
+    fn describe() -> Option<crate::spec::ResponseSpec> {
+        T::describe()
     }
 }
 
@@ -191,6 +218,10 @@ where
             Err(e) => e.into().into(),
         }
     }
+
+    fn describe() -> Option<crate::spec::ResponseSpec> {
+        T::describe()
+    }
 }
 
 /// 200 OK with the wrapped value serialized as JSON.
@@ -207,19 +238,27 @@ where
 #[derive(Debug, Clone)]
 pub struct Json<T>(pub T);
 
-impl<T: Serialize> IntoResponse for Json<T> {
+impl<T: Serialize + schemars::JsonSchema> IntoResponse for Json<T> {
     fn into_response(self) -> HttpResponse {
         ok(&self.0)
+    }
+
+    fn describe() -> Option<crate::spec::ResponseSpec> {
+        Some(crate::spec::ResponseSpec { status: 200, schema: Some(crate::spec::schema_value::<T>()) })
     }
 }
 
 /// 201 Created with the wrapped value serialized as JSON. Use for
 /// successful POSTs that return the created resource.
-pub struct Created<T: Serialize>(pub T);
+pub struct Created<T>(pub T);
 
-impl<T: Serialize> IntoResponse for Created<T> {
+impl<T: Serialize + schemars::JsonSchema> IntoResponse for Created<T> {
     fn into_response(self) -> HttpResponse {
         created(&self.0)
+    }
+
+    fn describe() -> Option<crate::spec::ResponseSpec> {
+        Some(crate::spec::ResponseSpec { status: 201, schema: Some(crate::spec::schema_value::<T>()) })
     }
 }
 
@@ -230,6 +269,10 @@ pub struct NoContent;
 impl IntoResponse for NoContent {
     fn into_response(self) -> HttpResponse {
         no_content()
+    }
+
+    fn describe() -> Option<crate::spec::ResponseSpec> {
+        Some(crate::spec::ResponseSpec { status: 204, schema: None })
     }
 }
 
@@ -246,6 +289,10 @@ impl IntoResponse for Redirect {
     fn into_response(self) -> HttpResponse {
         redirect(&self.0)
     }
+
+    fn describe() -> Option<crate::spec::ResponseSpec> {
+        Some(crate::spec::ResponseSpec { status: 302, schema: None })
+    }
 }
 
 #[cfg(test)]
@@ -253,7 +300,7 @@ mod tests {
     use super::*;
     use serde::Serialize;
 
-    #[derive(Serialize)]
+    #[derive(Serialize, schemars::JsonSchema)]
     struct Greeting {
         message: &'static str,
     }
@@ -324,5 +371,23 @@ mod tests {
             Ok(Created(Greeting { message: "hi" }));
         let resp = r.into_response();
         assert_eq!(resp.status, 201);
+    }
+
+    #[derive(Serialize, schemars::JsonSchema)]
+    struct Described { id: u64 }
+
+    #[test]
+    fn json_describes_200_with_schema() {
+        let spec = <Json<Described> as IntoResponse>::describe().unwrap();
+        assert_eq!(spec.status, 200);
+        assert_eq!(spec.schema.unwrap()["properties"]["id"]["type"], "integer");
+    }
+
+    #[test]
+    fn created_describes_201_result_delegates_nocontent_204() {
+        assert_eq!(<Created<Described> as IntoResponse>::describe().unwrap().status, 201);
+        assert_eq!(<Result<Json<Described>, ApiError> as IntoResponse>::describe().unwrap().status, 200);
+        assert_eq!(<NoContent as IntoResponse>::describe().unwrap().status, 204);
+        assert!(<HttpResponse as IntoResponse>::describe().is_none(), "raw responses stay undescribed");
     }
 }

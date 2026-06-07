@@ -23,10 +23,13 @@
 //! #[derive(Deserialize, JsonSchema)]
 //! struct CreateNoteArgs { title: String, body: String }
 //!
-//! #[derive(Serialize)]
+//! // R must also derive JsonSchema — outputSchema is auto-derived from it.
+//! #[derive(Serialize, JsonSchema)]
 //! struct NoteOut { id: String, title: String }
 //!
-//! fn mcp_dispatch(req: &mut Req<'_>) -> response::HttpResponse {
+//! // Mount via Router::mcp so the endpoint appears in openapi.json.
+//! // Router::new().mcp("/mcp", mcp_handler)
+//! fn mcp_handler(req: &mut Req<'_>) -> response::HttpResponse {
 //!     McpServer::new("notes-mcp", "0.1.0")
 //!         .tool_typed(
 //!             tool("create_note").description("Create a note for the authenticated agent."),
@@ -185,6 +188,12 @@ pub struct Tool {
     /// validate defensively.
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    /// JSON Schema for the tool's structured result (MCP `outputSchema`).
+    /// Set automatically by [`McpServer::tool_typed`] from its `R` type
+    /// parameter. May also be set manually via the [`Tool::output_schema`]
+    /// builder for custom overrides.
+    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
 }
 
 /// The placeholder input-schema [`tool`] returns when the caller
@@ -201,6 +210,7 @@ pub fn tool(name: impl Into<String>) -> Tool {
         name: name.into(),
         description: None,
         input_schema: default_tool_input_schema(),
+        output_schema: None,
     }
 }
 
@@ -212,6 +222,15 @@ impl Tool {
 
     pub fn input_schema(mut self, schema: Value) -> Self {
         self.input_schema = schema;
+        self
+    }
+
+    /// Set the `outputSchema` advertised to clients. This is set
+    /// automatically by [`McpServer::tool_typed`] from the `R` type
+    /// parameter; use this for manual overrides or when using the
+    /// raw [`McpServer::tool`] registration.
+    pub fn output_schema(mut self, schema: Value) -> Self {
+        self.output_schema = Some(schema);
         self
     }
 }
@@ -518,6 +537,14 @@ impl McpServer {
         }
     }
 
+    /// Test accessor: return references to all registered tool descriptors.
+    /// Used in unit tests to inspect the descriptor after `tool_typed`
+    /// derives the schemas — avoids going through `tools/list` JSON parsing.
+    #[cfg(test)]
+    pub(crate) fn tool_descriptors_for_test(&self) -> Vec<&Tool> {
+        self.tools.iter().map(|t| &t.descriptor).collect()
+    }
+
     /// Register a raw tool with a `Fn(Value) -> Result<ToolResult, RpcError>`
     /// handler. **Prefer [`tool_typed`](Self::tool_typed)** — it's the
     /// symmetric counterpart to [`crate::rpc::Dispatcher::method`] and
@@ -581,7 +608,7 @@ impl McpServer {
     pub fn tool_typed<P, R, F>(self, mut descriptor: Tool, handler: F) -> Self
     where
         P: for<'de> serde::Deserialize<'de> + schemars::JsonSchema + 'static,
-        R: serde::Serialize + 'static,
+        R: serde::Serialize + schemars::JsonSchema + 'static,
         F: Fn(P) -> Result<R, crate::error::ApiError> + 'static,
     {
         // Override the builder's default schema with one derived from P.
@@ -595,6 +622,15 @@ impl McpServer {
                 schemars::schema_for!(P).schema,
             )
             .unwrap_or_else(|_| default_tool_input_schema());
+        }
+
+        // Derive outputSchema from R unless the caller already provided one.
+        // Same override-respect rule as input_schema above.
+        if descriptor.output_schema.is_none() {
+            descriptor.output_schema = serde_json::to_value(
+                schemars::schema_for!(R).schema,
+            )
+            .ok();
         }
 
         // Erase the typed handler into the underlying `Fn(Value) ->
@@ -1292,7 +1328,7 @@ mod tests {
         name: String,
     }
 
-    #[derive(serde::Serialize)]
+    #[derive(serde::Serialize, schemars::JsonSchema)]
     struct GreetResult {
         message: String,
     }
@@ -1636,5 +1672,61 @@ mod tests {
     fn extract_template_var_returns_none_for_unknown_name() {
         let v = extract_template_var("note://{id}", "note://abc", "missing");
         assert!(v.is_none());
+    }
+
+    // ─── Task 6: outputSchema ────────────────────────────────────────────
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct AddParams { a: i64, b: i64 }
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct AddResult { sum: i64 }
+
+    #[test]
+    fn tool_typed_emits_output_schema() {
+        let server = McpServer::new("t", "1.0").tool_typed::<AddParams, AddResult, _>(
+            tool("add").description("add two ints"),
+            |p| -> Result<AddResult, crate::error::ApiError> {
+                Ok(AddResult { sum: p.a + p.b })
+            },
+        );
+        let tools = server.tool_descriptors_for_test();
+        let v = serde_json::to_value(&tools[0]).unwrap();
+        assert_eq!(v["inputSchema"]["properties"]["a"]["type"], "integer");
+        assert_eq!(v["outputSchema"]["properties"]["sum"]["type"], "integer");
+    }
+
+    // ─── Hardening sweep (spec-endpoints) ─────────────────────────────────
+
+    /// Test 10: an explicit `.output_schema(custom)` set before `tool_typed`
+    /// must be preserved — `tool_typed` must not stomp a pre-populated
+    /// output_schema with the derived `R` schema.
+    #[test]
+    fn manual_output_schema_override_respected() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct PingArgs { n: u32 }
+        #[derive(serde::Serialize, schemars::JsonSchema)]
+        struct PingResult { pong: u32 }
+
+        let custom_output = serde_json::json!({
+            "type": "object",
+            "description": "hand-crafted output",
+            "properties": { "pong": { "type": "integer", "description": "custom" } }
+        });
+
+        let server = McpServer::new("t", "1.0").tool_typed::<PingArgs, PingResult, _>(
+            tool("ping").output_schema(custom_output.clone()),
+            |p| -> Result<PingResult, crate::error::ApiError> {
+                Ok(PingResult { pong: p.n })
+            },
+        );
+
+        let tools = server.tool_descriptors_for_test();
+        let output_schema = tools[0].output_schema.as_ref()
+            .expect("output_schema must be set");
+        assert_eq!(output_schema["description"], "hand-crafted output",
+            "explicit output_schema must win over derived R schema; got: {output_schema}");
+        // Ensure the derived schema's properties did NOT replace the custom one.
+        assert_eq!(output_schema["properties"]["pong"]["description"], "custom",
+            "custom property description must be preserved");
     }
 }

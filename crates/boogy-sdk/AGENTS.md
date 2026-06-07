@@ -704,18 +704,19 @@ constructed inline.
 ## JSON-RPC
 
 For "many small typed methods over one endpoint" (search, share,
-admin operations):
+admin operations), use `Router::rpc` — it registers the POST route and
+captures the method shapes for `…/openrpc.json` in one call:
 
 ```rust
-.post("/api/rpc", rpc_dispatch)
+.rpc("/api/rpc", || boogy_sdk::rpc::Dispatcher::new()
+    .method("search_notes", search_notes)
+    .method("share_note",   share_note))
+```
 
-fn rpc_dispatch(req: &mut Req<'_>) -> response::HttpResponse {
-    boogy_sdk::rpc::Dispatcher::new()
-        .method("search_notes", search_notes)
-        .method("share_note",   share_note)
-        .handle(req.request)
-}
+The closure runs once at registration time (for spec capture) and once
+per request (for dispatch). Method handlers:
 
+```rust
 #[derive(Deserialize)]
 struct SearchParams { query: String }
 #[derive(Serialize)]
@@ -731,31 +732,31 @@ JSON-RPC handlers use `RpcError` for failures — propagate
 
 ## MCP (Model Context Protocol)
 
-For LLM clients (Claude Code, Inspector, etc.):
+For LLM clients (Claude Code, Inspector, etc.), use `Router::mcp` — it
+registers the POST route and records the endpoint in `…/openapi.json`:
 
 ```rust
-.post("/mcp", mcp_dispatch)
-
-fn mcp_dispatch(req: &mut Req<'_>) -> response::HttpResponse {
+.mcp("/mcp", |req| {
     boogy_sdk::mcp::McpServer::new("notes-mcp", env!("CARGO_PKG_VERSION"))
         .tool_typed(mcp::tool("create_note").description("..."), create_note_tool)
         .resource(mcp::resource("notes://summary", "summary"), summary_resource)
         .resource_template(mcp::resource_template("note://{id}", "note"), note_resource)
         .prompt(mcp::prompt("summarize_notes"), summarize_prompt)
         .handle(req.request)
-}
+})
 ```
 
 **Tool registrations:** prefer `tool_typed::<P, R>` — the typed
 counterpart to `rpc::Dispatcher::method`. Argument struct must derive
-`Deserialize + JsonSchema`; the MCP `inputSchema` is auto-derived from
-the struct, so the deserializer and the protocol surface can't drift.
+`Deserialize + JsonSchema`; result struct must derive `Serialize + JsonSchema`.
+The MCP `inputSchema` and `outputSchema` are auto-derived, so the
+deserializer/serializer and the protocol surface can't drift.
 
 ```rust
 #[derive(Deserialize, JsonSchema)]
 struct CreateNoteArgs { title: String, body: String }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct NoteOut { id: String, title: String, body: String }
 
 fn create_note_tool(args: CreateNoteArgs) -> Result<NoteOut, ApiError> {
@@ -766,12 +767,15 @@ fn create_note_tool(args: CreateNoteArgs) -> Result<NoteOut, ApiError> {
 }
 ```
 
+`schemars` is a direct dep — add `schemars = { workspace = true }` in-repo
+(or `schemars = "0.8"` for external consumers) to your `Cargo.toml`.
+
 The legacy `tool(...)` registration with raw `Fn(Value) -> Result<ToolResult, RpcError>`
 is still available as the escape hatch for hand-rolled `ToolResult`
 shapes (e.g. multi-content-block responses).
 
 MCP handler shapes:
-- Tool (typed):  `fn(P) -> Result<R, ApiError>` where `P: Deserialize + JsonSchema`, `R: Serialize`
+- Tool (typed):  `fn(P) -> Result<R, ApiError>` where `P: Deserialize + JsonSchema`, `R: Serialize + JsonSchema`
 - Tool (raw):    `fn(serde_json::Value) -> Result<ToolResult, RpcError>`
 - Resource:      `fn(uri: &str) -> Result<Vec<ResourceContent>, RpcError>`
 - Prompt:        `fn(args: HashMap<String, String>) -> Result<PromptResult, RpcError>`
@@ -780,6 +784,57 @@ MCP handlers don't see `Req` / `Ctx` — auth and resource loading must
 be done explicitly. Use `auth::current_principal()` / `auth::find_owned`
 / `auth::load_owned` inside MCP handlers — they work without a router
 context.
+
+## Spec endpoints
+
+Every deployed service automatically serves spec documents off its
+route tree — no handler code needed.
+
+| URL (relative to service subtree) | Format | Served when |
+|---|---|---|
+| `GET …/openapi.json` | OpenAPI 3.0.3 | Always |
+| `GET …/openrpc.json` | OpenRPC 1.3.2 | One or more `Router::rpc(...)` mounts exist |
+
+**Two-tier visibility.** Anonymous callers see only public routes — not
+inside a `.group([...], …)` guard block and not taking a `Principal`
+typed extractor (`Option<Principal>` doesn't hide a route).
+Authenticated callers (any valid bearer) see all routes. Use
+`Router::undocumented(|g| …)` to exclude routes from spec docs entirely
+— they still dispatch normally, guards still apply inside the block.
+
+**`Router::info`** sets the doc identity fields:
+
+```rust
+Router::new()
+    .info("Notes API", env!("CARGO_PKG_VERSION"), Some("Note CRUD + MCP tools"))
+    .get("/api/notes", list_notes)
+    // ...
+```
+
+**Reserved filenames.** `openapi.json` and `openrpc.json` are reserved
+at the leaf of any path in your tree. An explicit `GET` route whose
+literal path ends in one of those filenames overrides the generated doc.
+A `{param}`-style route at the same position does NOT capture them.
+
+**Host bypass.** The host forwards spec-doc GETs to the service even
+when the manifest `[routing] methods` list excludes GET. No manifest
+change needed.
+
+**`JsonSchema` derive requirement.** Typed extractors (`Json<T>`,
+`Query<T>`, `Path<T>`) and typed responses (`Json<T>`, `Created<T>`)
+need `schemars::JsonSchema` on the payload type to appear in the
+generated schema. Add it to every DTO:
+
+```rust
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+struct CreateNote { title: String, body: String }
+```
+
+For types where you want a custom schema shape, use
+`.input_schema(serde_json::json!({...}))` / `.output_schema(...)` on
+the `Tool` descriptor (MCP), or implement `JsonSchema` manually.
+
+See `boogy:boogy-api-specs` for the full spec-endpoint reference.
 
 ## Cross-service calls (`peer`)
 

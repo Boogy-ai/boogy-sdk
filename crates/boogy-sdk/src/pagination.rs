@@ -273,7 +273,7 @@ pub fn keyset_resume_filter(
 /// Pagination response envelope. Serializes as
 /// `{"items": [...], "next_cursor": "..."}` with `next_cursor`
 /// omitted when there is no next page (last-page marker).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct CursorPage<T: Serialize> {
     pub items: Vec<T>,
     #[serde(skip_serializing_if = "Option::is_none")]

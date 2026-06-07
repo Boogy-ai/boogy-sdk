@@ -182,6 +182,29 @@ The macro emits, into your crate's namespace:
 
 The macro also holds the WIT-bindings paths in one place. If WIT regenerates with different paths, this is the only thing to update.
 
+## Spec endpoints
+
+Every deployed service automatically serves `GET …/openapi.json`
+(OpenAPI 3.0.3) and — when one or more `Router::rpc(...)` mounts exist
+— `GET …/openrpc.json` (OpenRPC 1.3.2). No handler code required.
+
+Opt-in controls:
+
+- `Router::info(title, version, description)` — set the doc identity.
+- `Router::undocumented(|g| …)` — register routes without recording
+  them in the spec; they still dispatch normally.
+- `schemars::JsonSchema` on payload types — required for typed
+  extractors and responses to appear in the generated schema. Add
+  `schemars = "0.8"` as a direct dep (or `{ workspace = true }`
+  in-repo) and derive it alongside `Serialize`/`Deserialize`.
+- `Router::mcp(path, handler)` — the canonical MCP mount; records the
+  endpoint in `openapi.json` automatically.
+- `Router::rpc(path, || Dispatcher::new()…)` — the canonical JSON-RPC
+  mount; captures method shapes for `openrpc.json`.
+
+Two-tier visibility: anonymous callers see only unguarded routes;
+authenticated callers see everything.
+
 ## Modules
 
 ### `router`

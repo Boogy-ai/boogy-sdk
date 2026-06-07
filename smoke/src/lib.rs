@@ -20,7 +20,7 @@ impl Api for SmokeApi {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 struct Pong {
     message: &'static str,
 }

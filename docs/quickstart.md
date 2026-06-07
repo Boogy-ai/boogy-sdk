@@ -49,6 +49,9 @@ serde       = { version = "1", features = ["derive"] }
 # Required: wit_glue! uses ::serde_json absolute paths; every service
 # crate must have it as a direct dependency.
 serde_json  = "1"
+# Required for spec generation: #[derive(JsonSchema)] on DTO types so
+# typed extractors and responses appear in the generated openapi.json.
+schemars    = "0.8"
 
 [build-dependencies]
 # build.rs copies the WIT files from this exact revision into wit/
@@ -112,7 +115,7 @@ impl Api for MyService {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 struct Pong {
     message: &'static str,
 }
@@ -209,6 +212,8 @@ boogy deploy boogy.toml
 
 `deploy` is `publish + provision` in one shot: it uploads the manifest and Wasm binary, then provisions a running service instance for your user ID.
 
+The platform API is self-describing: `GET <host>/openapi.json` returns an OpenAPI 3.1 document covering the full deploy lifecycle (`/_agents/*`, `/_admin/*`, `/v1/*`); anonymous fetch OK.
+
 ### Verify
 
 ```bash
@@ -230,6 +235,7 @@ boogy remove <owner-user-id> <service-id>
 
 ## 6. Next steps
 
+- **Your service self-describes.** Once deployed, `GET /<owner>/<service-id>/openapi.json` returns an OpenAPI 3.0.3 document for your service automatically — no extra code required. Add `schemars::JsonSchema` to your DTO types and the schema will include request/response shapes. See `boogy:boogy-api-specs` in the skills catalog for the full spec-endpoint reference.
 - **Handler reference**: [`../crates/boogy-sdk/AGENTS.md`](../crates/boogy-sdk/AGENTS.md) — the canonical guide for writing handlers, guards, store access, auth patterns, MCP tools, and more. Feed this to your coding agent before writing service code.
 - **Manifest reference**: [`manifest.md`](manifest.md) — every manifest field, all ingress modes, outbound HTTP policy, secrets, background jobs, and common errors.
 - **`smoke/` template**: [`../smoke/`](../smoke/) in this repo — the working template this quickstart is based on.

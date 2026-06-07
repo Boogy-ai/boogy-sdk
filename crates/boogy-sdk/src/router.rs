@@ -253,6 +253,15 @@ pub type Guard = Rc<dyn Fn(&mut Req<'_>) -> Result<(), crate::response::HttpResp
 /// and have handlers return them directly.
 pub trait IntoHandler<Args> {
     fn into_handler(self) -> Handler;
+
+    /// Spec-capture hook, called once at registration. Default: an empty
+    /// spec (path+method appear in the doc with no shape detail).
+    fn describe() -> crate::spec::OperationSpec
+    where
+        Self: Sized,
+    {
+        crate::spec::OperationSpec::default()
+    }
 }
 
 /// Marker for the `Fn(&mut Req<'_>) -> R` handler shape.
@@ -268,6 +277,10 @@ where
 {
     fn into_handler(self) -> Handler {
         Rc::new(move |req| self(req).into_response())
+    }
+
+    fn describe() -> crate::spec::OperationSpec {
+        crate::spec::OperationSpec { response: R::describe(), ..Default::default() }
     }
 }
 
@@ -307,6 +320,12 @@ where
             self(e1).into_response()
         })
     }
+
+    fn describe() -> crate::spec::OperationSpec {
+        let mut op = crate::spec::OperationSpec { response: R::describe(), ..Default::default() };
+        E1::describe(&mut op);
+        op
+    }
 }
 
 impl<F, R, E1, E2> IntoHandler<(E1, E2)> for F
@@ -328,6 +347,13 @@ where
             };
             self(e1, e2).into_response()
         })
+    }
+
+    fn describe() -> crate::spec::OperationSpec {
+        let mut op = crate::spec::OperationSpec { response: R::describe(), ..Default::default() };
+        E1::describe(&mut op);
+        E2::describe(&mut op);
+        op
     }
 }
 
@@ -355,6 +381,14 @@ where
             };
             self(e1, e2, e3).into_response()
         })
+    }
+
+    fn describe() -> crate::spec::OperationSpec {
+        let mut op = crate::spec::OperationSpec { response: R::describe(), ..Default::default() };
+        E1::describe(&mut op);
+        E2::describe(&mut op);
+        E3::describe(&mut op);
+        op
     }
 }
 
@@ -387,6 +421,15 @@ where
             };
             self(e1, e2, e3, e4).into_response()
         })
+    }
+
+    fn describe() -> crate::spec::OperationSpec {
+        let mut op = crate::spec::OperationSpec { response: R::describe(), ..Default::default() };
+        E1::describe(&mut op);
+        E2::describe(&mut op);
+        E3::describe(&mut op);
+        E4::describe(&mut op);
+        op
     }
 }
 
@@ -424,6 +467,16 @@ where
             };
             self(e1, e2, e3, e4, e5).into_response()
         })
+    }
+
+    fn describe() -> crate::spec::OperationSpec {
+        let mut op = crate::spec::OperationSpec { response: R::describe(), ..Default::default() };
+        E1::describe(&mut op);
+        E2::describe(&mut op);
+        E3::describe(&mut op);
+        E4::describe(&mut op);
+        E5::describe(&mut op);
+        op
     }
 }
 
@@ -466,6 +519,17 @@ where
             };
             self(e1, e2, e3, e4, e5, e6).into_response()
         })
+    }
+
+    fn describe() -> crate::spec::OperationSpec {
+        let mut op = crate::spec::OperationSpec { response: R::describe(), ..Default::default() };
+        E1::describe(&mut op);
+        E2::describe(&mut op);
+        E3::describe(&mut op);
+        E4::describe(&mut op);
+        E5::describe(&mut op);
+        E6::describe(&mut op);
+        op
     }
 }
 
@@ -572,6 +636,20 @@ pub struct Router {
     /// carry their guards in their own RouteEntry.guards — populated
     /// only by `.group()` and `.nest()` internally.
     group_guards: Vec<Guard>,
+    /// Spec entries captured at registration; serialized on demand by the
+    /// auto-mounted doc endpoints.
+    specs: Vec<crate::spec::SpecEntry>,
+    /// Identity block for generated docs. None → spec::DocInfo::default().
+    doc_info: Option<crate::spec::DocInfo>,
+    /// When `true`, `route()` skips the spec push — used by
+    /// `Router::undocumented()` to register internal routes without
+    /// leaking them in the generated spec.
+    undocumented: bool,
+    /// JSON-RPC method tables keyed by mount path. Each entry is
+    /// `(path, guarded, methods)`. Populated by `Router::rpc` (Task 5);
+    /// declared here so `rpc_method_specs()` and the `undocumented()`
+    /// builder can reference it now.
+    rpc_specs: Vec<(String, bool, Vec<crate::spec::MethodSpec>)>,
 }
 
 impl Default for Router {
@@ -582,7 +660,14 @@ impl Default for Router {
 
 impl Router {
     pub fn new() -> Self {
-        Self { routes_by_path: vec![], group_guards: vec![] }
+        Self {
+            routes_by_path: vec![],
+            group_guards: vec![],
+            specs: vec![],
+            doc_info: None,
+            undocumented: false,
+            rpc_specs: vec![],
+        }
     }
 
     /// Register a single (method, path, handler) triple.
@@ -594,15 +679,47 @@ impl Router {
     /// Each registration captures the router's current `group_guards`
     /// — the route's effective guard chain at handle time. Use `.group()`
     /// to scope guards to a subset of routes.
+    ///
+    /// Spec capture: unless `self.undocumented` is set, a [`SpecEntry::Rest`]
+    /// is pushed before the route is inserted, recording the handler's
+    /// operation shape for `…/openapi.json`.
     pub fn route<H, Args>(mut self, method: &str, path: &str, handler: H) -> Self
     where
         H: IntoHandler<Args> + 'static,
     {
+        if !self.undocumented {
+            self.specs.push(crate::spec::SpecEntry::Rest {
+                method: method.to_uppercase(),
+                path: path.to_string(),
+                op: H::describe(),
+                guarded: !self.group_guards.is_empty(),
+            });
+        }
+        let h = handler.into_handler();
+        self.route_inner(method, path, h)
+    }
+
+    /// Core route-insertion logic (no spec push). Called by `route()` and
+    /// directly by `route_many()` / `rpc()` / `mcp()` so they can manage
+    /// spec entries themselves without triggering a double-push.
+    fn route_inner(mut self, method: &str, path: &str, handler: Handler) -> Self {
         let method = method.to_uppercase();
         let entry = RouteEntry {
-            handler: handler.into_handler(),
+            handler,
             guards: self.group_guards.clone(),
         };
+        self.merge_route_entry(path, method, entry);
+        self
+    }
+
+    /// Insert one (path, method) → RouteEntry, creating the path's
+    /// MethodTable on first use. The single insertion point shared by
+    /// `route_inner` and the `nest`/`group`/`undocumented` merge loops.
+    /// `method` must already be uppercase (every caller registers through
+    /// `route_inner`, which uppercases on insertion).
+    fn merge_route_entry(&mut self, path: &str, method: String, entry: RouteEntry) {
+        debug_assert_eq!(method, method.to_uppercase(),
+            "RouteEntry method should be uppercase by the time it reaches merge_route_entry");
         if let Some((_, mt)) = self.routes_by_path.iter_mut().find(|(p, _)| p == path) {
             mt.handlers.insert(method, entry);
         } else {
@@ -610,7 +727,6 @@ impl Router {
             mt.handlers.insert(method, entry);
             self.routes_by_path.push((path.to_string(), mt));
         }
-        self
     }
 
     /// Register the same handler against multiple methods on one path.
@@ -619,12 +735,20 @@ impl Router {
     where
         H: IntoHandler<Args> + 'static,
     {
-        // Wrap once, then register the resulting Handler against each
-        // method — avoids re-running the IntoHandler conversion N times
-        // (which for closures would mean re-`Rc::new`-ing identical state).
+        // Capture the spec once (before type erasure) then push per method.
+        // Using route_inner for each registration avoids double spec entries.
+        let op = H::describe();
         let h = handler.into_handler();
         for m in methods {
-            self = self.route(m, path, h.clone());
+            if !self.undocumented {
+                self.specs.push(crate::spec::SpecEntry::Rest {
+                    method: m.to_uppercase(),
+                    path: path.to_string(),
+                    op: op.clone(),
+                    guarded: !self.group_guards.is_empty(),
+                });
+            }
+            self = self.route_inner(m, path, h.clone());
         }
         self
     }
@@ -689,11 +813,14 @@ impl Router {
     ///   same paths they were registered at).
     pub fn nest(mut self, prefix: &str, sub: Router) -> Self {
         let prefix = normalize_prefix(prefix);
+        // Destructure sub to move out routes and specs independently before
+        // the route-merge loop consumes them.
+        let Router { routes_by_path: sub_routes, specs: sub_specs, rpc_specs: sub_rpc_specs, .. } = sub;
         // Snapshot of guards on `self` at the time of nesting. These are
         // outer guards — they should run BEFORE the sub-router's own
         // guards on each nested route.
         let outer_guards = self.group_guards.clone();
-        for (path, mt) in sub.routes_by_path {
+        for (path, mt) in sub_routes {
             let combined = join_paths(&prefix, &path);
             for (method, mut entry) in mt.handlers {
                 // Outer guards first, then the route's pre-existing
@@ -702,17 +829,38 @@ impl Router {
                 let mut chain = outer_guards.clone();
                 chain.extend(entry.guards);
                 entry.guards = chain;
-                let method_upper = method.to_uppercase();
-                if let Some((_, dest_mt)) = self.routes_by_path.iter_mut()
-                    .find(|(p, _)| *p == combined)
-                {
-                    dest_mt.handlers.insert(method_upper, entry);
-                } else {
-                    let mut dest_mt = MethodTable::new();
-                    dest_mt.handlers.insert(method_upper, entry);
-                    self.routes_by_path.push((combined.clone(), dest_mt));
-                }
+                self.merge_route_entry(&combined, method.to_uppercase(), entry);
             }
+        }
+        // Mirror the spec path rewrite for every entry in the sub-router.
+        // If `self` has active group guards, mark each merged entry as guarded
+        // (the nest is happening inside a guarded group).
+        let nest_is_guarded = !outer_guards.is_empty();
+        for entry in sub_specs {
+            let combined = join_paths(&prefix, entry.path());
+            let entry = entry.with_path(combined);
+            // Propagate the outer guard flag if needed.
+            let entry = if nest_is_guarded {
+                match entry {
+                    crate::spec::SpecEntry::Rest { method, path, op, .. } =>
+                        crate::spec::SpecEntry::Rest { method, path, op, guarded: true },
+                    crate::spec::SpecEntry::Mcp { path, .. } =>
+                        crate::spec::SpecEntry::Mcp { path, guarded: true },
+                    crate::spec::SpecEntry::Rpc { path, .. } =>
+                        crate::spec::SpecEntry::Rpc { path, guarded: true },
+                }
+            } else {
+                entry
+            };
+            self.specs.push(entry);
+        }
+        // Mirror rpc_specs path rewrite — and the SAME guard upgrade the
+        // SpecEntry loop applies, so an rpc mount nested inside a guarded
+        // group never leaks its method specs to anonymous openrpc.json
+        // readers.
+        for (path, guarded, methods) in sub_rpc_specs {
+            let combined = join_paths(&prefix, &path);
+            self.rpc_specs.push((combined, guarded || nest_is_guarded, methods));
         }
         self
     }
@@ -757,6 +905,10 @@ impl Router {
         let inner = Router {
             routes_by_path: vec![],
             group_guards: inner_guards,
+            specs: vec![],
+            doc_info: None,
+            undocumented: false,
+            rpc_specs: vec![],
         };
         let built = build(RouteSet(inner)).0;
         // Merge built's routes back into self. Each route's RouteEntry
@@ -764,23 +916,13 @@ impl Router {
         // registration inside the inner Router).
         for (path, mt) in built.routes_by_path {
             for (method, entry) in mt.handlers {
-                // `method` is already uppercase (registered through Router::route
-                // which uppercases on insertion). debug_assert documents this invariant.
-                debug_assert_eq!(method, method.to_uppercase(),
-                    "RouteEntry method should be uppercase by the time it reaches the group merge");
-                if let Some((_, dest_mt)) = self
-                    .routes_by_path
-                    .iter_mut()
-                    .find(|(p, _)| *p == path)
-                {
-                    dest_mt.handlers.insert(method.clone(), entry);
-                } else {
-                    let mut dest_mt = MethodTable::new();
-                    dest_mt.handlers.insert(method, entry);
-                    self.routes_by_path.push((path.clone(), dest_mt));
-                }
+                self.merge_route_entry(&path, method, entry);
             }
         }
+        // Merge the inner Router's spec entries; they already carry guarded: true
+        // because the inner Router had non-empty group_guards at registration.
+        self.specs.extend(built.specs);
+        self.rpc_specs.extend(built.rpc_specs);
         self
     }
 
@@ -796,6 +938,23 @@ impl Router {
     ///    `Allow:` header.
     /// 5. Path doesn't match anything → 404.
     pub fn handle(&self, req: &crate::Request) -> response::HttpResponse {
+        // Spec-doc requests short-circuit BEFORE pattern matching: the
+        // canonical CRUD layout (`/api/notes/{id}`) would otherwise
+        // capture `/api/notes/openapi.json` as `id = "openapi.json"` and
+        // shadow the doc behind that route's guards. "User routes win"
+        // means an EXPLICIT literal registration at the doc path — an
+        // incidental param capture doesn't count. (Consequence: the doc
+        // filenames are reserved ids within a param segment.)
+        if req.method.eq_ignore_ascii_case("GET")
+            && (doc_path(&req.path, "openapi.json") || doc_path(&req.path, "openrpc.json"))
+        {
+            let user_claims_path = self.routes_by_path.iter()
+                .any(|(p, mt)| p == &req.path && mt.handlers.contains_key("GET"));
+            if !user_claims_path {
+                return self.serve_spec_doc_or_404(req);
+            }
+        }
+
         let mut matcher = matchit::Router::new();
         for (i, (path, _)) in self.routes_by_path.iter().enumerate() {
             // Insertion failure (e.g. duplicate or invalid pattern) is
@@ -806,7 +965,7 @@ impl Router {
 
         let matched = match matcher.at(&req.path) {
             Ok(m) => m,
-            Err(_) => return response::not_found(),
+            Err(_) => return self.serve_spec_doc_or_404(req),
         };
         let idx = *matched.value;
         let mt = &self.routes_by_path[idx].1;
@@ -886,10 +1045,180 @@ impl Router {
             body: Some(body),
         }
     }
+
+    /// Set the identity block for generated spec documents
+    /// (`…/openapi.json`, `…/openrpc.json`). Optional — defaults to a
+    /// generic title and version 0.0.0.
+    pub fn info(mut self, title: &str, version: &str, description: Option<&str>) -> Self {
+        self.doc_info = Some(crate::spec::DocInfo {
+            title: title.to_string(),
+            version: version.to_string(),
+            description: description.map(str::to_string),
+        });
+        self
+    }
+
+    /// Register routes in the closure without recording them in the generated
+    /// spec. The routes handle requests normally; they simply won't appear in
+    /// `…/openapi.json` or `…/openrpc.json`.
+    ///
+    /// Useful for internal health, debug, or admin endpoints that should not
+    /// be advertised to external consumers.
+    ///
+    /// ```ignore
+    /// Router::new()
+    ///     .post("/api/notes", create_note)
+    ///     .undocumented(|g| g.get("/internal/health", health_check))
+    /// ```
+    pub fn undocumented<F>(mut self, build: F) -> Self
+    where
+        F: FnOnce(RouteSet) -> RouteSet,
+    {
+        // Build an inner Router with undocumented=true so route() skips spec pushes.
+        let inner = Router {
+            routes_by_path: vec![],
+            group_guards: self.group_guards.clone(),
+            specs: vec![],
+            doc_info: None,
+            undocumented: true,
+            rpc_specs: vec![],
+        };
+        let built = build(RouteSet(inner)).0;
+        // Merge only the routes (no specs — that's the whole point).
+        // This also covers `nest()` inside the block: the sub-router's
+        // specs land in built.specs via the nest merge and are dropped
+        // wholesale here.
+        for (path, mt) in built.routes_by_path {
+            for (method, entry) in mt.handlers {
+                self.merge_route_entry(&path, method, entry);
+            }
+        }
+        // Intentionally: built.specs and built.rpc_specs are NOT merged.
+        self
+    }
+
+    /// Mount a JSON-RPC dispatcher at `path` (registered as POST).
+    ///
+    /// The `build` closure runs once at registration time to capture the
+    /// dispatcher's method shapes for `…/openrpc.json` and the OpenAPI
+    /// protocol stub, then again per request to dispatch calls (same
+    /// per-request idiom as `McpServer`).
+    ///
+    /// When `self.undocumented` is set both the `SpecEntry` and the
+    /// `rpc_specs` entry are skipped — the route still dispatches
+    /// normally. `guarded` mirrors the surrounding `group_guards`:
+    /// anonymous callers see only unguarded mounts in the generated
+    /// `…/openrpc.json`.
+    ///
+    /// ```ignore
+    /// Router::new()
+    ///     .rpc("/rpc", || Dispatcher::new()
+    ///         .method("search_notes", search_notes)
+    ///         .method("share_note", share_note))
+    /// ```
+    pub fn rpc<F>(mut self, path: &str, build: F) -> Self
+    where
+        F: Fn() -> crate::rpc::Dispatcher + 'static,
+    {
+        let guarded = !self.group_guards.is_empty();
+        if !self.undocumented {
+            let registration_probe = build();
+            self.rpc_specs.push((path.to_string(), guarded, registration_probe.method_specs().to_vec()));
+            self.specs.push(crate::spec::SpecEntry::Rpc { path: path.to_string(), guarded });
+        }
+        let handler: Handler = std::rc::Rc::new(move |req: &mut Req<'_>| build().handle(req.request));
+        self.route_inner("POST", path, handler)
+    }
+
+    /// Mount an MCP dispatch handler at `path` (registered as POST) and
+    /// record it as an MCP endpoint in the generated OpenAPI document.
+    /// Capability discovery stays in-protocol (`tools/list` etc.).
+    ///
+    /// When `self.undocumented` is set the `SpecEntry` is skipped — the
+    /// route still dispatches normally. `guarded` mirrors the surrounding
+    /// `group_guards`, same as [`Router::rpc`].
+    ///
+    /// ```ignore
+    /// Router::new()
+    ///     .mcp("/mcp", |req| {
+    ///         McpServer::new("my-service", "1.0")
+    ///             .tool_typed(tool("do_thing").description("…"), do_thing)
+    ///             .handle(req.request)
+    ///     })
+    /// ```
+    pub fn mcp<H, Args>(mut self, path: &str, handler: H) -> Self
+    where
+        H: IntoHandler<Args> + 'static,
+    {
+        let guarded = !self.group_guards.is_empty();
+        if !self.undocumented {
+            self.specs.push(crate::spec::SpecEntry::Mcp { path: path.to_string(), guarded });
+        }
+        self.route_inner("POST", path, handler.into_handler())
+    }
+
+    /// Unmatched request fallback: serve a generated spec document when
+    /// the request is a GET for a doc filename anywhere under the
+    /// service's subtree (the guest never learns its manifest routing
+    /// prefix, so suffix-matching is the reachable contract — the host
+    /// only forwards paths inside this service's own prefix). User
+    /// routes always win: this only runs when nothing matched.
+    ///
+    /// Two-tier visibility: guarded routes are hidden from anonymous callers
+    /// (no principal in the thread-local) and shown to authenticated ones.
+    fn serve_spec_doc_or_404(&self, req: &crate::Request) -> response::HttpResponse {
+        if !req.method.eq_ignore_ascii_case("GET") {
+            return response::not_found();
+        }
+        if doc_path(&req.path, "openapi.json") {
+            let info = self.doc_info.clone().unwrap_or_default();
+            let caller = crate::request_state::_request_principal();
+            let authenticated = caller.is_some();
+            // Filter entries: anonymous callers see only unguarded routes.
+            let entries: Vec<crate::spec::SpecEntry> = self.specs.iter()
+                .filter(|e| authenticated || !e.is_guarded())
+                .cloned()
+                .collect();
+            let reg = crate::spec::SpecRegistry { entries };
+            let doc = crate::spec::build_openapi(&info, &reg);
+            return response::raw(200, doc.to_string().as_bytes(), "application/json");
+        }
+        if doc_path(&req.path, "openrpc.json") {
+            if let Some(methods) = self.rpc_method_specs() {
+                let info = self.doc_info.clone().unwrap_or_default();
+                let doc = crate::spec::build_openrpc(&info, &methods);
+                return response::raw(200, doc.to_string().as_bytes(), "application/json");
+            }
+        }
+        response::not_found()
+    }
+
+    /// Return the flattened list of JSON-RPC method specs from all mounted
+    /// `Router::rpc` dispatchers, respecting the same two-tier visibility
+    /// as `serve_spec_doc_or_404`. Returns `None` when no RPC mounts exist
+    /// — or when no methods remain visible (every mount guarded and the
+    /// caller anonymous, or only empty dispatchers): both mean 404.
+    fn rpc_method_specs(&self) -> Option<Vec<crate::spec::MethodSpec>> {
+        if self.rpc_specs.is_empty() {
+            return None;
+        }
+        let caller = crate::request_state::_request_principal();
+        let authenticated = caller.is_some();
+        let methods: Vec<crate::spec::MethodSpec> = self.rpc_specs.iter()
+            .filter(|(_, guarded, _)| authenticated || !guarded)
+            .flat_map(|(_, _, methods)| methods.iter().cloned())
+            .collect();
+        // Return None (→ 404) when all mounts are guarded and caller is
+        // anonymous — the openrpc.json document would be empty, which
+        // is more confusing than a 404.
+        if methods.is_empty() { None } else { Some(methods) }
+    }
 }
 
 /// Closure receiver for [`Router::group`] — exposes only route-registration
-/// methods. Has no `.group()` method by design, so guards declared at the
+/// methods. (`rpc()`/`mcp()` are intentionally absent: protocol mounts
+/// carry spec-registry side effects that must record the group's guard
+/// state — mount them on the `Router` and `.nest()` the result instead.) Has no `.group()` method by design, so guards declared at the
 /// enclosing `.group([...], |g| ...)` cannot be extended from inside the
 /// closure body.
 ///
@@ -940,7 +1269,19 @@ impl RouteSet {
     }
 }
 
-// ─── Path joining (used by nest) ────────────────────────────────────────────
+// ─── Path joining (used by nest) + doc-path predicate ───────────────────────
+
+/// `/<filename>` itself or any path ending `/<filename>`.
+///
+/// Used by `serve_spec_doc_or_404` to serve spec docs via suffix matching —
+/// the guest Router never knows the manifest `[routing] path` prefix, so the
+/// host can only reach it through the service's own routed subtree.
+fn doc_path(path: &str, filename: &str) -> bool {
+    // Allocation-free equivalent of `path == "/<filename>" ||
+    // path.ends_with("/<filename>")`: stripping the filename suffix must
+    // leave something ending in '/' ("/" itself for the root case).
+    path.strip_suffix(filename).is_some_and(|rest| rest.ends_with('/'))
+}
 
 fn normalize_prefix(p: &str) -> String {
     let p = p.trim_end_matches('/');
@@ -1548,7 +1889,7 @@ mod tests {
     use crate::extract::{Path, Principal, Query};
 
     /// Shared body struct for extractor dispatch tests.
-    #[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq)]
+    #[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, schemars::JsonSchema)]
     struct FooBody {
         v: i32,
     }
@@ -1594,9 +1935,9 @@ mod tests {
             Ok(Json(FooBody { v: id as i32 }))
         }
         // Arity 3: Path<u64> + Query<QFoo2> + Option<Principal>
-        #[derive(Debug, serde::Deserialize)]
+        #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
         struct QFoo2 { limit: u32 }
-        #[derive(Debug, serde::Serialize)]
+        #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
         struct Resp3 { id: u64, limit: u32, who: String }
         fn h_three(
             Path(id): Path<u64>,
@@ -1726,7 +2067,7 @@ mod tests {
     /// handler runs and returns a response with "anon" in it.
     #[test]
     fn option_principal_returns_none_when_anonymous_through_router() {
-        #[derive(Debug, serde::Serialize)]
+        #[derive(Debug, serde::Serialize, schemars::JsonSchema)]
         struct WhoResp { who: String }
 
         fn h(p: Option<Principal>) -> Result<Json<WhoResp>, crate::error::ApiError> {
@@ -1746,6 +2087,187 @@ mod tests {
         assert_eq!(resp.status, 200, "Option<Principal> must succeed for anonymous");
         let body = String::from_utf8(resp.body.unwrap()).unwrap();
         assert!(body.contains("anon"), "anonymous must yield 'anon' in response: {body}");
+    }
+
+    // ── Spec / doc tests (Task 4 + Amendment A) ──────────────────────────────
+
+    #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+    struct SpecNote { title: String }
+
+    fn typed_create(crate::response::Json(n): crate::response::Json<SpecNote>)
+        -> crate::response::Created<SpecNote> { crate::response::Created(n) }
+
+    #[test]
+    fn openapi_served_on_unmatched_get() {
+        let r = Router::new()
+            .info("notes", "1.2.3", Some("test service"))
+            .post("/api/notes", typed_create);
+        let resp = r.handle(&req("GET", "/api/notes/openapi.json"));
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert_eq!(doc["info"]["title"], "notes");
+        let op = &doc["paths"]["/api/notes"]["post"];
+        assert_eq!(op["requestBody"]["content"]["application/json"]["schema"]["properties"]["title"]["type"], "string");
+        assert!(op["responses"]["201"].is_object());
+    }
+
+    #[test]
+    fn user_route_wins_over_generated_doc() {
+        fn custom(_req: &mut Req<'_>) -> response::HttpResponse {
+            response::raw(200, b"mine", "text/plain")
+        }
+        let r = Router::new().get("/openapi.json", custom);
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        assert_eq!(resp.body.unwrap(), b"mine".to_vec());
+    }
+
+    #[test]
+    fn param_route_does_not_shadow_doc_path() {
+        // The canonical CRUD layout: /api/notes/{id} would pattern-match
+        // /api/notes/openapi.json (id = "openapi.json") and bury the doc
+        // behind that route's guards. The doc short-circuit must win over
+        // incidental param captures — only an explicit literal GET route
+        // at the doc path defers to the user.
+        let r = Router::new()
+            .get("/api/notes", ok_handler)
+            .group([deny_guard], |g| g.get("/api/notes/{id}", echo_id));
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        let resp = r.handle(&req("GET", "/api/notes/openapi.json"));
+        assert_eq!(resp.status, 200, "doc served, not captured by {{id}}");
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert_eq!(doc["openapi"], "3.0.3");
+        // …while real ids still dispatch (and hit the guard).
+        assert_eq!(r.handle(&req("GET", "/api/notes/abc")).status, 403);
+    }
+
+    #[test]
+    fn nest_rewrites_spec_paths_and_group_marks_guarded() {
+        let sub = Router::new().post("/notes", typed_create);
+        let r = Router::new()
+            .group([deny_guard], |g| g.nest("/api", sub));
+        // Set an authenticated caller so guarded routes are included in the spec.
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(Some("agent_test".into()));
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert!(doc["paths"]["/api/notes"]["post"].is_object(), "nested path rewritten in spec");
+        assert!(doc["paths"]["/api/notes"]["post"]["security"].is_array(), "guarded route marked");
+    }
+
+    #[test]
+    fn raw_req_handlers_appear_with_response_only() {
+        // ok_handler is the Fn(&mut Req) shape returning HttpResponse — undescribed body, listed path.
+        let r = Router::new().get("/users", ok_handler);
+        let resp = r.handle(&req("GET", "/users/openapi.json"));
+        // suffix-match serves the doc anywhere under the service subtree
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert!(doc["paths"]["/users"]["get"]["responses"]["200"].is_object());
+    }
+
+    // Amendment A tests
+
+    #[test]
+    fn undocumented_routes_excluded_from_spec() {
+        let r = Router::new()
+            .post("/api/notes", typed_create)
+            .undocumented(|g| g.get("/internal/health", ok_handler));
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        // The documented route appears.
+        assert!(doc["paths"]["/api/notes"].is_object(), "documented route must appear");
+        // The undocumented route must NOT appear in the spec.
+        assert!(doc["paths"]["/internal/health"].is_null(), "undocumented route must not appear in spec");
+        // But the route still handles requests normally.
+        assert_eq!(r.handle(&req("GET", "/internal/health")).status, 200);
+    }
+
+    #[test]
+    fn visibility_filter_hides_guarded_from_anonymous() {
+        // Guarded route inside a group: the spec should omit it for anonymous callers,
+        // but show it for authenticated ones.
+        let r = Router::new()
+            .get("/public", ok_handler)
+            .group([deny_guard], |g| g.post("/private", typed_create));
+
+        // Anonymous caller (no principal)
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert!(doc["paths"]["/public"].is_object(), "public route visible to anonymous");
+        assert!(doc["paths"]["/private"].is_null(), "guarded route hidden from anonymous");
+
+        // Authenticated caller
+        crate::request_state::_set_fallback_principal(Some("agent_test".into()));
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert!(doc["paths"]["/public"].is_object(), "public route visible to authenticated");
+        assert!(doc["paths"]["/private"].is_object(), "guarded route visible to authenticated");
+    }
+
+    // ── RPC mount + openrpc.json tests (Task 5) ─────────────────────────────
+
+    #[test]
+    fn rpc_mount_serves_openrpc_json() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct P { q: String }
+        #[derive(serde::Serialize, schemars::JsonSchema)]
+        struct R2 { hits: u32 }
+        fn search(_p: P) -> Result<R2, crate::rpc::RpcError> { Ok(R2 { hits: 0 }) }
+
+        let r = Router::new().rpc("/rpc", || crate::rpc::Dispatcher::new().method("search", search));
+        let resp = r.handle(&req("GET", "/openrpc.json"));
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert_eq!(doc["methods"][0]["name"], "search");
+        // and the POST endpoint itself still dispatches
+        // (covered by dispatcher tests; here just confirm the route exists)
+        assert_eq!(r.handle(&req("OPTIONS", "/rpc")).status, 204);
+    }
+
+    #[test]
+    fn no_rpc_mounts_no_openrpc_json() {
+        let r = Router::new().get("/users", ok_handler);
+        assert_eq!(r.handle(&req("GET", "/openrpc.json")).status, 404);
+    }
+
+    #[test]
+    fn guarded_rpc_mount_hidden_from_anonymous_openrpc() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct P2 { id: u64 }
+        #[derive(serde::Serialize, schemars::JsonSchema)]
+        struct R3 { val: String }
+        fn lookup(_p: P2) -> Result<R3, crate::rpc::RpcError> { Ok(R3 { val: "x".into() }) }
+
+        // Router::rpc can't appear inside RouteSet (RouteSet has no rpc() method).
+        // A guarded rpc mount is produced by building the sub-router first, then
+        // nesting it inside a group on the outer router.
+        let sub = Router::new().rpc("/rpc", || crate::rpc::Dispatcher::new().method("lookup", lookup));
+        let r = Router::new().group([deny_guard], |g| g.nest("/api", sub));
+
+        // Anonymous caller: all mounts are guarded → openrpc.json must 404.
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        let resp = r.handle(&req("GET", "/openrpc.json"));
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        assert_eq!(resp.status, 404, "guarded-only rpc mount must be invisible to anonymous");
+
+        // Authenticated caller: methods are present.
+        crate::request_state::_set_fallback_principal(Some("agent_x".into()));
+        let resp = r.handle(&req("GET", "/openrpc.json"));
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        assert_eq!(resp.status, 200, "authenticated caller must see guarded rpc methods");
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert_eq!(doc["methods"][0]["name"], "lookup");
     }
 
     /// Test 6: Guard runs before extractors — a 403-returning guard short-circuits
@@ -1784,5 +2306,185 @@ mod tests {
         );
         let body = String::from_utf8(resp.body.unwrap()).unwrap();
         assert!(body.contains("guard blocked"), "guard response body must be returned: {body}");
+    }
+
+    // ─── Task 6: Router::mcp ─────────────────────────────────────────────
+
+    #[test]
+    fn mcp_mount_appears_in_openapi() {
+        fn mcp_handler(req: &mut Req<'_>) -> response::HttpResponse {
+            crate::mcp::McpServer::new("t", "1.0").handle(req.request)
+        }
+        let r = Router::new().mcp("/mcp", mcp_handler);
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert!(
+            doc["paths"]["/mcp"]["post"]["description"].as_str().unwrap().contains("tools/list"),
+            "MCP stub description must mention tools/list"
+        );
+        // The MCP endpoint itself still dispatches (anonymous caller, unguarded)
+        assert_eq!(r.handle(&req("OPTIONS", "/mcp")).status, 204);
+    }
+
+    // ─── Hardening sweep (spec-endpoints) ─────────────────────────────────
+
+    /// Test 1 (SECURITY): a sub-router with an UNGUARDED `.rpc("/rpc", …)`
+    /// is nested via `.group([deny_guard], |g| g.nest("/api", sub))`.
+    /// Anonymous GET /openrpc.json must 404 because the nest upgrades the
+    /// rpc_specs guarded flag — commit 8ec1984's fix is pinned here.
+    /// An authenticated caller must see the methods.
+    #[test]
+    fn nest_inside_group_hides_rpc_methods_from_anonymous() {
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct P3 { q: String }
+        #[derive(serde::Serialize, schemars::JsonSchema)]
+        struct R4 { hits: u32 }
+        fn search(_p: P3) -> Result<R4, crate::rpc::RpcError> { Ok(R4 { hits: 0 }) }
+
+        // The sub-router itself has no guards — .rpc() registers guarded=false.
+        let sub = Router::new()
+            .rpc("/rpc", || crate::rpc::Dispatcher::new().method("search", search));
+        // Nesting inside a group must upgrade guarded to true on the rpc entry.
+        let r = Router::new().group([deny_guard], |g| g.nest("/api", sub));
+
+        // Anonymous: all rpc mounts now guarded → openrpc.json must 404.
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        let resp = r.handle(&req("GET", "/openrpc.json"));
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        assert_eq!(resp.status, 404,
+            "anonymous must not see rpc methods from a sub-router nested inside a guarded group");
+
+        // Authenticated: methods are present.
+        crate::request_state::_set_fallback_principal(Some("agent_x".into()));
+        let resp = r.handle(&req("GET", "/openrpc.json"));
+        crate::request_state::_set_wit_principal(None);
+        crate::request_state::_set_fallback_principal(None);
+        assert_eq!(resp.status, 200,
+            "authenticated caller must see the rpc methods after nest-inside-group");
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert_eq!(doc["methods"][0]["name"], "search");
+    }
+
+    /// Test 2: `.route_many(&["GET","POST"], "/sync", typed_handler)` then
+    /// GET /openapi.json: `paths["/sync"]` has exactly `get` and `post` keys,
+    /// each with the captured request/response shape.
+    #[test]
+    fn route_many_records_one_spec_entry_per_method() {
+        #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+        struct SyncBody { value: i32 }
+        fn sync_handler(crate::response::Json(b): crate::response::Json<SyncBody>)
+            -> crate::response::Json<SyncBody> { crate::response::Json(b) }
+
+        let r = Router::new().route_many(&["GET", "POST"], "/sync", sync_handler);
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        let path_item = &doc["paths"]["/sync"];
+        assert!(path_item["get"].is_object(), "GET must be in spec");
+        assert!(path_item["post"].is_object(), "POST must be in spec");
+        // Neither PATCH nor DELETE should appear — only the two registered methods.
+        assert!(path_item.get("patch").is_none() || path_item["patch"].is_null(),
+            "PATCH must not appear in spec");
+        // Prove describe() ran: requestBody schema must mention the `value` field.
+        let req_body_schema = &path_item["post"]["requestBody"]["content"]["application/json"]["schema"];
+        assert!(req_body_schema["properties"]["value"].is_object(),
+            "requestBody schema must mention 'value'; got: {req_body_schema}");
+    }
+
+    /// Test 3: a 3-extractor typed handler `fn(Path<u64>, Query<Q>, Json<B>) -> Created<R>`
+    /// produces an operation with path param + query params + requestBody + 201 response.
+    #[test]
+    fn multi_extractor_describe_folds_all_parts() {
+        use crate::extract::{Path, Query};
+
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        struct MultiQuery { limit: u32 }
+        #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+        struct MultiBody { name: String }
+        #[derive(serde::Serialize, schemars::JsonSchema)]
+        struct MultiResp { id: u64 }
+
+        fn h(
+            Path(_id): Path<u64>,
+            Query(_q): Query<MultiQuery>,
+            crate::response::Json(_b): crate::response::Json<MultiBody>,
+        ) -> crate::response::Created<MultiResp> {
+            crate::response::Created(MultiResp { id: 1 })
+        }
+
+        let r = Router::new().post("/items/{id}", h);
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        let op = &doc["paths"]["/items/{id}"]["post"];
+
+        // Path param must appear.
+        let params = op["parameters"].as_array().expect("parameters must be present");
+        assert!(params.iter().any(|p| p["in"] == "path"),
+            "path parameter must be present; params: {params:?}");
+        // Query param must appear.
+        assert!(params.iter().any(|p| p["in"] == "query" && p["name"] == "limit"),
+            "query param 'limit' must be present; params: {params:?}");
+        // requestBody must mention 'name'.
+        let body_schema = &op["requestBody"]["content"]["application/json"]["schema"];
+        assert!(body_schema["properties"]["name"].is_object(),
+            "requestBody schema must mention 'name'");
+        // 201 response.
+        assert!(op["responses"]["201"].is_object(), "Created response must be 201");
+    }
+
+    /// Test 4: no `.info()` call → doc title "boogy-service", version "0.0.0".
+    #[test]
+    fn info_defaults_when_unset() {
+        let r = Router::new().get("/ping", ok_handler);
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert_eq!(doc["info"]["title"], "boogy-service");
+        assert_eq!(doc["info"]["version"], "0.0.0");
+    }
+
+    /// Test 5: direct unit test of `doc_path` covering the boundary cases
+    /// specified in the task.
+    #[test]
+    fn doc_path_boundary_cases() {
+        // True cases.
+        assert!(doc_path("/openapi.json", "openapi.json"),
+            "/openapi.json must match");
+        assert!(doc_path("/api/openapi.json", "openapi.json"),
+            "/api/openapi.json must match");
+        // False cases.
+        assert!(!doc_path("xopenapi.json", "openapi.json"),
+            "xopenapi.json (no leading slash) must not match");
+        assert!(!doc_path("/xopenapi.json", "openapi.json"),
+            "/xopenapi.json must not match (strip_suffix leaves '/x', not '/')");
+        // Wrong filename for its own endpoint.
+        assert!(!doc_path("/openrpc.json", "openapi.json"),
+            "openrpc.json path must not match openapi.json filename check");
+        // Deeper path with correct suffix.
+        assert!(doc_path("/v1/api/openapi.json", "openapi.json"),
+            "deeper path must still match");
+    }
+
+    /// Test 6: HEAD /openapi.json (unrouted) → 404.
+    /// The spec-doc short-circuit is GET-only: HEAD is not handled by
+    /// `serve_spec_doc_or_404` and falls through to normal dispatch, which
+    /// finds no route and returns 404.
+    /// This is intentional — HEAD /openapi.json is an undocumented non-use-case.
+    #[test]
+    fn head_request_for_doc_path_is_404() {
+        // No explicit route registered for /openapi.json — the router should
+        // NOT auto-serve the spec for HEAD requests (the short-circuit is GET-only).
+        let r = Router::new().get("/ping", ok_handler);
+        let resp = r.handle(&req("HEAD", "/openapi.json"));
+        // Current behavior: 404. HEAD is not in the spec-doc arm, so it falls
+        // through to normal dispatch which finds no matching route.
+        // This comment intentionally documents that the behavior is by design,
+        // not an oversight.
+        assert_eq!(resp.status, 404,
+            "HEAD /openapi.json (unregistered) must 404 — the doc short-circuit is GET-only");
     }
 }

@@ -135,6 +135,10 @@ pub fn error_response(id: Option<&Value>, error: &RpcError) -> response::HttpRes
 /// - serialising the handler's `Ok` value failed → `-32603 internal`
 pub struct Dispatcher {
     handlers: Vec<(String, Box<dyn Fn(Value) -> Result<Value, RpcError>>)>,
+    /// Captured method shapes — one entry per `.method()` registration,
+    /// in registration order. Used by `Router::rpc` to populate
+    /// `rpc_specs` at mount time and by the `rpc.discover` built-in.
+    specs: Vec<crate::spec::MethodSpec>,
 }
 
 impl Default for Dispatcher {
@@ -145,21 +149,32 @@ impl Default for Dispatcher {
 
 impl Dispatcher {
     pub fn new() -> Self {
-        Self { handlers: Vec::new() }
+        Self { handlers: Vec::new(), specs: Vec::new() }
     }
 
     /// Register a typed JSON-RPC method.
     ///
     /// `handler` is `fn(P) -> Result<R, RpcError>` (or any `Fn` of that shape).
-    /// `P` is the params struct (must `Deserialize`); `R` is the result
-    /// struct (must `Serialize`). The dispatcher decodes incoming `params`
-    /// into `P` and serialises the returned `R` into the wire response.
+    /// `P` is the params struct (must `Deserialize + JsonSchema`); `R` is
+    /// the result struct (must `Serialize + JsonSchema`). The dispatcher
+    /// decodes incoming `params` into `P`, serialises the returned `R`
+    /// into the wire response, and records the method's shape for
+    /// `rpc.discover` / `…/openrpc.json`.
     pub fn method<P, R, F>(mut self, name: &str, handler: F) -> Self
     where
-        P: for<'de> serde::Deserialize<'de> + 'static,
-        R: serde::Serialize + 'static,
+        P: for<'de> serde::Deserialize<'de> + schemars::JsonSchema + 'static,
+        R: serde::Serialize + schemars::JsonSchema + 'static,
         F: Fn(P) -> Result<R, RpcError> + 'static,
     {
+        // Capture the method shape before type erasure so rpc.discover
+        // and Router::rpc can serve the OpenRPC document without needing
+        // to reconstruct P/R from the erased closure.
+        self.specs.push(crate::spec::MethodSpec {
+            name: name.to_string(),
+            params_schema: crate::spec::schema_value::<P>(),
+            result_schema: crate::spec::schema_value::<R>(),
+        });
+
         let erased: Box<dyn Fn(Value) -> Result<Value, RpcError>> = Box::new(move |raw: Value| {
             let typed: P = serde_json::from_value(raw)
                 .map_err(|e| RpcError::invalid_params(format!("{e}")))?;
@@ -171,10 +186,23 @@ impl Dispatcher {
         self
     }
 
+    /// The captured method shapes (one per `.method()` registration, in order).
+    ///
+    /// Called by `Router::rpc` at mount time to populate its `rpc_specs`
+    /// table, and by the `rpc.discover` built-in to build the OpenRPC
+    /// document in-protocol.
+    pub fn method_specs(&self) -> &[crate::spec::MethodSpec] {
+        &self.specs
+    }
+
     /// Dispatch a request to the matching method handler.
     ///
     /// The whole envelope/error pipeline lives here so callers only see
     /// `req` in and `HttpResponse` out — no per-method boilerplate.
+    ///
+    /// The `rpc.discover` method is handled automatically (after all
+    /// user-registered handlers are consulted, so a user-registered
+    /// `rpc.discover` wins).
     pub fn handle(&self, req: &crate::Request) -> response::HttpResponse {
         let Some(body) = &req.body else {
             return error_response(None, &RpcError::invalid_request("missing body"));
@@ -185,6 +213,8 @@ impl Dispatcher {
         };
         let id = envelope.id.as_ref();
 
+        // User-registered handlers are consulted first so a user-registered
+        // `rpc.discover` wins over the built-in.
         for (name, handler) in &self.handlers {
             if name == &envelope.method {
                 return match handler(envelope.params.clone()) {
@@ -193,6 +223,66 @@ impl Dispatcher {
                 };
             }
         }
+
+        // Built-in OpenRPC service-discovery method (the spec reserves
+        // `rpc.*` as a namespace; this is the standard discovery hook).
+        // OpenRPC service discovery (the spec reserves rpc.*). DocInfo
+        // is the default here by necessity: at dispatch time only the
+        // Dispatcher survives — the Router (and its doc_info) is gone.
+        if envelope.method == "rpc.discover" {
+            let doc = crate::spec::build_openrpc(&crate::spec::DocInfo::default(), &self.specs);
+            return success_response(id, &doc);
+        }
+
         error_response(id, &RpcError::method_not_found(envelope.method.clone()))
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct EchoParams { msg: String }
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct EchoResult { msg: String }
+
+    fn echo(p: EchoParams) -> Result<EchoResult, RpcError> { Ok(EchoResult { msg: p.msg }) }
+
+    fn rpc_req(body: &str) -> crate::Request {
+        crate::Request {
+            method: "POST".into(), path: "/rpc".into(), headers: vec![],
+            body: Some(body.as_bytes().to_vec()), path_params: vec![], query_params: vec![],
+        }
+    }
+
+    #[test]
+    fn dispatcher_records_method_specs() {
+        let d = Dispatcher::new().method("echo", echo);
+        let specs = d.method_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "echo");
+        assert_eq!(specs[0].params_schema["properties"]["msg"]["type"], "string");
+        assert_eq!(specs[0].result_schema["properties"]["msg"]["type"], "string");
+    }
+
+    #[test]
+    fn rpc_discover_returns_openrpc_document() {
+        let d = Dispatcher::new().method("echo", echo);
+        let resp = d.handle(&rpc_req(r#"{"jsonrpc":"2.0","method":"rpc.discover","id":1}"#));
+        let v: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert_eq!(v["result"]["openrpc"], "1.3.2");
+        assert_eq!(v["result"]["methods"][0]["name"], "echo");
+    }
+
+    #[test]
+    fn user_registered_discover_wins() {
+        fn custom(_: serde_json::Value) -> Result<&'static str, RpcError> { Ok("custom") }
+        let d = Dispatcher::new().method("rpc.discover", custom);
+        let resp = d.handle(&rpc_req(r#"{"jsonrpc":"2.0","method":"rpc.discover","id":1}"#));
+        let v: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert_eq!(v["result"], "custom");
     }
 }

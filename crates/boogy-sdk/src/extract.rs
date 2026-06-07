@@ -21,6 +21,11 @@ use crate::router::Req;
 /// renders the correct HTTP status uniformly.
 pub trait FromRequest: Sized {
     fn from_request(req: &Req<'_>) -> Result<Self, ApiError>;
+
+    /// Spec-capture hook: record this extractor's contribution to the
+    /// route's operation spec. Default: contributes nothing. Called at
+    /// registration time only.
+    fn describe(_op: &mut crate::spec::OperationSpec) {}
 }
 
 // ─── Path<T> ────────────────────────────────────────────────────────────────
@@ -39,10 +44,13 @@ pub trait FromRequest: Sized {
 ///
 /// **Multi-param:** declare a struct with `#[derive(Deserialize)]` whose
 /// field names match the param names, or use `Path<HashMap<String,String>>`.
+///
+/// Implements [`FromRequest::describe`] to capture path-param shape into
+/// the route's [`crate::spec::OperationSpec`]; requires `T: schemars::JsonSchema`.
 #[derive(Debug, Clone)]
 pub struct Path<T>(pub T);
 
-impl<T: DeserializeOwned> FromRequest for Path<T> {
+impl<T: DeserializeOwned + schemars::JsonSchema> FromRequest for Path<T> {
     fn from_request(req: &Req<'_>) -> Result<Self, ApiError> {
         let pairs = req.params.as_pairs();
 
@@ -88,6 +96,12 @@ impl<T: DeserializeOwned> FromRequest for Path<T> {
             }
         }
     }
+
+    /// Records the path-parameter schema into `op.path_params` at
+    /// route-registration time. `T: schemars::JsonSchema` is required.
+    fn describe(op: &mut crate::spec::OperationSpec) {
+        op.path_params = Some(crate::spec::schema_value::<T>());
+    }
 }
 
 // ─── Query<T> ───────────────────────────────────────────────────────────────
@@ -97,12 +111,21 @@ impl<T: DeserializeOwned> FromRequest for Path<T> {
 /// Internally delegates to [`Req::parse_query_raw`] (no garde validation).
 /// To add validation, declare the struct with `garde::Validate` and call
 /// `req.parse_query()` directly, or compose this extractor with a guard.
+///
+/// Implements [`FromRequest::describe`] to capture query-param shape into
+/// the route's [`crate::spec::OperationSpec`]; requires `T: schemars::JsonSchema`.
 #[derive(Debug, Clone)]
 pub struct Query<T>(pub T);
 
-impl<T: DeserializeOwned> FromRequest for Query<T> {
+impl<T: DeserializeOwned + schemars::JsonSchema> FromRequest for Query<T> {
     fn from_request(req: &Req<'_>) -> Result<Self, ApiError> {
         req.parse_query_raw::<T>().map(Query)
+    }
+
+    /// Records the query-parameter schema into `op.query` at
+    /// route-registration time. `T: schemars::JsonSchema` is required.
+    fn describe(op: &mut crate::spec::OperationSpec) {
+        op.query = Some(crate::spec::schema_value::<T>());
     }
 }
 
@@ -120,13 +143,22 @@ impl<T: DeserializeOwned> FromRequest for Query<T> {
 /// ```ignore
 /// fn create(Json(body): Json<CreateReq>) -> Result<Json<CreateResp>, ApiError> { … }
 /// ```
-impl<T: DeserializeOwned> FromRequest for crate::response::Json<T> {
+///
+/// Implements [`FromRequest::describe`] to capture the request-body schema
+/// into the route's [`crate::spec::OperationSpec`]; requires `T: schemars::JsonSchema`.
+impl<T: DeserializeOwned + schemars::JsonSchema> FromRequest for crate::response::Json<T> {
     fn from_request(req: &Req<'_>) -> Result<Self, ApiError> {
         let bytes =
             req.body().ok_or_else(|| ApiError::bad_request("missing JSON body"))?;
         let v: T = serde_json::from_slice(bytes)
             .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?;
         Ok(crate::response::Json(v))
+    }
+
+    /// Records the JSON request-body schema into `op.request_body` at
+    /// route-registration time. `T: schemars::JsonSchema` is required.
+    fn describe(op: &mut crate::spec::OperationSpec) {
+        op.request_body = Some(crate::spec::schema_value::<T>());
     }
 }
 
@@ -139,6 +171,9 @@ impl<T: DeserializeOwned> FromRequest for crate::response::Json<T> {
 /// Sources the principal from the same thread-local the `wit_glue!`-emitted
 /// `auth::current_principal()` reads — stashed at request entry by the macro
 /// so both sites agree without a WIT call inside `boogy-sdk`.
+///
+/// Implements [`FromRequest::describe`] to set `op.requires_principal = true`,
+/// marking the route as authentication-required in the spec.
 #[derive(Debug, Clone)]
 pub struct Principal(pub String);
 
@@ -147,6 +182,11 @@ impl FromRequest for Principal {
         crate::request_state::_request_principal()
             .map(Principal)
             .ok_or_else(ApiError::unauthenticated)
+    }
+
+    /// Marks the route as requiring authentication in the operation spec.
+    fn describe(op: &mut crate::spec::OperationSpec) {
+        op.requires_principal = true;
     }
 }
 
@@ -200,7 +240,7 @@ mod tests {
 
     use crate::response::Json;
 
-    #[derive(Debug, serde::Deserialize, PartialEq)]
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema, PartialEq)]
     struct Foo {
         x: i32,
     }
@@ -237,7 +277,7 @@ mod tests {
 
     // ── Query ───────────────────────────────────────────────────────────────
 
-    #[derive(Debug, serde::Deserialize, PartialEq)]
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema, PartialEq)]
     struct QFoo {
         x: i32,
     }
@@ -291,7 +331,7 @@ mod tests {
         assert_eq!(err.status, 400);
     }
 
-    #[derive(Debug, serde::Deserialize, PartialEq)]
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema, PartialEq)]
     struct PathStruct {
         user_id: u64,
         post_id: u64,
@@ -371,5 +411,27 @@ mod tests {
         crate::request_state::_set_fallback_principal(None);
         let opt = result.unwrap();
         assert_eq!(opt.map(|p| p.0).as_deref(), Some("api_key_user"));
+    }
+
+    // ── describe() ──────────────────────────────────────────────────────────
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct DescQuery { limit: u32 }
+
+    #[test]
+    fn extractors_describe_into_operation() {
+        let mut op = crate::spec::OperationSpec::default();
+        <Query<DescQuery> as FromRequest>::describe(&mut op);
+        <Json<DescQuery> as FromRequest>::describe(&mut op);
+        <Path<u64> as FromRequest>::describe(&mut op);
+        <Principal as FromRequest>::describe(&mut op);
+        assert!(op.query.is_some());
+        assert!(op.request_body.is_some());
+        assert!(op.path_params.is_some());
+        assert!(op.requires_principal);
+        let mut op2 = crate::spec::OperationSpec::default();
+        <Option<Principal> as FromRequest>::describe(&mut op2);
+        assert!(!op2.requires_principal, "optional principal is not a requirement");
     }
 }
