@@ -911,6 +911,62 @@ and `.distance` (f32) fields. Lower distance is better for Euclidean;
 higher dot product is better for DotProduct; Cosine returns values in
 [0, 2] where 0 is identical.
 
+## Websockets (real-time channels)
+
+A service can broadcast real-time messages to subscribers over declared
+channels. Subscribers connect to the platform streaming gateway; the
+service only publishes. Enable the capability and declare each channel in
+the manifest, then use the functions emitted by `wit_glue!`.
+
+**Manifest:**
+```toml
+[capabilities]
+websockets = true
+
+[[websockets.channels]]
+name = "ticker"
+class = "public"          # anyone may subscribe
+
+[[websockets.channels]]
+name = "inbox"
+class = "private"         # subscribers need a grant
+replay = 50               # optional: keep the last N messages for late joiners
+```
+
+**SDK functions** (available unqualified after `wit_glue!`):
+
+| Function | Purpose |
+|---|---|
+| `ws_publish(channel, payload) -> Result<(), PublishError>` | Broadcast a UTF-8 payload (JSON by convention, ≤ 16 KiB) to a declared channel. |
+| `ws_mint_subscribe_grant(channel, ttl_seconds) -> Result<String, GrantError>` | Mint a short-lived grant for a private channel; hand it to the user via your own API so they can subscribe. `ttl_seconds` must be `10..=3600` — out of range is rejected (`InvalidTtl`), never clamped. |
+
+**Error enums** (`boogy_sdk::websockets`):
+
+- `PublishError`: `CapabilityDenied`, `UnknownChannel`, `PayloadTooLarge`, `RateLimited`, `BackendUnavailable`.
+- `GrantError`: `CapabilityDenied`, `UnknownChannel`, `NotPrivate`, `InvalidTtl`, `RateLimited`.
+
+**Usage example:**
+
+```rust
+fn push_price(req: &mut Req<'_>) -> Result<NoContent, ApiError> {
+    let input: PriceInput = validate_body(req.body())?;
+    ws_publish("ticker", &json::json!({ "px": input.px }).to_string())
+        .map_err(ApiError::internal)?;
+    Ok(NoContent)
+}
+
+fn subscribe_inbox(req: &mut Req<'_>) -> Result<Json<json::Value>, ApiError> {
+    let grant = ws_mint_subscribe_grant("inbox", 300)
+        .map_err(ApiError::internal)?;
+    Ok(Json(json::json!({ "grant": grant })))
+}
+```
+
+Publishing is service -> subscribers only; there is no way to publish to
+another service's channels. Public channels need no grant; private
+channels require the caller to present a grant minted by the owning
+service.
+
 ## API keys (`api_keys_glue!`)
 
 If you invoke `boogy_sdk::api_keys_glue!(bindings)`:

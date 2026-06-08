@@ -14,6 +14,7 @@ world service {
     import outbound-http;
     import background-jobs;
     import vector;
+    import websockets;
 }
 
 // Superset world for APIs that also process background jobs. Targets
@@ -36,4 +37,5 @@ world service-with-jobs {
     import outbound-http;
     import background-jobs;
     import vector;
+    import websockets;
 }

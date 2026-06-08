@@ -69,6 +69,7 @@ pub mod schema_resolve;
 pub mod spec;
 pub mod store;
 pub mod vector;
+pub mod websockets;
 
 pub use boogy_sdk_macros::job;
 pub use boogy_sdk_macros::Model;

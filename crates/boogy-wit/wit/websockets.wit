@@ -1,0 +1,30 @@
+package boogy:platform@0.1.0;
+
+// Service-published real-time channels, delivered to subscribers through
+// the platform streaming gateway. Channels are declared in the service
+// manifest with a class (public | private) and an optional replay ring.
+interface websockets {
+    variant publish-error {
+        capability-denied,
+        unknown-channel,
+        payload-too-large,
+        rate-limited,
+        backend-unavailable,
+    }
+
+    variant grant-error {
+        capability-denied,
+        unknown-channel,
+        not-private,
+        invalid-ttl,
+        rate-limited,
+    }
+
+    // Broadcast a UTF-8 payload (JSON by convention) to a declared channel.
+    publish: func(channel: string, payload: string) -> result<_, publish-error>;
+
+    // Mint a short-lived subscription grant for a private channel. The
+    // service returns the grant to its user via its own API; the user
+    // presents it when subscribing on the streaming gateway.
+    mint-subscribe-grant: func(channel: string, ttl-seconds: u32) -> result<string, grant-error>;
+}

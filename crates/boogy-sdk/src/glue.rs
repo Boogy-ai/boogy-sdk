@@ -121,6 +121,8 @@ macro_rules! wit_glue {
         #[allow(unused_imports)]
         use $bindings::boogy::platform::vector as vector_bindings;
         #[allow(unused_imports)]
+        use $bindings::boogy::platform::websockets as ws_bindings;
+        #[allow(unused_imports)]
         use $crate::json::{self, Deserialize, Serialize};
         #[allow(unused_imports)]
         use $crate::response::{self, Created, IntoResponse, Json, NoContent, Redirect};
@@ -2817,6 +2819,77 @@ macro_rules! wit_glue {
                 }
                 jobs_bindings::JobStatusInfo::Cancelled => {
                     $crate::jobs::JobStatusInfo::Cancelled
+                }
+            }
+        }
+
+        // -- Websockets bridging --
+        //
+        // Same shape as jobs: clean SDK types in, WIT types out via
+        // `ws_bindings::publish` / `mint_subscribe_grant`. Capability
+        // gate is host-side; if `[capabilities] websockets = false`,
+        // calls return CapabilityDenied.
+
+        fn ws_publish(
+            channel: &str,
+            payload: &str,
+        ) -> ::core::result::Result<(), $crate::websockets::PublishError> {
+            match ws_bindings::publish(&channel.to_string(), &payload.to_string()) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(__ws_publish_error_to_sdk(e)),
+            }
+        }
+
+        fn ws_mint_subscribe_grant(
+            channel: &str,
+            ttl_seconds: u32,
+        ) -> ::core::result::Result<String, $crate::websockets::GrantError> {
+            match ws_bindings::mint_subscribe_grant(&channel.to_string(), ttl_seconds) {
+                Ok(grant) => Ok(grant),
+                Err(e) => Err(__ws_grant_error_to_sdk(e)),
+            }
+        }
+
+        fn __ws_publish_error_to_sdk(
+            e: ws_bindings::PublishError,
+        ) -> $crate::websockets::PublishError {
+            match e {
+                ws_bindings::PublishError::CapabilityDenied => {
+                    $crate::websockets::PublishError::CapabilityDenied
+                }
+                ws_bindings::PublishError::UnknownChannel => {
+                    $crate::websockets::PublishError::UnknownChannel
+                }
+                ws_bindings::PublishError::PayloadTooLarge => {
+                    $crate::websockets::PublishError::PayloadTooLarge
+                }
+                ws_bindings::PublishError::RateLimited => {
+                    $crate::websockets::PublishError::RateLimited
+                }
+                ws_bindings::PublishError::BackendUnavailable => {
+                    $crate::websockets::PublishError::BackendUnavailable
+                }
+            }
+        }
+
+        fn __ws_grant_error_to_sdk(
+            e: ws_bindings::GrantError,
+        ) -> $crate::websockets::GrantError {
+            match e {
+                ws_bindings::GrantError::CapabilityDenied => {
+                    $crate::websockets::GrantError::CapabilityDenied
+                }
+                ws_bindings::GrantError::UnknownChannel => {
+                    $crate::websockets::GrantError::UnknownChannel
+                }
+                ws_bindings::GrantError::NotPrivate => {
+                    $crate::websockets::GrantError::NotPrivate
+                }
+                ws_bindings::GrantError::InvalidTtl => {
+                    $crate::websockets::GrantError::InvalidTtl
+                }
+                ws_bindings::GrantError::RateLimited => {
+                    $crate::websockets::GrantError::RateLimited
                 }
             }
         }
