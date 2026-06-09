@@ -811,6 +811,32 @@ Router::new()
     // ...
 ```
 
+### Documenting endpoints (summary & description)
+
+Attach human-readable docs to individual operations so other agents and
+clients understand each endpoint. `.summary(...)` / `.description(...)`
+are chainable and apply to the **next** route/method registered, then
+clear themselves (one annotation = exactly one operation):
+
+```rust
+Router::new()
+    .summary("List widgets")
+    .description("Return every widget the caller owns.")
+    .get("/widgets", list_widgets)   // ← annotated
+    .get("/gadgets", list_gadgets);  // ← no summary/description
+
+Dispatcher::new()
+    .summary("Search notes")
+    .description("Full-text search over the caller's notes.")
+    .method::<SearchParams, SearchResult, _>("search_notes", search);
+```
+
+Route annotations flow into `…/openapi.json` (`summary`/`description` on
+the operation); method annotations flow into `…/openrpc.json`
+(`summary`/`description` on the method). Absent keys are omitted, not
+emitted as null. This is per-operation; `Router::info` sets the
+document-level identity instead.
+
 **Reserved filenames.** `openapi.json` and `openrpc.json` are reserved
 at the leaf of any path in your tree. An explicit `GET` route whose
 literal path ends in one of those filenames overrides the generated doc.
@@ -819,6 +845,25 @@ A `{param}`-style route at the same position does NOT capture them.
 **Host bypass.** The host forwards spec-doc GETs to the service even
 when the manifest `[routing] methods` list excludes GET. No manifest
 change needed.
+
+**Mount path is external.** A provision-time `[routing] path` override
+relocates the instance's external URL (so one module can run as several
+instances at distinct mounts). The guest keeps serving its own module
+routes — the host rewrites the mount prefix transparently on the way in,
+and remaps the served `openapi.json`/`openrpc.json` path keys to the mount.
+Write handlers against the module's own paths; don't hardcode the mount.
+Mounts are unique per owner (a colliding/overlapping mount is rejected 409).
+
+**Module-intrinsic vs deployment config.** Two tiers in the manifest.
+*Module-intrinsic* (author-fixed, never changed by a provisioner):
+`[capabilities]`, declared `[[websockets.channels]]`, declared secret
+**names**, routing methods + internal base path. *Deployment config* (set
+per instance at provision time): service id, mount path, `[ingress]`,
+`[limits]`, `[outbound] allowed_hosts`, and secret **values**. The shipped
+`[limits]` are defaults — a provisioner may raise or lower each within the
+**platform caps** (not the module's value); capabilities can never be
+widened by a provisioner. Outbound `allowed_hosts` is provisioner-set, but
+the runtime IP firewall blocks internal/loopback regardless.
 
 **`JsonSchema` derive requirement.** Typed extractors (`Json<T>`,
 `Query<T>`, `Path<T>`) and typed responses (`Json<T>`, `Created<T>`)

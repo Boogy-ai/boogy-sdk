@@ -650,6 +650,12 @@ pub struct Router {
     /// declared here so `rpc_method_specs()` and the `undocumented()`
     /// builder can reference it now.
     rpc_specs: Vec<(String, bool, Vec<crate::spec::MethodSpec>)>,
+    /// Summary staged by `Router::summary`, applied to (and cleared by) the
+    /// NEXT route registered. `None` between annotations.
+    pending_summary: Option<String>,
+    /// Description staged by `Router::description`, applied to (and cleared
+    /// by) the NEXT route registered. `None` between annotations.
+    pending_description: Option<String>,
 }
 
 impl Default for Router {
@@ -667,7 +673,23 @@ impl Router {
             doc_info: None,
             undocumented: false,
             rpc_specs: vec![],
+            pending_summary: None,
+            pending_description: None,
         }
+    }
+
+    /// Attach a one-line summary to the NEXT route/method registered. Flows into
+    /// the generated openapi.json (`summary`) so REST clients + agents see what
+    /// the endpoint does.
+    pub fn summary(mut self, s: impl Into<String>) -> Self {
+        self.pending_summary = Some(s.into());
+        self
+    }
+
+    /// Attach a longer description to the NEXT route registered (openapi `description`).
+    pub fn description(mut self, d: impl Into<String>) -> Self {
+        self.pending_description = Some(d.into());
+        self
     }
 
     /// Register a single (method, path, handler) triple.
@@ -687,11 +709,14 @@ impl Router {
     where
         H: IntoHandler<Args> + 'static,
     {
+        let mut op = H::describe();
+        op.summary = self.pending_summary.take();
+        op.description = self.pending_description.take();
         if !self.undocumented {
             self.specs.push(crate::spec::SpecEntry::Rest {
                 method: method.to_uppercase(),
                 path: path.to_string(),
-                op: H::describe(),
+                op,
                 guarded: !self.group_guards.is_empty(),
             });
         }
@@ -737,7 +762,9 @@ impl Router {
     {
         // Capture the spec once (before type erasure) then push per method.
         // Using route_inner for each registration avoids double spec entries.
-        let op = H::describe();
+        let mut op = H::describe();
+        op.summary = self.pending_summary.take();
+        op.description = self.pending_description.take();
         let h = handler.into_handler();
         for m in methods {
             if !self.undocumented {
@@ -909,6 +936,8 @@ impl Router {
             doc_info: None,
             undocumented: false,
             rpc_specs: vec![],
+            pending_summary: None,
+            pending_description: None,
         };
         let built = build(RouteSet(inner)).0;
         // Merge built's routes back into self. Each route's RouteEntry
@@ -1082,6 +1111,8 @@ impl Router {
             doc_info: None,
             undocumented: true,
             rpc_specs: vec![],
+            pending_summary: None,
+            pending_description: None,
         };
         let built = build(RouteSet(inner)).0;
         // Merge only the routes (no specs — that's the whole point).
@@ -2445,6 +2476,31 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
         assert_eq!(doc["info"]["title"], "boogy-service");
         assert_eq!(doc["info"]["version"], "0.0.0");
+    }
+
+    /// `.summary()/.description()` annotate exactly the NEXT route and flow
+    /// into the OpenAPI operation; an un-annotated route carries neither key.
+    #[test]
+    fn summary_description_flow_into_openapi_per_route() {
+        let r = Router::new()
+            .summary("List widgets")
+            .description("Return every widget the caller owns.")
+            .get("/widgets", ok_handler)
+            .get("/gadgets", ok_handler);
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+
+        // Annotated route carries both keys.
+        let widgets = &doc["paths"]["/widgets"]["get"];
+        assert_eq!(widgets["summary"], "List widgets");
+        assert_eq!(widgets["description"], "Return every widget the caller owns.");
+
+        // The annotation is per-route (cleared via take()): the next route
+        // registered without annotations must have neither key.
+        let gadgets = &doc["paths"]["/gadgets"]["get"];
+        assert!(gadgets.get("summary").is_none(), "summary must not leak to the next route");
+        assert!(gadgets.get("description").is_none(), "description must not leak to the next route");
     }
 
     /// Test 5: direct unit test of `doc_path` covering the boundary cases

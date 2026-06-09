@@ -139,6 +139,12 @@ pub struct Dispatcher {
     /// in registration order. Used by `Router::rpc` to populate
     /// `rpc_specs` at mount time and by the `rpc.discover` built-in.
     specs: Vec<crate::spec::MethodSpec>,
+    /// Summary staged by `Dispatcher::summary`, applied to (and cleared by)
+    /// the NEXT method registered. `None` between annotations.
+    pending_summary: Option<String>,
+    /// Description staged by `Dispatcher::description`, applied to (and
+    /// cleared by) the NEXT method registered. `None` between annotations.
+    pending_description: Option<String>,
 }
 
 impl Default for Dispatcher {
@@ -149,7 +155,27 @@ impl Default for Dispatcher {
 
 impl Dispatcher {
     pub fn new() -> Self {
-        Self { handlers: Vec::new(), specs: Vec::new() }
+        Self {
+            handlers: Vec::new(),
+            specs: Vec::new(),
+            pending_summary: None,
+            pending_description: None,
+        }
+    }
+
+    /// Attach a one-line summary to the NEXT method registered. Flows into
+    /// the generated openrpc.json (`summary`) so JSON-RPC clients + agents
+    /// see what the method does.
+    pub fn summary(mut self, s: impl Into<String>) -> Self {
+        self.pending_summary = Some(s.into());
+        self
+    }
+
+    /// Attach a longer description to the NEXT method registered (openrpc
+    /// `description`).
+    pub fn description(mut self, d: impl Into<String>) -> Self {
+        self.pending_description = Some(d.into());
+        self
     }
 
     /// Register a typed JSON-RPC method.
@@ -173,6 +199,8 @@ impl Dispatcher {
             name: name.to_string(),
             params_schema: crate::spec::schema_value::<P>(),
             result_schema: crate::spec::schema_value::<R>(),
+            summary: self.pending_summary.take(),
+            description: self.pending_description.take(),
         });
 
         let erased: Box<dyn Fn(Value) -> Result<Value, RpcError>> = Box::new(move |raw: Value| {
@@ -266,6 +294,29 @@ mod tests {
         assert_eq!(specs[0].name, "echo");
         assert_eq!(specs[0].params_schema["properties"]["msg"]["type"], "string");
         assert_eq!(specs[0].result_schema["properties"]["msg"]["type"], "string");
+    }
+
+    #[test]
+    fn summary_description_flow_into_openrpc_per_method() {
+        let d = Dispatcher::new()
+            .summary("Echo back")
+            .description("Return the message unchanged.")
+            .method("echo", echo)
+            .method("echo2", echo);
+
+        // Annotation lands on the first (annotated) method.
+        let resp = d.handle(&rpc_req(r#"{"jsonrpc":"2.0","method":"rpc.discover","id":1}"#));
+        let v: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        let m0 = &v["result"]["methods"][0];
+        assert_eq!(m0["name"], "echo");
+        assert_eq!(m0["summary"], "Echo back");
+        assert_eq!(m0["description"], "Return the message unchanged.");
+
+        // Per-method (cleared via take()): the next method has neither key.
+        let m1 = &v["result"]["methods"][1];
+        assert_eq!(m1["name"], "echo2");
+        assert!(m1.get("summary").is_none(), "summary must not leak to the next method");
+        assert!(m1.get("description").is_none(), "description must not leak to the next method");
     }
 
     #[test]

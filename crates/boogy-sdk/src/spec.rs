@@ -49,6 +49,12 @@ pub struct ResponseSpec {
 /// Everything captured about one REST route's request/response shape.
 #[derive(Debug, Clone, Default)]
 pub struct OperationSpec {
+    /// One-line human summary, emitted as the operation's `summary` in
+    /// OpenAPI. Set via `Router::summary` at registration time.
+    pub summary: Option<String>,
+    /// Longer prose, emitted as the operation's `description` in OpenAPI.
+    /// Set via `Router::description` at registration time.
+    pub description: Option<String>,
     /// JSON request-body schema (from a `Json<T>` extractor).
     pub request_body: Option<Value>,
     /// Query-string schema (from a `Query<T>` extractor; an object schema
@@ -135,6 +141,12 @@ pub struct MethodSpec {
     pub name: String,
     pub params_schema: Value,
     pub result_schema: Value,
+    /// One-line human summary, emitted as the method's `summary` in OpenRPC.
+    /// Set via `rpc::Dispatcher::summary` at registration time.
+    pub summary: Option<String>,
+    /// Longer prose, emitted as the method's `description` in OpenRPC.
+    /// Set via `rpc::Dispatcher::description` at registration time.
+    pub description: Option<String>,
 }
 
 /// The RFC 7807 problem schema every SDK error path emits, advertised as
@@ -162,6 +174,13 @@ pub fn build_openapi(info: &DocInfo, reg: &SpecRegistry) -> Value {
         match entry {
             SpecEntry::Rest { method, path, op, guarded } => {
                 let mut operation = serde_json::Map::new();
+
+                if let Some(s) = &op.summary {
+                    operation.insert("summary".into(), Value::String(s.clone()));
+                }
+                if let Some(d) = &op.description {
+                    operation.insert("description".into(), Value::String(d.clone()));
+                }
 
                 // Parameters: named path params + query properties.
                 let mut params = Vec::new();
@@ -303,15 +322,23 @@ pub fn build_openrpc(info: &DocInfo, methods: &[MethodSpec]) -> Value {
             "version": info.version,
             "description": info.description,
         },
-        "methods": methods.iter().map(|m| json!({
-            "name": m.name,
-            "params": [{
+        "methods": methods.iter().map(|m| {
+            let mut method = serde_json::Map::new();
+            method.insert("name".into(), Value::String(m.name.clone()));
+            if let Some(s) = &m.summary {
+                method.insert("summary".into(), Value::String(s.clone()));
+            }
+            if let Some(d) = &m.description {
+                method.insert("description".into(), Value::String(d.clone()));
+            }
+            method.insert("params".into(), json!([{
                 "name": "params",
                 "required": true,
                 "schema": m.params_schema,
-            }],
-            "result": { "name": "result", "schema": m.result_schema },
-        })).collect::<Vec<_>>(),
+            }]));
+            method.insert("result".into(), json!({ "name": "result", "schema": m.result_schema }));
+            Value::Object(method)
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -452,11 +479,30 @@ mod tests {
             name: "search_notes".into(),
             params_schema: schema_value::<CreateNote>(),
             result_schema: schema_value::<CreateNote>(),
+            summary: None,
+            description: None,
         }];
         let doc = build_openrpc(&DocInfo::default(), &methods);
         assert_eq!(doc["openrpc"], "1.3.2");
         assert_eq!(doc["methods"][0]["name"], "search_notes");
         assert_eq!(doc["methods"][0]["params"][0]["name"], "params");
         assert!(doc["methods"][0]["result"]["schema"].is_object());
+        // Without annotations, no summary/description keys are emitted.
+        assert!(doc["methods"][0].get("summary").is_none());
+        assert!(doc["methods"][0].get("description").is_none());
+    }
+
+    #[test]
+    fn openrpc_method_carries_summary_and_description() {
+        let methods = vec![MethodSpec {
+            name: "search_notes".into(),
+            params_schema: schema_value::<CreateNote>(),
+            result_schema: schema_value::<CreateNote>(),
+            summary: Some("Search notes".into()),
+            description: Some("Full-text search over the caller's notes.".into()),
+        }];
+        let doc = build_openrpc(&DocInfo::default(), &methods);
+        assert_eq!(doc["methods"][0]["summary"], "Search notes");
+        assert_eq!(doc["methods"][0]["description"], "Full-text search over the caller's notes.");
     }
 }
