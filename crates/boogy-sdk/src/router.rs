@@ -1277,6 +1277,18 @@ impl RouteSet {
         Self(self.0.route_many(methods, path, handler))
     }
 
+    /// Set the OpenAPI summary for the NEXT route registered in this group
+    /// (same pending-doc semantics as [`Router::summary`]).
+    pub fn summary(self, s: impl Into<String>) -> Self {
+        Self(self.0.summary(s))
+    }
+
+    /// Set the OpenAPI description for the NEXT route registered in this group
+    /// (same pending-doc semantics as [`Router::description`]).
+    pub fn description(self, d: impl Into<String>) -> Self {
+        Self(self.0.description(d))
+    }
+
     pub fn get<H, Args>(self, path: &str, handler: H) -> Self
     where H: IntoHandler<Args> + 'static { Self(self.0.get(path, handler)) }
 

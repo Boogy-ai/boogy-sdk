@@ -673,6 +673,26 @@ macro_rules! wit_glue {
             create_table_from(&M::schema());
         }
 
+        /// Register a `Model`'s schema under an OVERRIDDEN table name plus a
+        /// caller-supplied index set — for families of identically-shaped tables
+        /// whose names are only known at runtime (e.g. one table per time
+        /// window). The model supplies the column set + types via its
+        /// `schema()`; `table` replaces the model's compile-time `TABLE`, and
+        /// `indices` replaces the model's declared indexes (their names usually
+        /// need to embed the per-table suffix, which a single model can't
+        /// express). Idempotent (CREATE TABLE / index IF NOT EXISTS), same as
+        /// `create_model`.
+        #[allow(dead_code)]
+        fn create_model_as<M: $crate::model::Model>(
+            table: &str,
+            indices: ::std::vec::Vec<$crate::store::Index>,
+        ) {
+            let mut schema = M::schema();
+            schema.name = table.to_string();
+            schema.indices = indices;
+            create_table_from(&schema);
+        }
+
         /// Atomic keyed counter: `counter += delta`, upserting the row
         /// identified by the composite `key`. First call inserts
         /// (`counter = delta` + the `set` columns); later calls

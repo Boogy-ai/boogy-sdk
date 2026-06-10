@@ -71,6 +71,16 @@ pub fn resolve(table: &str, patterns: &[AccessPattern], explicit: &[Index]) -> (
         }
     }
     for ix in explicit {
+        // The declared `name` is canonicalized away — warn if it differs so the
+        // author doesn't depend on a hand-typed name (which silently drifts from
+        // the real index and breaks any cursor/`for_each_batch` hint by that name).
+        let canonical = index_name(table, &ix.columns);
+        if !ix.name.is_empty() && ix.name != canonical {
+            diags.push(Diagnostic::Warning(format!(
+                "declared index name '{}' is ignored; this index is canonically named '{}'. \
+                 Reference indexes via access patterns / the Query DSL, not by name.",
+                ix.name, canonical)));
+        }
         want(ix.columns.clone(), ix.unique, ix.covering, false, false);
     }
 
@@ -211,6 +221,44 @@ mod tests {
         assert_eq!(idx.len(), 1);
         assert_eq!(idx[0].columns, vec!["score".to_string()]);
         assert!(idx[0].covering);
+    }
+
+    // EDGE: a declared explicit-index name that differs from the canonical
+    // `ix_<table>_<cols>` emits a Warning (the declared name is ignored, and
+    // depending on it — e.g. as a `for_each_batch`/`open_cursor` hint — silently
+    // drifts). The resolved index still carries the canonical name.
+    #[test]
+    fn explicit_index_with_drifting_name_warns() {
+        let explicit = vec![Index {
+            name: "idx_invest_investor".into(),
+            columns: vec!["investor_principal".into(), "invested_at".into()],
+            unique: false, covering: false,
+        }];
+        let (idx, diags) = resolve("post_investments", &[], &explicit);
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx[0].name, "ix_post_investments_investor_principal_invested_at");
+        assert_eq!(diags.len(), 1);
+        let Diagnostic::Warning(m) = &diags[0] else { panic!("expected a Warning, got {:?}", diags[0]) };
+        assert!(m.contains("idx_invest_investor"), "warning names the declared name: {m}");
+        assert!(m.contains("ix_post_investments_investor_principal_invested_at"),
+            "warning names the canonical name: {m}");
+    }
+
+    // EDGE: an explicit index whose declared name ALREADY equals the canonical
+    // name (or is empty) emits NO warning — no false positive.
+    #[test]
+    fn explicit_index_with_canonical_name_is_silent() {
+        let explicit = vec![Index {
+            name: "ix_t_a".into(), columns: vec!["a".into()], unique: false, covering: false,
+        }];
+        let (_, diags) = resolve("t", &[], &explicit);
+        assert!(diags.is_empty(), "canonical declared name should not warn: {diags:?}");
+
+        let empty_named = vec![Index {
+            name: String::new(), columns: vec!["a".into()], unique: false, covering: false,
+        }];
+        let (_, diags2) = resolve("t", &[], &empty_named);
+        assert!(diags2.is_empty(), "empty declared name should not warn: {diags2:?}");
     }
 
     fn ix(name: &str) -> Index {
