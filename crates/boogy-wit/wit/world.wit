@@ -12,6 +12,7 @@ world service {
     import runtime;
     import peer;
     import outbound-http;
+    import secrets;
     import background-jobs;
     import vector;
     import websockets;
@@ -35,6 +36,7 @@ world service-with-jobs {
     import runtime;
     import peer;
     import outbound-http;
+    import secrets;
     import background-jobs;
     import vector;
     import websockets;

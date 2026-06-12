@@ -117,6 +117,8 @@ macro_rules! wit_glue {
         #[allow(unused_imports)]
         use $bindings::boogy::platform::peer as peer_bindings;
         #[allow(unused_imports)]
+        use $bindings::boogy::platform::secrets as secrets_bindings;
+        #[allow(unused_imports)]
         use $bindings::boogy::platform::background_jobs as jobs_bindings;
         #[allow(unused_imports)]
         use $bindings::boogy::platform::vector as vector_bindings;
@@ -1051,6 +1053,22 @@ macro_rules! wit_glue {
         /// unix milliseconds (u64).
         fn now_millis() -> u64 {
             $bindings::boogy::platform::runtime::now_millis()
+        }
+
+        /// This service's own host-pinned identity — the
+        /// `(owner, service_id)` of the deployment currently executing.
+        /// Wrapper around `runtime::self_identity()` so user code can call
+        /// `crate::self_identity()` without spelling out the bindings
+        /// path.
+        ///
+        /// The value is set by the host from the matched route (HTTP edge)
+        /// / the CALLEE on a `peer::fetch` hop (so a callee reads ITS OWN
+        /// identity, never the caller's) / the job target in a background
+        /// job. It can never be derived from guest input or an inbound
+        /// header, so it's safe to authorize on. Always available — no
+        /// `[capabilities]` grant required.
+        fn self_identity() -> $bindings::boogy::platform::runtime::ServiceIdentity {
+            $bindings::boogy::platform::runtime::self_identity()
         }
 
         /// Build an ascending `SortBy` for `column`. Pairs with
@@ -2731,6 +2749,71 @@ macro_rules! wit_glue {
                 peer_bindings::FetchError::DepthExceeded => $crate::peer::PeerError::DepthExceeded,
                 peer_bindings::FetchError::CapabilityDenied => $crate::peer::PeerError::CapabilityDenied,
                 peer_bindings::FetchError::Internal(s) => $crate::peer::PeerError::Internal(s),
+            }
+        }
+
+        // -- Host-mediated secret verification bridge --
+        //
+        // Translates the SDK `VerifyError` to/from the WIT-generated
+        // equivalent. The host resolves + KMS-unwraps the named secret
+        // and verifies the HMAC entirely host-side — the secret value,
+        // the message, and the computed tag never cross back into wasm.
+        // There is NO `[capabilities]` flag for `secrets`: the gate is
+        // the per-secret `[secrets]` `hmac-verify` usage declaration. An
+        // undeclared / wrong-usage / unbound ref returns
+        // `VerifyError::UnknownSecret`.
+        #[allow(dead_code)]
+        fn secrets_verify_hmac(
+            secret_ref: &str,
+            algorithm: $crate::secrets::HmacAlgorithm,
+            message: &[u8],
+            expected_hex: &str,
+        ) -> ::core::result::Result<bool, $crate::secrets::VerifyError> {
+            let wit_alg = match algorithm {
+                $crate::secrets::HmacAlgorithm::Sha256 => {
+                    secrets_bindings::HmacAlgorithm::Sha256
+                }
+            };
+            match secrets_bindings::verify_hmac(
+                &secret_ref.to_string(),
+                wit_alg,
+                &message.to_vec(),
+                &expected_hex.to_string(),
+            ) {
+                Ok(b) => Ok(b),
+                Err(e) => Err(__secrets_verify_error_to_sdk(e)),
+            }
+        }
+
+        /// SHA-256 convenience over [`secrets_verify_hmac`] — the common
+        /// case for webhook signature verification. Equivalent to passing
+        /// `HmacAlgorithm::Sha256`. Catalog handlers call this:
+        /// `secrets_verify_hmac_sha256("stripe_webhook_secret",
+        /// &signed_message, &expected_hex)?`.
+        #[allow(dead_code)]
+        fn secrets_verify_hmac_sha256(
+            secret_ref: &str,
+            message: &[u8],
+            expected_hex: &str,
+        ) -> ::core::result::Result<bool, $crate::secrets::VerifyError> {
+            secrets_verify_hmac(
+                secret_ref,
+                $crate::secrets::HmacAlgorithm::Sha256,
+                message,
+                expected_hex,
+            )
+        }
+
+        fn __secrets_verify_error_to_sdk(
+            e: secrets_bindings::VerifyError,
+        ) -> $crate::secrets::VerifyError {
+            match e {
+                secrets_bindings::VerifyError::UnknownSecret(s) => {
+                    $crate::secrets::VerifyError::UnknownSecret(s)
+                }
+                secrets_bindings::VerifyError::Internal(s) => {
+                    $crate::secrets::VerifyError::Internal(s)
+                }
             }
         }
 

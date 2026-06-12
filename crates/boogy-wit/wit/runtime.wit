@@ -4,4 +4,19 @@ interface runtime {
     now-millis: func() -> u64;
     random-bytes: func(len: u32) -> list<u8>;
     log: func(level: string, message: string);
+
+    /// The host-pinned identity of the CURRENTLY-EXECUTING service:
+    /// the `(owner, service-id)` of the deployment whose route matched
+    /// (at the HTTP edge), the CALLEE's identity on a `peer::fetch` hop
+    /// (never the caller's), or the job's `(owner, service)` in a
+    /// background job. Always set host-side from routing / the callee
+    /// workload / the job target — never derived from any guest-supplied
+    /// value or inbound header, so a service cannot spoof its own
+    /// identity. Ungated: knowing your own identity is benign and always
+    /// available (conceptually like reading the clock).
+    record service-identity {
+        owner: string,
+        service-id: string,
+    }
+    self-identity: func() -> service-identity;
 }
