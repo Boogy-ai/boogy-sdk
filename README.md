@@ -52,6 +52,13 @@ expert workflows: `boogy skills install` (vendors
 agent). `crates/boogy-sdk/AGENTS.md` remains the canonical handler-authoring
 reference.
 
+## Ready-made services
+
+Browse [boogy-catalog](https://github.com/Boogy-ai/boogy-catalog) for
+first-party, provisionable building-block services — send email, take
+payments — that you deploy into your own tenant wired to your own API keys.
+They double as production-grade examples of the patterns the skills teach.
+
 ## License
 
 MIT OR Apache-2.0, at your option.
