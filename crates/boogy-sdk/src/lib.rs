@@ -90,7 +90,7 @@ pub use store::{Row, StoreError, Table};
 // `Json` is intentionally omitted here — it's already exported above from
 // `response` and the same type implements `FromRequest` via `extract`.
 pub use extract::{FromRequest, Path, Query, Principal};
-pub use job_router::{JobRegistration, JobRouter};
+pub use job_router::{JobContext, JobError, JobRegistration, JobRouter};
 
 /// Boogy SDK convention: the column name Boogy-authored APIs
 /// use to record the owning principal of a row. The platform's

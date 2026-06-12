@@ -406,14 +406,19 @@ fn to_snake_case(s: &str) -> String {
 
 /// `#[job("name")]` (exact) or `#[job(prefix = "name_")]` (prefix-matched).
 ///
-/// Annotates a free function whose signature is one of:
-///   - `fn() -> Result<(), String>`
-///   - `fn() -> Result<R, String>`                where R: Serialize
+/// Annotates a free function whose signature is one of (each may take an
+/// optional leading `ctx: JobContext` to read `ctx.attempts` etc.):
+///   - `fn() -> Result<(), E>`
+///   - `fn() -> Result<R, E>`                     where R: Serialize
 ///   - `fn(payload: T) -> …`                      where T: DeserializeOwned
 ///   - `fn(payload: Vec<u8>) -> …`                (raw bytes; no deserialization)
 ///   - `fn(suffix: &str) -> …`                    (prefix form, no payload)
 ///   - `fn(suffix: &str, payload: T) -> …`        (prefix form + typed payload)
 ///   - `fn(suffix: &str, payload: Vec<u8>) -> …`  (prefix form + raw bytes)
+///   - `fn(ctx: JobContext, payload: T) -> …`     (+ any of the above)
+///
+/// The error type `E` is either `String` (treated as retryable) or
+/// `boogy_sdk::JobError` (explicit `Retry`/`Terminal` control).
 ///
 /// The original function name is replaced by a `pub fn <name>() -> JobRegistration`
 /// constructor. Register it via `JobRouter::new().exact(my_job)` or `.prefix(my_job)`.
@@ -470,55 +475,84 @@ enum PayloadKind {
     Typed(syn::Type),
 }
 
-/// Inspect the fn signature and return `(is_prefix_form, payload_kind)`.
+/// Inspect the fn signature and return `(takes_ctx, is_prefix_form, payload_kind)`.
 ///
-/// Detection rules (first arg wins, examined in order):
+/// An optional leading `ctx: JobContext` argument is stripped first. The
+/// remaining 0–2 args follow the historical rules:
 /// - `&str` — `Type::Reference` whose inner type is the path `str` → suffix arg
-///   (sets `is_prefix_form = true`; must be the first arg).
+///   (sets `is_prefix_form = true`; must be the first non-ctx arg).
 /// - `Vec<u8>` — `Type::Path` whose last segment is `Vec` with a single `u8` generic
 ///   arg → `PayloadKind::Bytes`.
 /// - Anything else → `PayloadKind::Typed(ty)` (assumed `T: DeserializeOwned`).
-fn inspect_signature(
-    sig: &syn::Signature,
-) -> syn::Result<(bool, PayloadKind)> {
+fn inspect_signature(sig: &syn::Signature) -> syn::Result<(bool, bool, PayloadKind)> {
     let inputs: Vec<&syn::FnArg> = sig.inputs.iter().collect();
 
-    if inputs.len() > 2 {
+    if inputs.len() > 3 {
         return Err(syn::Error::new_spanned(
             &sig.inputs,
-            "#[job] functions accept at most 2 arguments (optional suffix: &str, optional payload)",
+            "#[job] functions accept at most 3 arguments (optional ctx: JobContext, optional suffix: &str, optional payload)",
+        ));
+    }
+
+    // Strip an optional leading `ctx: JobContext`.
+    let mut takes_ctx = false;
+    let mut rest: &[&syn::FnArg] = &inputs;
+    if let Some(first) = inputs.first() {
+        if is_job_context(fn_arg_type(first)?) {
+            takes_ctx = true;
+            rest = &inputs[1..];
+        }
+    }
+
+    if rest.len() > 2 {
+        return Err(syn::Error::new_spanned(
+            &sig.inputs,
+            "#[job] functions accept at most (ctx: JobContext, suffix: &str, payload) — too many arguments, or the first arg should be `ctx: JobContext`",
         ));
     }
 
     let mut is_prefix_form = false;
     let mut payload_kind = PayloadKind::None;
 
-    let mut arg_iter = inputs.into_iter();
-
-    // Examine the first argument (if any).
-    if let Some(first) = arg_iter.next() {
-        let ty = fn_arg_type(first)?;
-        if is_str_ref(ty) {
-            is_prefix_form = true;
-            // The second argument (if any) is the payload.
-            if let Some(second) = arg_iter.next() {
-                let pty = fn_arg_type(second)?;
-                payload_kind = classify_payload(pty);
+    match rest.len() {
+        0 => {}
+        1 => {
+            let ty = fn_arg_type(rest[0])?;
+            if is_str_ref(ty) {
+                is_prefix_form = true;
+            } else {
+                payload_kind = classify_payload(ty);
             }
-        } else {
-            // The first (and only allowed) argument is the payload.
-            payload_kind = classify_payload(ty);
-            // A second arg after a payload (non-&str first) is an error.
-            if arg_iter.next().is_some() {
+        }
+        2 => {
+            // Two non-ctx args are only valid as (suffix: &str, payload).
+            let ty0 = fn_arg_type(rest[0])?;
+            if !is_str_ref(ty0) {
                 return Err(syn::Error::new_spanned(
                     &sig.inputs,
-                    "#[job] functions: if the first arg is not `&str` (suffix), only one arg (payload) is allowed",
+                    "#[job] functions: if the first non-ctx arg is not `&str` (suffix), only one arg (payload) is allowed",
                 ));
+            }
+            is_prefix_form = true;
+            payload_kind = classify_payload(fn_arg_type(rest[1])?);
+        }
+        _ => unreachable!("rest.len() <= 2 enforced above"),
+    }
+
+    Ok((takes_ctx, is_prefix_form, payload_kind))
+}
+
+/// Return true iff `ty` is (path ending in) `JobContext` — the optional leading
+/// handler-context argument.
+fn is_job_context(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(p) = ty {
+        if p.qself.is_none() {
+            if let Some(last) = p.path.segments.last() {
+                return last.ident == "JobContext";
             }
         }
     }
-
-    Ok((is_prefix_form, payload_kind))
+    false
 }
 
 /// Extract the `syn::Type` from a typed `FnArg`. Errors on `self` receivers.
@@ -606,16 +640,21 @@ fn return_is_unit(output: &syn::ReturnType) -> bool {
     false
 }
 
-/// Emit the return-mapping tokens: `Ok(vec![])` for unit, serde_json serialize for typed.
+/// Emit the return-mapping tokens. The inner fn's error (`String` or
+/// `JobError`) is normalized to `JobError` via `JobError::from` first, so both
+/// handler error types compile; then `Ok` is mapped to bytes (`vec![]` for
+/// unit, serde_json serialize otherwise — a serialize failure is `Terminal`).
 fn build_return_mapping(output: &syn::ReturnType) -> TokenStream2 {
     if return_is_unit(output) {
         quote! {
-            result.map(|_| ::std::vec::Vec::new())
+            result.map_err(::boogy_sdk::JobError::from).map(|_| ::std::vec::Vec::new())
         }
     } else {
         quote! {
-            result.and_then(|r| {
-                ::serde_json::to_vec(&r).map_err(|e| ::std::format!("result serialize: {e}"))
+            result.map_err(::boogy_sdk::JobError::from).and_then(|r| {
+                ::serde_json::to_vec(&r).map_err(|e| {
+                    ::boogy_sdk::JobError::Terminal(::std::format!("result serialize: {e}"))
+                })
             })
         }
     }
@@ -624,20 +663,33 @@ fn build_return_mapping(output: &syn::ReturnType) -> TokenStream2 {
 /// Build the handler closure body tokens.
 fn build_handler_body(
     inner: &proc_macro2::Ident,
+    takes_ctx: bool,
     is_prefix: bool,
     payload: &PayloadKind,
     output: &syn::ReturnType,
 ) -> TokenStream2 {
-    // 1. Extract the suffix (prefix jobs) or discard it (exact jobs).
+    // 0. The closure always receives `ctx: &JobContext`; discard it when the
+    //    user fn does not take one.
+    let ctx_discard = if takes_ctx {
+        quote! {}
+    } else {
+        quote! { let _ = ctx; }
+    };
+
+    // 1. Extract the suffix (prefix jobs) or discard it (exact jobs). A missing
+    //    suffix is a routing bug that never resolves → Terminal.
     let suffix_extraction = if is_prefix {
         quote! {
-            let suffix: &str = suffix_opt.ok_or_else(|| "missing suffix for prefix job".to_string())?;
+            let suffix: &str = suffix_opt.ok_or_else(|| {
+                ::boogy_sdk::JobError::Terminal("missing suffix for prefix job".to_string())
+            })?;
         }
     } else {
         quote! { let _ = suffix_opt; }
     };
 
-    // 2. Prepare the payload variable.
+    // 2. Prepare the payload variable. A bad payload never deserializes on
+    //    retry → Terminal.
     let payload_let = match payload {
         PayloadKind::None => quote! { let _ = payload_bytes; },
         PayloadKind::Bytes => quote! {
@@ -645,11 +697,16 @@ fn build_handler_body(
         },
         PayloadKind::Typed(ty) => quote! {
             let payload: #ty = ::serde_json::from_slice(payload_bytes)
-                .map_err(|e| ::std::format!("payload deserialize: {e}"))?;
+                .map_err(|e| ::boogy_sdk::JobError::Terminal(::std::format!("payload deserialize: {e}")))?;
         },
     };
 
     // 3. Build the call expression.
+    let ctx_arg = if takes_ctx {
+        quote! { ctx.clone(), }
+    } else {
+        quote! {}
+    };
     let suffix_arg = if is_prefix {
         quote! { suffix, }
     } else {
@@ -659,12 +716,13 @@ fn build_handler_body(
         PayloadKind::None => quote! {},
         PayloadKind::Bytes | PayloadKind::Typed(_) => quote! { payload },
     };
-    let call = quote! { #inner(#suffix_arg #payload_arg) };
+    let call = quote! { #inner(#ctx_arg #suffix_arg #payload_arg) };
 
-    // 4. Map the result to `Result<Vec<u8>, String>`.
+    // 4. Map the result to `Result<Vec<u8>, JobError>`.
     let return_mapping = build_return_mapping(output);
 
     quote! {
+        #ctx_discard
         #suffix_extraction
         #payload_let
         let result = #call;
@@ -683,8 +741,8 @@ fn expand_job(attr: JobAttr, user_fn: syn::ItemFn) -> syn::Result<TokenStream2> 
     // Strip outer attributes from the renamed inner fn (they've been consumed).
     renamed.attrs.clear();
 
-    // Inspect the signature to learn (prefix?, payload kind).
-    let (is_prefix_form, payload_kind) = inspect_signature(&user_fn.sig)?;
+    // Inspect the signature to learn (takes ctx?, prefix?, payload kind).
+    let (takes_ctx, is_prefix_form, payload_kind) = inspect_signature(&user_fn.sig)?;
 
     // Cross-check: attr form must agree with signature form.
     let attr_is_prefix = matches!(attr, JobAttr::Prefix(_));
@@ -704,7 +762,13 @@ fn expand_job(attr: JobAttr, user_fn: syn::ItemFn) -> syn::Result<TokenStream2> 
     };
     let is_prefix_lit = is_prefix_form;
 
-    let body = build_handler_body(&inner_ident, is_prefix_form, &payload_kind, &user_fn.sig.output);
+    let body = build_handler_body(
+        &inner_ident,
+        takes_ctx,
+        is_prefix_form,
+        &payload_kind,
+        &user_fn.sig.output,
+    );
 
     // Preserve the user fn's visibility on the registration ctor.
     let vis = &user_fn.vis;
@@ -721,8 +785,10 @@ fn expand_job(attr: JobAttr, user_fn: syn::ItemFn) -> syn::Result<TokenStream2> 
             ::boogy_sdk::JobRegistration {
                 name: #name_lit,
                 is_prefix: #is_prefix_lit,
-                handler: |suffix_opt: ::core::option::Option<&str>, payload_bytes: &[u8]|
-                    -> ::core::result::Result<::std::vec::Vec<u8>, ::std::string::String>
+                handler: |ctx: &::boogy_sdk::JobContext,
+                          suffix_opt: ::core::option::Option<&str>,
+                          payload_bytes: &[u8]|
+                    -> ::core::result::Result<::std::vec::Vec<u8>, ::boogy_sdk::JobError>
                 {
                     #body
                 },

@@ -3217,9 +3217,20 @@ macro_rules! wit_glue {
                         .map(|i| i.principal),
                 );
 
-                match <$api_struct as $crate::Api>::build_job_router().dispatch(&ctx.handler, &payload) {
+                // Build the SDK-side JobContext mirror from the WIT context so
+                // handlers can read `ctx.attempts` (the terminal-attempt signal).
+                let sdk_ctx = $crate::JobContext {
+                    job_id: ctx.job_id.clone(),
+                    handler: ctx.handler.clone(),
+                    attempts: ctx.attempts,
+                    not_before_unix_s: ctx.not_before_unix_s,
+                };
+                match <$api_struct as $crate::Api>::build_job_router().dispatch(&sdk_ctx, &payload) {
                     ::core::result::Result::Ok(bytes) => ::core::result::Result::Ok(bytes),
-                    ::core::result::Result::Err(msg)  => ::core::result::Result::Err(
+                    ::core::result::Result::Err($crate::JobError::Retry(msg)) => ::core::result::Result::Err(
+                        $bindings::exports::boogy::platform::job_handler::HandlerError::Retry(msg),
+                    ),
+                    ::core::result::Result::Err($crate::JobError::Terminal(msg)) => ::core::result::Result::Err(
                         $bindings::exports::boogy::platform::job_handler::HandlerError::Terminal(msg),
                     ),
                 }
