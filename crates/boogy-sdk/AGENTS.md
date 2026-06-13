@@ -657,14 +657,66 @@ above.
 
 ### Filtering / sorting / paginating
 
-`store::find` takes a `FindOptions` with `filters`, `sort`, and `page`.
+**Keyset pagination is THE default for any list a client pages through — reach
+for it first.** It is O(page) regardless of depth (no offset re-scan), stable
+under concurrent inserts (no skipped/repeated rows), and the SDK makes it a
+one-liner. Offset/`find` is a fallback for tiny, fixed, non-paged sets only.
+
+Keyset is **two halves that must match**:
+
+1. **Declare the access pattern on the model** so the walk is an index walk, not
+   a scan (this is the part agents forget — without it the keyset query
+   degrades to a full scan):
+   - `#[model(list_by(filter = "owner_id", newest = "created_at"))]` — a filtered
+     newest-first list. Resolves to a covering composite index
+     `(owner_id, created_at DESC, _id)`; its prefix also serves a plain
+     `where_eq(owner_id)` equality seek, so you usually DON'T also need
+     `#[index]` on that column.
+   - `#[model(ranked_by(highest = "created_at"))]` — an UNfiltered newest-first
+     feed (or any score column, e.g. `highest = "score"`).
+   Repeat `list_by` once per filter axis a list endpoint exposes.
+
+2. **Page it with the Query DSL terminal** — `keyset_by` + `.cursor` + `.limit`
+   + `.fetch_page`, returning a `CursorPage<T>` (serializes `{ items,
+   next_cursor }`):
+
+   ```rust
+   use boogy_sdk::pagination::{decode, CursorPage};
+   use boogy_sdk::store::SortDir;
+
+   fn list_orders(req: &mut Req<'_>) -> Result<Json<CursorPage<OrderOut>>, ApiError> {
+       let limit  = req.query("limit").and_then(|s| s.parse().ok()).unwrap_or(50).clamp(1, 200);
+       let cursor = req.query("cursor").and_then(decode);
+       let page = Query::on(Order::TABLE)
+           .where_eq(Order::OWNER_ID, owner.as_str())     // optional filter(s)
+           .keyset_by(Order::CREATED_AT, SortDir::Desc)   // MUST match a list_by/ranked_by
+           .limit(limit)
+           .cursor(cursor)
+           .fetch_page(|r| order_out(r))?;                // over-fetch+1, builds next_cursor
+       Ok(Json(page))
+   }
+   ```
+
+   `fetch_page` over-fetches by one to detect the next page and builds the opaque
+   `next_cursor` for you — no manual cursor arithmetic. The client passes the
+   returned `next_cursor` straight back as `?cursor=`. Extra
+   `where_eq`/`where_gte`/… filters compose on the same walk (residual-filtered
+   when not the indexed axis), so multi-axis admin filters Just Work.
+   `next_cursor` is absent on the last page. Reference: `chat` (`list_by`),
+   `notes-api` (`ranked_by`), `stripe-base` / `resend-base` (multi-axis admin).
+
+**Bounded-memory batch jobs** (sweeps, exports — not a client page): use
+`for_each_batch` (above), not keyset.
+
+**Offset/`find` (fallback ONLY).** `store::find` takes `FindOptions { filters,
+sort, page: Some(Page { limit, offset }) }`. Offset re-scans `offset` rows every
+page and can skip/repeat rows under concurrent writes — use ONLY for a tiny,
+fixed, non-paged set where keyset would be overkill.
 
 ```rust
 let result = store::find("notes", &store::FindOptions {
     filters: vec![store::Filter {
-        column: "done".into(),
-        op: store::FilterOp::Eq,
-        val: store::Value::Boolean(false),
+        column: "done".into(), op: store::FilterOp::Eq, val: store::Value::Boolean(false),
     }],
     sort: vec![store::SortBy { column: "priority".into(), descending: true }],
     page: Some(store::Page { limit: 20, offset: 0 }),

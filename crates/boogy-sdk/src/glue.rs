@@ -1071,6 +1071,19 @@ macro_rules! wit_glue {
             $bindings::boogy::platform::runtime::self_identity()
         }
 
+        /// True iff the CALLER is this service's owner — the provisioner's own
+        /// agent (their human/dashboard token, resolved host-side) or one of
+        /// their own workloads. False for anonymous, a different owner, or an
+        /// unresolvable caller (fail-closed). Host-attested — safe to authorize
+        /// on. Lets a provisionable module gate an owner-only surface (e.g.
+        /// `/admin`) WITHOUT hardcoding an identity in its manifest:
+        /// ```ignore
+        /// if !crate::caller_is_service_owner() { return Err(ApiError::forbidden("operator only")); }
+        /// ```
+        fn caller_is_service_owner() -> bool {
+            $bindings::boogy::platform::runtime::caller_is_service_owner()
+        }
+
         /// Build an ascending `SortBy` for `column`. Pairs with
         /// [`sort_desc`]; pass a `Vec` of these to `find_rows` for
         /// composite sort (e.g. `vec![sort_desc("score"), sort_asc("_id")]`).
@@ -2953,6 +2966,51 @@ macro_rules! wit_glue {
             }
         }
 
+        fn ws_publish_to_principal(
+            channel: &str,
+            principal: &str,
+            payload: &str,
+        ) -> ::core::result::Result<(), $crate::websockets::PublishError> {
+            match ws_bindings::publish_to_principal(
+                &channel.to_string(),
+                &principal.to_string(),
+                &payload.to_string(),
+            ) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(__ws_publish_error_to_sdk(e)),
+            }
+        }
+
+        fn ws_mint_principal_subscribe_grant(
+            channel: &str,
+            principal: &str,
+            ttl_seconds: u32,
+        ) -> ::core::result::Result<String, $crate::websockets::GrantError> {
+            match ws_bindings::mint_principal_subscribe_grant(
+                &channel.to_string(),
+                &principal.to_string(),
+                ttl_seconds,
+            ) {
+                Ok(g) => Ok(g),
+                Err(e) => Err(__ws_grant_error_to_sdk(e)),
+            }
+        }
+
+        /// Build a typed envelope and publish it to a principal's room. The
+        /// preferred publish entrypoint for per-principal channels — always
+        /// send an envelope, never a bare payload. `ts` is filled from the
+        /// host clock (milliseconds since Unix epoch).
+        fn ws_publish_event(
+            channel: &str,
+            principal: &str,
+            type_: &str,
+            v: u32,
+            data: ::serde_json::Value,
+        ) -> ::core::result::Result<(), $crate::websockets::PublishError> {
+            let env = $crate::websockets::Envelope::new(type_, v, now_millis(), data);
+            ws_publish_to_principal(channel, principal, &env.to_json())
+        }
+
         fn __ws_publish_error_to_sdk(
             e: ws_bindings::PublishError,
         ) -> $crate::websockets::PublishError {
@@ -2971,6 +3029,9 @@ macro_rules! wit_glue {
                 }
                 ws_bindings::PublishError::BackendUnavailable => {
                     $crate::websockets::PublishError::BackendUnavailable
+                }
+                ws_bindings::PublishError::WrongClass => {
+                    $crate::websockets::PublishError::WrongClass
                 }
             }
         }
@@ -2993,6 +3054,9 @@ macro_rules! wit_glue {
                 }
                 ws_bindings::GrantError::RateLimited => {
                     $crate::websockets::GrantError::RateLimited
+                }
+                ws_bindings::GrantError::WrongClass => {
+                    $crate::websockets::GrantError::WrongClass
                 }
             }
         }
