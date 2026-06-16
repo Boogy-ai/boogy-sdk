@@ -1,0 +1,54 @@
+package boogy:platform@0.1.0;
+
+/// Host-mediated signing over per-service keys whose private material NEVER
+/// crosses back into the wasm component.
+///
+/// A service can generate a signing key (`create-key`), sign a prehashed
+/// 32-byte digest (`sign-digest`, the ECDSA path) or a full message
+/// (`sign-message`, the Ed25519 path), enumerate its keys (`list-keys`), and
+/// remove one (`remove-key`). The private key lives host-side (KMS-wrapped or
+/// in a transit backend); the component only ever receives the public key, a
+/// produced signature, or a typed error. There is deliberately NO export
+/// operation — a key, once created or imported, can only be used, never read
+/// back out.
+///
+/// The (owner, service) scope every operation runs under is pinned host-side
+/// from routing — a service can only touch its OWN keys.
+interface signing {
+    /// Signing algorithm. `ecdsa-secp256k1` / `ecdsa-p256` sign a digest;
+    /// `ed25519` signs a message.
+    enum sig-alg { ed25519, ecdsa-secp256k1, ecdsa-p256 }
+
+    /// A produced signature. `recovery-id` is set only for recoverable ECDSA
+    /// (secp256k1); absent for Ed25519 / non-recoverable P-256. No secret
+    /// material.
+    record signature { bytes: list<u8>, recovery-id: option<u8> }
+
+    /// Public descriptor for one signing key (no secret material).
+    record key-info { label: string, alg: sig-alg, public-key: list<u8> }
+
+    variant sign-error {
+        /// No key bound under this (scope, label).
+        unknown-key(string),
+        /// Caller-supplied input rejected (wrong digest length, alg mismatch).
+        bad-input(string),
+        /// Capability not granted / backend unavailable / internal host error.
+        internal(string),
+    }
+
+    /// Generate a new signing key under `label`. Returns the public key.
+    create-key:   func(label: string, alg: sig-alg) -> result<list<u8>, sign-error>;
+
+    /// Sign a prehashed 32-byte digest (the ECDSA path). Non-32-byte digests
+    /// are rejected `bad-input`. Ed25519 keys reject here — use `sign-message`.
+    sign-digest:  func(label: string, digest: list<u8>, alg: sig-alg) -> result<signature, sign-error>;
+
+    /// Sign a full message (the Ed25519 path). ECDSA keys reject here.
+    sign-message: func(label: string, message: list<u8>, alg: sig-alg) -> result<signature, sign-error>;
+
+    /// List this service's signing keys (label + alg + public key only).
+    list-keys:    func() -> list<key-info>;
+
+    /// Remove a signing key. Idempotent.
+    remove-key:   func(label: string) -> result<_, sign-error>;
+}

@@ -2,6 +2,7 @@ mod build;
 mod deploy;
 mod manage;
 mod provision;
+mod secret;
 mod skills;
 
 use anyhow::Context;
@@ -69,11 +70,40 @@ enum Commands {
         /// Service ID to remove
         service_id: String,
     },
+    /// Manage per-service secrets (sealed client-side before binding)
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
     /// Vendor the Boogy skills into this project (.claude/skills/boogy)
     /// so coding agents pick them up automatically
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SecretAction {
+    /// Bind a secret value to a service (sealed before it leaves this machine)
+    Set {
+        /// Service id to bind the secret to
+        service: String,
+        /// Secret name
+        name: String,
+        /// Secret value (omit and pass --value-stdin to read it from stdin)
+        value: Option<String>,
+        /// Read the value from stdin instead of the positional arg
+        /// (keeps secrets out of shell history)
+        #[arg(long)]
+        value_stdin: bool,
+    },
+    /// Remove a secret binding from a service
+    Rm {
+        /// Service id the secret is bound to
+        service: String,
+        /// Secret name
+        name: String,
     },
 }
 
@@ -137,6 +167,26 @@ async fn main() -> anyhow::Result<()> {
             let token = resolve_token(&cli.token)?;
             manage::remove(&cli.host, &token, &owner, &service_id).await?
         }
+        Commands::Secret { action } => match action {
+            SecretAction::Set {
+                service,
+                name,
+                value,
+                value_stdin,
+            } => {
+                let token = resolve_token(&cli.token)?;
+                let value = if value_stdin {
+                    secret::read_value_from_stdin()?
+                } else {
+                    value.context("provide a value argument or pass --value-stdin")?
+                };
+                secret::set(&cli.host, &token, &service, &name, &value).await?
+            }
+            SecretAction::Rm { service, name } => {
+                let token = resolve_token(&cli.token)?;
+                secret::rm(&cli.host, &token, &service, &name).await?
+            }
+        },
         Commands::Skills { action } => match action {
             SkillsAction::Install { dest } => skills::run(dest.as_deref(), "installed")?,
             SkillsAction::Update { dest } => skills::run(dest.as_deref(), "updated")?,
