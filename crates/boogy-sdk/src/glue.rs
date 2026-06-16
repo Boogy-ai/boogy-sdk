@@ -119,6 +119,8 @@ macro_rules! wit_glue {
         #[allow(unused_imports)]
         use $bindings::boogy::platform::secrets as secrets_bindings;
         #[allow(unused_imports)]
+        use $bindings::boogy::platform::signing as signing_bindings;
+        #[allow(unused_imports)]
         use $bindings::boogy::platform::background_jobs as jobs_bindings;
         #[allow(unused_imports)]
         use $bindings::boogy::platform::vector as vector_bindings;
@@ -2827,6 +2829,137 @@ macro_rules! wit_glue {
                 secrets_bindings::VerifyError::Internal(s) => {
                     $crate::secrets::VerifyError::Internal(s)
                 }
+            }
+        }
+
+        // -- Host-mediated signing bridge --
+        //
+        // Translates the SDK `signing` types to/from their WIT-generated
+        // equivalents. The host generates + holds the private key and signs
+        // entirely host-side — the component only ever receives the public
+        // key, a produced signature, or a typed error; the private key never
+        // crosses back into wasm and there is no read/export op. The gate is
+        // the `[capabilities] signing = true` manifest grant; without it the
+        // bindings call returns `SignError::Internal`.
+
+        fn __signing_alg_to_wit(
+            alg: $crate::signing::SigAlg,
+        ) -> signing_bindings::SigAlg {
+            match alg {
+                $crate::signing::SigAlg::Ed25519 => signing_bindings::SigAlg::Ed25519,
+                $crate::signing::SigAlg::EcdsaSecp256k1 => {
+                    signing_bindings::SigAlg::EcdsaSecp256k1
+                }
+                $crate::signing::SigAlg::EcdsaP256 => signing_bindings::SigAlg::EcdsaP256,
+            }
+        }
+
+        fn __signing_alg_to_sdk(
+            alg: signing_bindings::SigAlg,
+        ) -> $crate::signing::SigAlg {
+            match alg {
+                signing_bindings::SigAlg::Ed25519 => $crate::signing::SigAlg::Ed25519,
+                signing_bindings::SigAlg::EcdsaSecp256k1 => {
+                    $crate::signing::SigAlg::EcdsaSecp256k1
+                }
+                signing_bindings::SigAlg::EcdsaP256 => $crate::signing::SigAlg::EcdsaP256,
+            }
+        }
+
+        fn __signing_signature_to_sdk(
+            sig: signing_bindings::Signature,
+        ) -> $crate::signing::Signature {
+            $crate::signing::Signature {
+                bytes: sig.bytes,
+                recovery_id: sig.recovery_id,
+            }
+        }
+
+        fn __signing_error_to_sdk(
+            e: signing_bindings::SignError,
+        ) -> $crate::signing::SignError {
+            match e {
+                signing_bindings::SignError::UnknownKey(s) => {
+                    $crate::signing::SignError::UnknownKey(s)
+                }
+                signing_bindings::SignError::BadInput(s) => {
+                    $crate::signing::SignError::BadInput(s)
+                }
+                signing_bindings::SignError::Internal(s) => {
+                    $crate::signing::SignError::Internal(s)
+                }
+            }
+        }
+
+        /// Generate a new signing key under `label`. Returns the public key.
+        /// The private key stays host-side and is never returned.
+        #[allow(dead_code)]
+        fn signing_create_key(
+            label: &str,
+            alg: $crate::signing::SigAlg,
+        ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::signing::SignError> {
+            match signing_bindings::create_key(&label.to_string(), __signing_alg_to_wit(alg)) {
+                Ok(pk) => Ok(pk),
+                Err(e) => Err(__signing_error_to_sdk(e)),
+            }
+        }
+
+        /// Sign a prehashed 32-byte digest (the ECDSA path). Non-32-byte
+        /// input is rejected `BadInput`; an Ed25519 key rejects here.
+        #[allow(dead_code)]
+        fn signing_sign_digest(
+            label: &str,
+            digest: &[u8],
+            alg: $crate::signing::SigAlg,
+        ) -> ::core::result::Result<$crate::signing::Signature, $crate::signing::SignError> {
+            match signing_bindings::sign_digest(
+                &label.to_string(),
+                &digest.to_vec(),
+                __signing_alg_to_wit(alg),
+            ) {
+                Ok(sig) => Ok(__signing_signature_to_sdk(sig)),
+                Err(e) => Err(__signing_error_to_sdk(e)),
+            }
+        }
+
+        /// Sign a full message (the Ed25519 path). An ECDSA key rejects here.
+        #[allow(dead_code)]
+        fn signing_sign_message(
+            label: &str,
+            message: &[u8],
+            alg: $crate::signing::SigAlg,
+        ) -> ::core::result::Result<$crate::signing::Signature, $crate::signing::SignError> {
+            match signing_bindings::sign_message(
+                &label.to_string(),
+                &message.to_vec(),
+                __signing_alg_to_wit(alg),
+            ) {
+                Ok(sig) => Ok(__signing_signature_to_sdk(sig)),
+                Err(e) => Err(__signing_error_to_sdk(e)),
+            }
+        }
+
+        /// List this service's signing keys (label + alg + public key only).
+        #[allow(dead_code)]
+        fn signing_list_keys() -> ::std::vec::Vec<$crate::signing::KeyInfo> {
+            signing_bindings::list_keys()
+                .into_iter()
+                .map(|k| $crate::signing::KeyInfo {
+                    label: k.label,
+                    alg: __signing_alg_to_sdk(k.alg),
+                    public_key: k.public_key,
+                })
+                .collect()
+        }
+
+        /// Remove a signing key. Idempotent.
+        #[allow(dead_code)]
+        fn signing_remove_key(
+            label: &str,
+        ) -> ::core::result::Result<(), $crate::signing::SignError> {
+            match signing_bindings::remove_key(&label.to_string()) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(__signing_error_to_sdk(e)),
             }
         }
 

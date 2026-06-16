@@ -67,6 +67,7 @@ pub mod router;
 pub mod rpc;
 pub mod schema_resolve;
 pub mod secrets;
+pub mod signing;
 pub mod spec;
 pub mod store;
 pub mod vector;
