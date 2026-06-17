@@ -1,5 +1,6 @@
 mod build;
 mod deploy;
+mod frontend;
 mod manage;
 mod provision;
 mod secret;

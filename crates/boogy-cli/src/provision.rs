@@ -1,40 +1,97 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use reqwest::multipart;
 use serde_json::json;
+
+use crate::frontend::tar_gz_dir;
+
+/// What a manifest carries for publishing: the raw TOML, plus the optional
+/// wasm and optional frontend bundle. A deployment must carry at least one of
+/// the two (a wasm service, a static frontend, or both).
+struct PublishArtifacts {
+    manifest_content: String,
+    /// `(full_path, bytes)` of the wasm, when `service.wasm` is present.
+    wasm: Option<(PathBuf, Vec<u8>)>,
+    /// Gzipped tarball of `[frontend].root`, when a `[frontend]` section is
+    /// present.
+    frontend_tar_gz: Option<Vec<u8>>,
+}
 
 /// Read a manifest toml + resolve and read the wasm bytes relative to the
 /// manifest directory. Returns (manifest_content, wasm_full_path, wasm_bytes).
 ///
 /// Accepts both `[service]` and the legacy `[api]` section name (the server
 /// accepts either via `#[serde(alias = "api")]`).
+///
+/// The wasm is **required** here — this is the back-compat entry point for
+/// callers that always ship a wasm. Deployments that may omit the wasm (a
+/// static-frontend deployment) go through `read_publish_artifacts`.
 pub fn read_manifest_and_wasm(manifest_path: &str) -> Result<(String, std::path::PathBuf, Vec<u8>)> {
+    let arts = read_publish_artifacts(manifest_path)?;
+    let (path, bytes) = arts
+        .wasm
+        .context("manifest missing service.wasm field")?;
+    Ok((arts.manifest_content, path, bytes))
+}
+
+/// Read a manifest and resolve every artifact it references: the optional wasm
+/// (`service.wasm`) and the optional frontend bundle (`[frontend].root`, tarred
+/// + gzipped). Paths resolve relative to the manifest's directory.
+///
+/// A `[frontend]` section means a frontend ships; without `service.wasm` that
+/// is a static (frontend-only) deployment. A manifest with neither a wasm nor a
+/// frontend is rejected — there would be nothing to deploy.
+fn read_publish_artifacts(manifest_path: &str) -> Result<PublishArtifacts> {
     let manifest_content =
         std::fs::read_to_string(manifest_path).context("failed to read manifest")?;
 
     let manifest: toml::Value =
         toml::from_str(&manifest_content).context("failed to parse manifest")?;
 
-    // Accept [service] (canonical) or legacy [api] alias.
-    let service_section = manifest
-        .get("service")
-        .or_else(|| manifest.get("api"))
-        .context("manifest missing [service] (or [api]) section")?;
-
-    let wasm_path = service_section
-        .get("wasm")
-        .and_then(|w| w.as_str())
-        .context("manifest missing service.wasm field")?;
-
-    // Resolve wasm path relative to manifest location
     let manifest_dir = Path::new(manifest_path).parent().unwrap_or(Path::new("."));
-    let wasm_full_path = manifest_dir.join(wasm_path);
 
-    let wasm_bytes = std::fs::read(&wasm_full_path)
-        .with_context(|| format!("failed to read wasm at: {}", wasm_full_path.display()))?;
+    // Accept [service] (canonical) or legacy [api] alias.
+    let service_section = manifest.get("service").or_else(|| manifest.get("api"));
 
-    Ok((manifest_content, wasm_full_path, wasm_bytes))
+    // wasm is optional: a static-frontend deployment has no [service].wasm.
+    let wasm = match service_section.and_then(|s| s.get("wasm")).and_then(|w| w.as_str()) {
+        Some(wasm_path) => {
+            let wasm_full_path = manifest_dir.join(wasm_path);
+            let wasm_bytes = std::fs::read(&wasm_full_path)
+                .with_context(|| format!("failed to read wasm at: {}", wasm_full_path.display()))?;
+            Some((wasm_full_path, wasm_bytes))
+        }
+        None => None,
+    };
+
+    // Optional [frontend] section: tar+gzip the `root` directory.
+    let frontend_tar_gz = match manifest.get("frontend") {
+        Some(frontend) => {
+            let root = frontend
+                .get("root")
+                .and_then(|r| r.as_str())
+                .context("[frontend] section present but missing `root` (the source directory)")?;
+            let root_path = manifest_dir.join(root);
+            let tar_gz = tar_gz_dir(&root_path)
+                .with_context(|| format!("failed to package frontend root: {}", root_path.display()))?;
+            Some(tar_gz)
+        }
+        None => None,
+    };
+
+    if wasm.is_none() && frontend_tar_gz.is_none() {
+        anyhow::bail!(
+            "manifest has neither a [service] wasm nor a [frontend] section — \
+             nothing to deploy. Add `service.wasm` or a `[frontend]` section."
+        );
+    }
+
+    Ok(PublishArtifacts {
+        manifest_content,
+        wasm,
+        frontend_tar_gz,
+    })
 }
 
 /// Publish a module: an immutable, versioned wasm+manifest artifact.
@@ -42,23 +99,41 @@ pub fn read_manifest_and_wasm(manifest_path: &str) -> Result<(String, std::path:
 /// When `provision` is true the host also provisions the publisher's own
 /// service from the manifest in the same call.
 pub async fn publish(host: &str, token: &str, manifest_path: &str, provision: bool) -> Result<()> {
-    let (manifest_content, wasm_full_path, wasm_bytes) = read_manifest_and_wasm(manifest_path)?;
+    let PublishArtifacts {
+        manifest_content,
+        wasm,
+        frontend_tar_gz,
+    } = read_publish_artifacts(manifest_path)?;
 
     println!("Publishing module...");
     println!("  Manifest: {manifest_path}");
-    println!(
-        "  Wasm: {} ({} bytes)",
-        wasm_full_path.display(),
-        wasm_bytes.len()
-    );
+    match &wasm {
+        Some((path, bytes)) => println!("  Wasm: {} ({} bytes)", path.display(), bytes.len()),
+        None => println!("  Wasm: none (static frontend deployment)"),
+    }
+    if let Some(tar_gz) = &frontend_tar_gz {
+        println!("  Frontend: bundled ({} bytes gzipped)", tar_gz.len());
+    }
     if provision {
         println!("  Provision: true (publisher's own service)");
     }
 
-    let mut form = multipart::Form::new().text("manifest", manifest_content).part(
-        "wasm",
-        multipart::Part::bytes(wasm_bytes).file_name("component.wasm"),
-    );
+    let mut form = multipart::Form::new().text("manifest", manifest_content);
+    if let Some((_, bytes)) = wasm {
+        form = form.part(
+            "wasm",
+            multipart::Part::bytes(bytes).file_name("component.wasm"),
+        );
+    }
+    if let Some(tar_gz) = frontend_tar_gz {
+        form = form.part(
+            "frontend",
+            multipart::Part::bytes(tar_gz)
+                .file_name("frontend.tar.gz")
+                .mime_str("application/gzip")
+                .context("failed to set frontend part mime")?,
+        );
+    }
     if provision {
         form = form.text("provision", "true");
     }
