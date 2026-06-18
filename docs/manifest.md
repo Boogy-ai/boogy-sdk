@@ -23,9 +23,7 @@ wasm = "target/wasm32-wasip2/release/notes_api.wasm"
 description = "Per-user notes with tagging and full-text search."
 keywords = ["notes", "personal", "storage"]
 category = "productivity"
-
-[service.owner]
-user_id = "alice"
+owner = "alice"   # optional — the platform sets this to your handle at deploy; normally omit it
 
 [routing]
 path = "/api/notes"
@@ -71,18 +69,13 @@ Top-level service identity. All fields in this section are **required** unless m
 | `id` | string | **required** | Stable identifier for this service. ASCII alphanumeric, `-`, `_`; max 64 chars; no leading `-`; no dots or slashes. Used in URLs and on-disk paths. |
 | `name` | string | **required** | Human-readable display name. |
 | `version` | string | **required** | SemVer string (e.g. `"0.2.0"`). Stored with the deployment; not used for routing. |
-| `wasm` | string | **required** | Path to the compiled `.wasm` file, relative to the manifest. Typically `target/wasm32-wasip2/release/<crate_name>.wasm`. |
+| `wasm` | string | optional, `""` | Path to the compiled `.wasm` file, relative to the manifest (typically `target/wasm32-wasip2/release/<crate_name>.wasm`). **Omit it for a frontend-only (`Frontend` shape) deployment** — it runs no wasm. A `Service`/`FullStack` deploy with no wasm *and* no `[frontend]` is rejected ("nothing to deploy"). |
 | `description` | string | optional, `null` | One-paragraph description. Max 2000 chars. |
 | `keywords` | string array | optional, `[]` | Searchable tags. At most 40 entries; each ≤ 64 chars. |
 | `category` | string | optional, `null` | Category tag for grouping. Max 64 chars. |
+| `owner` | string | optional, `""` | The owning user's handle, as a **bare key** (`owner = "alice"`), NOT a `[service.owner]` table. Normally **omit it** — you are authenticated when you deploy, so the platform sets the owner to your handle at publish/provision and overwrites any value here. Keep it only for local-dev/tests that provision under a fixed owner without the auth flow. Same character rules as `service.id`; not a platform-reserved name (`v1`, `healthz`, `_admin`, `_agents`, `_sys`). |
 
-### `[service.owner]`
-
-| Field | Type | Required / Default | Meaning |
-|---|---|---|---|
-| `user_id` | string | **required** | Owner's user ID. Same character rules as `service.id`. Must not be a platform-reserved name (`v1`, `healthz`, `_admin`, `_agents`, `_sys`). |
-
-> The combined `owner.user_id` + `id` pair is the unique key for a deployment. Deploying with the same pair replaces the running service.
+> The `owner` + `id` pair is the unique key for a deployment: deploying the same pair replaces the running service. Since the platform fills `owner` from your authenticated handle, you normally only set `id`.
 
 ---
 
@@ -99,7 +92,7 @@ Both fields are **required**.
 
 ## `[capabilities]`
 
-All capabilities default to `false`. Deny-by-default: a service that doesn't declare a capability will get a host error if its wasm code attempts to use it.
+The `[capabilities]` section is **optional** — a missing or empty one grants nothing (deny-by-default). Each capability defaults to `false`; a service that doesn't declare a capability gets a host error if its wasm code attempts to use it. (A frontend-only deployment grants none and may omit the section entirely.)
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -118,7 +111,7 @@ All capabilities default to `false`. Deny-by-default: a service that doesn't dec
 
 ## `[limits]`
 
-All fields have defaults; the section itself may be present but empty (`[limits]`).
+The `[limits]` section is **optional** — a missing or empty one takes the per-field defaults below.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|

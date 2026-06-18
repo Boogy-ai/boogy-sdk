@@ -73,9 +73,15 @@ pub fn lint_file(file: &str, src: &str) -> Vec<Finding> {
 
     for (i, line) in lines.iter().enumerate() {
         let ln = i + 1;
+        // Run violation checks on the CODE part only — the text before a `//`
+        // line comment — so a doc comment mentioning `Table::new(...)` isn't
+        // flagged. Markers (`// escape-hatch:` etc.) are still matched on the
+        // full line by `marked()`. (Heuristic: doesn't account for `//` inside
+        // a string literal — rare for these tokens.)
+        let code = line.split("//").next().unwrap_or(line);
 
         // 1. raw table schema (HARD)
-        if line.contains("Table::new(") || line.contains("create_table_from(") {
+        if code.contains("Table::new(") || code.contains("create_table_from(") {
             out.push(Finding {
                 check: "raw-schema",
                 severity: Severity::Hard,
@@ -87,10 +93,10 @@ pub fn lint_file(file: &str, src: &str) -> Vec<Finding> {
         }
 
         // 3. untyped HTTP response body
-        let untyped_resp = line.contains("Json<serde_json::Value>")
-            || line.contains("Json<json::Value>")
-            || line.contains("Created<serde_json::Value>")
-            || line.contains("Created<json::Value>");
+        let untyped_resp = code.contains("Json<serde_json::Value>")
+            || code.contains("Json<json::Value>")
+            || code.contains("Created<serde_json::Value>")
+            || code.contains("Created<json::Value>");
         if untyped_resp && !marked(i, "// untyped-response:") {
             out.push(Finding {
                 check: "untyped-response",
@@ -103,7 +109,7 @@ pub fn lint_file(file: &str, src: &str) -> Vec<Finding> {
         }
 
         // 2. raw store CRUD without an escape hatch
-        if line_has_raw_crud(line) && !marked(i, "// escape-hatch:") {
+        if line_has_raw_crud(code) && !marked(i, "// escape-hatch:") {
             out.push(Finding {
                 check: "raw-store-crud",
                 severity: Severity::Fail,
@@ -445,4 +451,14 @@ mod tests {
         // `transform` contains "fn" but not as the `fn ` keyword.
         assert_eq!(fn_name("let transform = 1;"), None);
     }
+
+    #[test]
+    fn comment_mentions_are_not_flagged() {
+        // A doc comment mentioning the tokens must NOT be flagged.
+        assert!(lint_file("lib.rs", "/// Avoid Table::new(...) — use #[derive(Model)].").is_empty());
+        assert!(lint_file("lib.rs", "// returns Json<serde_json::Value> historically").is_empty());
+        // But real code still flags.
+        assert!(!lint_file("lib.rs", "let t = Table::new(\"x\");").is_empty());
+    }
+
 }

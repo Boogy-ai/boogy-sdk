@@ -165,6 +165,17 @@ pub async fn publish(host: &str, token: &str, manifest_path: &str, provision: bo
 
     println!("Published: {module}");
 
+    // Surface non-fatal frontend build warnings (e.g. an auto-rewritten `.ts`
+    // reference) so the author learns to fix the source even though the deploy
+    // succeeded.
+    if let Some(warnings) = body.get("frontend_warnings").and_then(|w| w.as_array()) {
+        for w in warnings {
+            if let Some(msg) = w.as_str() {
+                println!("  ⚠ frontend: {msg}");
+            }
+        }
+    }
+
     if provision && !provisioned {
         // The module was published successfully but the auto-provision step
         // failed. Surface the server-side error and exit non-zero so scripts
