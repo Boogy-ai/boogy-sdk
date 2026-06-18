@@ -15,7 +15,6 @@ world service {
     import secrets;
     import signing;
     import background-jobs;
-    import vector;
     import websockets;
 }
 
@@ -40,6 +39,5 @@ world service-with-jobs {
     import secrets;
     import signing;
     import background-jobs;
-    import vector;
     import websockets;
 }
