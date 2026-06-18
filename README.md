@@ -1,12 +1,20 @@
 # Boogy SDK
 
-Build services for [Boogy](https://boogy.ai) — Rust compiled to
-`wasm32-wasip2`, deployed to a shared runtime with isolated transactional
-storage, capability-based security, cross-service calls, and a built-in
-MCP surface for LLM clients.
+Ship whole services on [Boogy](https://boogy.ai) — frontend, API, and data —
+from one Rust crate compiled to `wasm32-wasip2`. Each service gets a route
+subtree, an isolated **relational, ACID** store, capability-based security,
+in-process calls to other services, and REST / JSON-RPC / MCP surfaces — and a
+single transaction can span a whole chain of services.
 
 > **Status: early development.** APIs change without notice. Pin a git
 > `rev` in your `Cargo.toml`. Published to crates.io once stable.
+
+## How it fits together
+
+**[`ARCHITECTURE.md`](ARCHITECTURE.md)** is the whole picture — the runtime, the
+capability model, the per-service transactional store and cross-service
+transactions, the REST / JSON-RPC / MCP surfaces, frontends, auth, background
+jobs, and WebSockets — with diagrams and a link to the skill that teaches each.
 
 ## What's here
 
