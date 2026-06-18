@@ -19,6 +19,11 @@ MCP surface for LLM clients.
 | `crates/boogy-cli` | `boogy` CLI — build and deploy services |
 | `smoke/` | Minimal consumer service — copy this to start a project |
 
+## API reference
+
+Full rustdoc for the crates above: **<https://boogy-ai.github.io/boogy-sdk/>**
+(rebuilt from `main` on every push).
+
 ## Quickstart
 
 See [`docs/quickstart.md`](docs/quickstart.md). The short version:
