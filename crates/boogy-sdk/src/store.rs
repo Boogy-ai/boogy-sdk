@@ -23,7 +23,7 @@ use crate::error::ApiError;
 ///
 /// The `From<StoreError> for ApiError` impl produces the canonical
 /// status mapping (QuotaExceeded → 507, NotFound → 404, Conflict /
-/// ConstraintViolation / VersionMismatch → 409, InvalidArgument → 400,
+/// ConstraintViolation / VersionMismatch / CommitUnknown → 409, InvalidArgument → 400,
 /// Unsupported → 501, Timeout → 504, ResourceExhausted → 503,
 /// Internal → 500), so handler code
 /// can `.map_err` store calls into `ApiError` without thinking about it.
@@ -37,6 +37,11 @@ pub enum StoreError {
     Unsupported(String),
     Timeout(String),
     VersionMismatch(String),
+    /// Ambiguous commit (`commit_unknown_result`): the write MAY or MAY NOT
+    /// have been applied. Maps to HTTP 409, but unlike a clean conflict it is
+    /// NOT safe to blindly retry — reconcile state (query it) first, since a
+    /// retry could double-apply. The message body carries the distinction.
+    CommitUnknown(String),
     /// Transient: a host concurrency cap was hit (e.g. too many open
     /// cross-service transactions). Maps to HTTP 503 — retry shortly.
     ResourceExhausted(String),
@@ -63,6 +68,7 @@ impl std::fmt::Display for StoreError {
             | StoreError::Conflict(m) | StoreError::ConstraintViolation(m)
             | StoreError::InvalidArgument(m) | StoreError::Unsupported(m)
             | StoreError::Timeout(m) | StoreError::VersionMismatch(m)
+            | StoreError::CommitUnknown(m)
             | StoreError::ResourceExhausted(m)
             | StoreError::Internal(m) => write!(f, "{m}"),
         }
@@ -83,6 +89,9 @@ impl From<StoreError> for ApiError {
             StoreError::Unsupported(_)         => ApiError::unsupported(msg),
             StoreError::Timeout(_)             => ApiError::timeout(msg),
             StoreError::VersionMismatch(_)     => ApiError::conflict(msg),
+            // 409, but NOT blindly retryable — the ambiguity is conveyed by the
+            // message body, not a distinct status (see `CommitUnknown` doc).
+            StoreError::CommitUnknown(_)       => ApiError::conflict(msg),
             StoreError::ResourceExhausted(_)   => ApiError::service_unavailable(msg),
             StoreError::Internal(_)            => ApiError::internal(msg),
         }
@@ -713,6 +722,7 @@ mod tests {
             (StoreError::Unsupported("x".into()), 501),
             (StoreError::Timeout("x".into()), 504),
             (StoreError::VersionMismatch("x".into()), 409),
+            (StoreError::CommitUnknown("x".into()), 409),
             (StoreError::ResourceExhausted("x".into()), 503),
             (StoreError::Internal("x".into()), 500),
         ];

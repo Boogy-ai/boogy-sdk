@@ -23,6 +23,11 @@ interface store {
         unsupported(string),
         timeout(string),
         version-mismatch(string),
+        /// Ambiguous commit (`commit_unknown_result`): the write MAY or MAY NOT
+        /// have been applied. Do NOT blindly retry (could double-apply) —
+        /// reconcile state first. → HTTP 409 (ambiguous-commit; distinct from a
+        /// clean retryable conflict). The message body carries the distinction.
+        commit-unknown(string),
         /// Transient: too many concurrent transactions; retry later. → HTTP 503.
         resource-exhausted(string),
         internal(string),

@@ -121,7 +121,17 @@ macro_rules! api_keys_glue {
                     Ok(id) => id,
                     Err(resp) => return resp,
                 };
-                let (rows, _total) = match super::find_all_rows(api_keys::TABLE) {
+                // Per-creator scoping is a `created_by == caller` equality
+                // seek on the indexed column — same key set the in-code
+                // `key_belongs_to` filter selected, but without scanning the
+                // whole table. NULL-`created_by` rows (legacy/bootstrap keys,
+                // owned by nobody) never equal a caller, so they are excluded
+                // here exactly as `key_belongs_to(None, _)` excluded them.
+                let rows = match super::find_rows_by(
+                    api_keys::TABLE,
+                    "created_by",
+                    super::$bindings::boogy::platform::store::Value::Text(caller.clone()),
+                ) {
                     Ok(r) => r,
                     Err(e) => return $crate::error::ApiError::from(e).into(),
                 };
@@ -133,10 +143,7 @@ macro_rules! api_keys_glue {
                             return response::server_error(&format!("schema drift: {e}"))
                         }
                     };
-                    // Per-creator scoping: only the caller's own keys.
-                    if api_keys::key_belongs_to(dto.created_by.as_deref(), &caller) {
-                        items.push(dto);
-                    }
+                    items.push(dto);
                 }
                 response::ok(&$crate::json::json!({ "items": items }))
             }

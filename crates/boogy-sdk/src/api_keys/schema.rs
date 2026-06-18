@@ -26,6 +26,7 @@ pub const TABLE: &str = "__boogy_api_keys";
 /// - `name`          — operator-supplied label for management UIs.
 /// - `scopes`        — comma-separated scopes. Empty string = no scopes.
 /// - `created_by`    — agent_id that minted the key, when known.
+///   Indexed so a creator can list its own keys via an equality seek.
 /// - `created_at`    — Unix seconds.
 /// - `last_used_at`  — Unix seconds; nullable (never used).
 /// - `expires_at`    — Unix seconds; nullable (never expires).
@@ -46,6 +47,9 @@ pub fn schema_table() -> Table {
         .integer("revoked")
         .unique_index("api_keys_prefix_idx", &["prefix"])
         .index("api_keys_revoked_idx", &["revoked"])
+        // Indexed so listing a creator's own keys is a creator-scoped
+        // equality seek rather than a full-table scan + in-code filter.
+        .index("api_keys_created_by_idx", &["created_by"])
 }
 
 #[cfg(test)]
@@ -83,5 +87,18 @@ mod tests {
             .find(|i| i.columns == vec!["prefix".to_string()])
             .expect("prefix index missing");
         assert!(idx.unique, "prefix index must be UNIQUE");
+    }
+
+    #[test]
+    fn schema_indexes_created_by_for_creator_scoped_listing() {
+        // `list` seeks `created_by == caller`; that seek needs an index on
+        // the column, or it would degrade to a full-table scan.
+        let t = schema_table();
+        let idx = t
+            .indices
+            .iter()
+            .find(|i| i.columns == vec!["created_by".to_string()])
+            .expect("created_by index missing");
+        assert!(!idx.unique, "created_by is non-unique (many keys per creator)");
     }
 }

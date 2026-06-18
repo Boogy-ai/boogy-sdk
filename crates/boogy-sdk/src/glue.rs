@@ -88,6 +88,7 @@ macro_rules! wit_glue {
                     store::StoreError::Unsupported(m)         => S::Unsupported(m),
                     store::StoreError::Timeout(m)             => S::Timeout(m),
                     store::StoreError::VersionMismatch(m)     => S::VersionMismatch(m),
+                    store::StoreError::CommitUnknown(m)       => S::CommitUnknown(m),
                     store::StoreError::ResourceExhausted(m)   => S::ResourceExhausted(m),
                     store::StoreError::Internal(m)            => S::Internal(m),
                 }
