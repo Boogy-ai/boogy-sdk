@@ -111,7 +111,8 @@ All capabilities default to `false`. Deny-by-default: a service that doesn't dec
 | `peer` | bool | `false` | Call other deployed services via `peer::fetch` (in-process, no network hop). |
 | `outbound_http` | bool | `false` | Make HTTPS calls to external URLs. Requires a `[outbound]` block with non-empty `allowed_hosts`. |
 | `background_jobs` | bool | `false` | Enqueue and manage background jobs (`jobs::enqueue` / `jobs::cancel` / `jobs::status`). |
-| `vector` | bool | `false` | Vector search — create collections and run nearest-neighbour queries against the service's store. |
+| `signing` | bool | `false` | Produce cryptographic signatures (ECDSA secp256k1 / P-256, Ed25519) with a private key the host holds and your code never sees — only a public key and the signature come back. |
+| `websockets` | bool | `false` | Publish real-time messages to end-user clients over channels declared in `[[websockets.channels]]`. |
 
 ---
 
@@ -125,6 +126,42 @@ All fields have defaults; the section itself may be present but empty (`[limits]
 | `timeout_ms` | u64 | `5000` | Legacy wall-clock timeout in ms. |
 | `cpu_deadline_ms` | u64 | `30000` | Per-request wall-clock budget `B_req` in ms. The scheduler uses this as the slot-holding ceiling. Epoch deadline traps a CPU-bound guest; an outer timeout returns HTTP 504. Range: 1–600000. |
 | `storage_mb` | u32 or null | `null` (platform default) | Soft storage quota in MiB. `null` = use the platform default; `0` = unlimited (trusted opt-out). |
+
+---
+
+## `[frontend]`
+
+Optional. Declares a web frontend the **platform serves for you** — no
+bundler, no Node, no JS toolchain. You ship TypeScript/JS/HTML/CSS source;
+the control plane transpiles it at deploy and serves the assets from object
+storage, decoupled from your wasm. Presence + whether you publish a wasm
+derives the **deployment shape**:
+
+- `[frontend]` **+ wasm** → **full-stack** (UI + API, one origin).
+- `[frontend]`, **no wasm** → **frontend-only** (a static site / SPA).
+- no `[frontend]` → a plain **service** (wasm only).
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `root` | string | **required** | Source dir holding the frontend (e.g. `index.html` + `.ts`/`.css`/assets). Safe relative path — no `..`, no leading `/`. |
+| `api_prefix` | string | — | Full-stack only: requests under this prefix go to the wasm backend; everything else is served as a static asset. Must start with `/`. Omit for a frontend-only deployment. |
+| `index` | string | `"index.html"` | SPA entry document, served for extensionless / fallback routes. |
+| `build` | string | `"ts"` | `"ts"` (platform transpiles TypeScript) or `"none"` (assets are already built). |
+| `private` | bool | `false` | `true` gates asset serving behind the service ingress (a private app). Default public. |
+| `allow_cdn` | bool | `false` | Permit CDN/edge caching of immutable assets. |
+| `csp` | string | — | Opt-in `Content-Security-Policy`, emitted verbatim on served responses. Unset = no CSP header. A safe baseline (`X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`) is always on. |
+| `frame_options` | string | `"same_origin"` | `same_origin` (→ `SAMEORIGIN`), `deny` (→ `DENY`), or `none` (omit the header, for apps meant to be embedded). |
+
+```toml
+[frontend]
+root = "web"
+api_prefix = "/api"   # full-stack; omit for a frontend-only site
+build = "ts"
+private = false
+```
+
+A frontend-only deployment needs **no `[capabilities]`, `[ingress]`, or data
+model** — it runs no wasm. See the `boogy-serving-frontends` skill.
 
 ---
 
@@ -176,6 +213,25 @@ mode = "authenticated"
 [ingress.delegation]
 allow_actor = ["boogy://alice/services/gateway"]
 max_delegated_scopes = ["notes:*"]
+```
+
+### `[ingress.cors]`
+
+Opt-in, host-enforced cross-origin allowlist. Absent = no CORS headers emitted (default-deny; browsers block cross-origin reads). Only relevant when a **different** origin calls your API — a same-origin full-stack page needs none. The host answers `OPTIONS` preflights at the edge and reflects the allowed origin on actual responses. **CORS is not authorization** — an allowed origin still passes the normal ingress (token) check.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `allowed_origins` | string array | `[]` | Exact origins (`https://app.example.com`), or `["*"]` to allow any — permitted only when `allow_credentials = false`. |
+| `allowed_methods` | string array | `[]` | Methods echoed on preflight. Empty = a safe default set. |
+| `allowed_headers` | string array | `[]` | Request headers echoed on preflight. |
+| `allow_credentials` | bool | `false` | Allow cookie/`Authorization` requests. `true` forbids `allowed_origins = ["*"]` (rejected at deploy). |
+| `max_age` | u64 | — | Preflight cache lifetime in seconds. |
+
+```toml
+[ingress.cors]
+allowed_origins = ["https://app.example.com"]
+allowed_methods = ["GET", "POST"]
+allow_credentials = false
 ```
 
 ---

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/boogy-wit",
     "crates/boogy-auth-core",
+    "crates/boogy-conventions",
     "crates/boogy-sdk-macros",
     "crates/boogy-sdk",
     "crates/boogy-cli",

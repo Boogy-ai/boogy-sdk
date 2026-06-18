@@ -1,4 +1,5 @@
 mod build;
+mod check;
 mod deploy;
 mod frontend;
 mod manage;
@@ -82,6 +83,12 @@ enum Commands {
         #[command(subcommand)]
         action: SkillsAction,
     },
+    /// Lint a service crate for Boogy conventions (transactions, typed DTOs,
+    /// Model schemas, annotated routes) before you deploy
+    Check {
+        /// Path to scan (default: current directory)
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -115,12 +122,20 @@ enum SkillsAction {
         /// Destination directory (default: .claude/skills/boogy)
         #[arg(long)]
         dest: Option<String>,
+        /// Also write a pointer for this agent so it discovers the skills
+        /// (claude needs none; codex→AGENTS.md, gemini→GEMINI.md, all→both,
+        /// auto→detect)
+        #[arg(long = "for", value_enum, default_value = "claude")]
+        agent: skills::AgentTarget,
     },
     /// Refresh a previously installed copy
     Update {
         /// Destination directory (default: .claude/skills/boogy)
         #[arg(long)]
         dest: Option<String>,
+        /// Also refresh the pointer for this agent (see `install --for`)
+        #[arg(long = "for", value_enum, default_value = "claude")]
+        agent: skills::AgentTarget,
     },
 }
 
@@ -189,9 +204,14 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Skills { action } => match action {
-            SkillsAction::Install { dest } => skills::run(dest.as_deref(), "installed")?,
-            SkillsAction::Update { dest } => skills::run(dest.as_deref(), "updated")?,
+            SkillsAction::Install { dest, agent } => {
+                skills::run(dest.as_deref(), "installed", agent)?
+            }
+            SkillsAction::Update { dest, agent } => {
+                skills::run(dest.as_deref(), "updated", agent)?
+            }
         },
+        Commands::Check { path } => check::run(path.as_deref())?,
     }
 
     Ok(())
