@@ -1,7 +1,9 @@
 mod build;
 mod check;
+mod config;
 mod deploy;
 mod frontend;
+mod login;
 mod manage;
 mod provision;
 mod secret;
@@ -27,6 +29,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Sign in via your browser (OAuth device flow)
+    Login,
     /// Build a service to wasm32-wasip2
     Build {
         /// Path to the service project directory
@@ -144,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Login => login::run(&cli.host).await?,
         Commands::Build { path } => build::run(&path).await?,
         Commands::Deploy { manifest } => {
             let token = resolve_token(&cli.token)?;
@@ -217,12 +222,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the bearer token from `--token` / `BOOGY_TOKEN`, erroring clearly
-/// if neither is set.
+/// Resolve the bearer token from `--token` / `BOOGY_TOKEN` / credentials file,
+/// erroring clearly if none is set (not logged in).
 fn resolve_token(token: &Option<String>) -> anyhow::Result<String> {
-    token
-        .clone()
-        .context("set --token or BOOGY_TOKEN")
+    config::resolve_token(token.as_deref())
+        .context("not logged in: set --token, BOOGY_TOKEN, or run `boogy login`")
 }
 
 #[cfg(test)]

@@ -21,13 +21,12 @@ cargo install --path crates/boogy-cli        # installs `boogy` binary
 cargo run -p boogy-cli -- <command> [args]   # no install needed
 ```
 
-## Global flag
+## Global flags
 
-| Flag | Default | Notes |
-|------|---------|-------|
-| `--host <url>` | `http://localhost:3000` | Base URL of the Boogy host. Applies to all subcommands. |
-
-No env var shortcut exists in the source — `--host` is the only mechanism.
+| Flag | Env var | Default | Notes |
+|------|---------|---------|-------|
+| `--host <url>` | `BOOGY_HOST_URL` | `http://localhost:3000` | Base URL of the Boogy host. Applies to all subcommands. |
+| `--token <value>` | `BOOGY_TOKEN` | (saved credentials file) | Bearer token for authenticated commands. Resolution order: flag → env var → `~/.config/boogy/credentials.toml`. |
 
 ```bash
 boogy --host https://boogy.example.com list
@@ -142,32 +141,62 @@ alice/hello-api") or exits non-zero with the HTTP status on failure.
 
 ---
 
+### `boogy login`
+
+Runs the OAuth device flow to obtain and save a bearer token.
+
+```bash
+boogy login
+boogy --host https://boogy.example.com login
+```
+
+Prints a short one-time `user_code` and a `verification_uri_complete` URL.
+Open the URL in your browser, confirm the on-screen code matches, sign in
+with your provider (Google, GitHub, …), and approve. A first-time user
+picks a handle during this step.
+
+The CLI polls in the background until the flow completes, then saves the
+token and handle to `~/.config/boogy/credentials.toml` (0600). All
+subsequent commands auto-load the saved token — no export needed.
+
+For agent sessions already connected to the Boogy MCP server, the
+equivalent zero-install path is the `login` / `login_status` MCP tools.
+
+---
+
 ## Auth
 
-**Current state:** the CLI sends **no Authorization header**. Every
-`/_admin/*` endpoint (deploy, remove) is protected by `require_admin_scope`
-on the host, which returns 401 if no identity is attached and 403 if the
-identity lacks `admin` scope.
+The CLI attaches a bearer token to every authenticated command. Token
+resolution order: `--token` flag → `BOOGY_TOKEN` env var → saved
+credentials file (`~/.config/boogy/credentials.toml`, written by
+`boogy login`).
 
-In the current implementation the workaround is to hit the admin
-endpoints via `curl` with a manually-obtained bearer token, or to run
-the CLI against a host where the admin middleware is bypassed (e.g. a
-local dev host with no auth enforcement — not the default).
+**Obtaining a token — primary path: `boogy login`**
 
-**Obtaining an admin token:**
+The `boogy login` command runs the OAuth device flow end-to-end: it
+prints a short one-time `user_code` and a URL, opens the browser
+best-effort, and polls until the flow completes. The resulting token
+and handle are saved to `~/.config/boogy/credentials.toml` (0600) and
+auto-loaded by all subsequent commands — no export needed.
 
-1. Register an agent: `POST /_agents/register` (password or agentkey).
+For agent sessions that are already connected to the Boogy MCP server,
+the zero-install alternative is the `login` / `login_status` MCP tools
+(see the quickstart for the exact flow). Either path produces the same
+PASETO v4.public bearer token.
+
+**Admin bootstrap (host setup)**
+
+`/_admin/*` endpoints (deploy, remove, list) require `admin` scope.
+To bootstrap:
+
+1. Register an agent: `POST /_agents/register` (handle + password).
 2. Set `BOOGY_BOOTSTRAP_ADMIN_HANDLE=<handle>` on the host before starting;
    the host grants `admin` scope idempotently at startup.
-3. Login: `POST /_agents/login/password` → `{"token": "v4.public...."}`
-4. Pass via curl: `curl -H "Authorization: Bearer $TOKEN" ...`
+3. Run `boogy login` (or use `POST /_agents/login` → `{"token": "v4.public.…"}`
+   and export it as `BOOGY_TOKEN`) — the token now carries `admin` scope.
 
-Token is PASETO v4.public. Set `BOOGY_AUTH_KEY_FILE` on the host so the
-signing key persists across restarts — otherwise all tokens are invalidated
-on every restart.
-
-Until the CLI gains native `--token` support, use `curl` for deploy and
-remove operations that require auth.
+Set `BOOGY_AUTH_KEY_FILE` on the host so the signing key persists across
+restarts; otherwise all tokens are invalidated on restart.
 
 ---
 

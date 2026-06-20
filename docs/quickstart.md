@@ -176,7 +176,39 @@ mode = "public"
 
 ## 5. Deploy
 
+### Signing in
+
+A first-time user signs in to get a bearer token. Three ways — the first two use the same OAuth device flow and need no password:
+
+**Via the MCP server (zero-install — recommended for agent sessions)**
+
+If your coding agent is already connected to Boogy's MCP server, no install needed. The agent:
+
+1. Calls the `login` tool → receives a `user_code`, a `verification_uri_complete`, and a `device_code`.
+2. Shows you the URL and code — open the URL in your browser, confirm the on-screen code matches (anti-phishing), sign in with your provider (Google, GitHub, …), and approve. A first-time user picks a handle during this step.
+3. Polls the `login_status` tool with the `device_code` until it returns `{status: "complete", token, handle}`.
+
+The returned `token` is your Boogy bearer token. Set it as `BOOGY_TOKEN` in the session (or pass `--token` per command) for any subsequent CLI calls.
+
+**Via the CLI**
+
+Requires [installing the CLI](#install-the-cli) first, then:
+
+```bash
+boogy login
+```
+
+The CLI prints the one-time code and URL, opens your browser best-effort, and polls until your token arrives. The token is saved to `~/.config/boogy/credentials.toml` (0600) and auto-loaded by every subsequent `boogy` command — no export needed.
+
+Token resolution order: `--token` flag > `$BOOGY_TOKEN` env var > saved credentials file.
+
+**Via the web app**
+
+You can also sign in through the Boogy web app and copy the token from your account settings.
+
 ### Install the CLI
+
+Required for the CLI path above. Skip this if you are working exclusively through an MCP session.
 
 ```bash
 cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli
@@ -184,15 +216,15 @@ cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli
 cargo run -p boogy-cli -- <command>
 ```
 
-### Set your token
+### Set your token (CLI)
 
-Most commands require a bearer token:
+If you signed in via the MCP path or web app, export the token before using the CLI:
 
 ```bash
 export BOOGY_TOKEN=v4.public.<your-token>
 ```
 
-Obtain a token by logging in via the Boogy web app or `curl /_agents/login`. The CLI reads `BOOGY_TOKEN` automatically; you can also pass `--token <value>` per command.
+The CLI reads `BOOGY_TOKEN` automatically; you can also pass `--token <value>` per command. (If you used `boogy login`, the token is already saved and no export is needed.)
 
 ### Default host URL
 
