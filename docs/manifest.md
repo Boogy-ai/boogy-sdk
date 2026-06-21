@@ -141,7 +141,7 @@ derives the **deployment shape**:
 | `index` | string | `"index.html"` | SPA entry document, served for extensionless / fallback routes. |
 | `build` | string | `"ts"` | `"ts"` (platform transpiles TypeScript) or `"none"` (assets are already built). |
 | `private` | bool | `false` | `true` gates asset serving behind the service ingress (a private app). Default public. |
-| `allow_cdn` | bool | `false` | Permit CDN/edge caching of immutable assets. |
+| `allow_cdn` | bool | `false` | When a bare import isn't vendored under `/vendor/`, resolve it to an `esm.sh` CDN URL in the generated import map instead of failing the build. |
 | `csp` | string | — | Opt-in `Content-Security-Policy`, emitted verbatim on served responses. Unset = no CSP header. A safe baseline (`X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`) is always on. |
 | `frame_options` | string | `"same_origin"` | `same_origin` (→ `SAMEORIGIN`), `deny` (→ `DENY`), or `none` (omit the header, for apps meant to be embedded). |
 
@@ -329,7 +329,7 @@ If your Wasm component calls `store::*`, `auth::*`, etc. without the correspondi
 
 **Path traversal characters rejected**
 
-`service.id` and `service.owner.user_id` must be ASCII alphanumeric plus `-` and `_`, max 64 chars, no leading `-`. Characters like `/`, `\`, `.`, `:`, and all Unicode are rejected. The validator also rejects `..` outright, and reserved owner names (`v1`, `healthz`, `_admin`, `_agents`, `_sys`).
+`service.id` (and `owner`, if you set it) must be ASCII alphanumeric plus `-` and `_`, max 64 chars, no leading `-`. Characters like `/`, `\`, `.`, `:`, and all Unicode are rejected. The validator also rejects `..` outright, and reserved owner names (`v1`, `healthz`, `_admin`, `_agents`, `_sys`).
 
 **`outbound_http` with empty `allowed_hosts`**
 

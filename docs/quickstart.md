@@ -156,9 +156,6 @@ name = "My Service"
 version = "0.1.0"
 wasm = "target/wasm32-wasip2/release/my_service.wasm"
 
-[service.owner]
-user_id = "your-user-id"
-
 [routing]
 path = "/api/ping"
 methods = ["GET"]
@@ -170,7 +167,9 @@ store = false
 mode = "public"
 ```
 
-`service.id` and `service.owner.user_id` must be ASCII alphanumeric plus `-` and `_` (no dots, slashes, or Unicode). See [`manifest.md`](manifest.md) for the full field reference.
+There's no `owner` field here on purpose: you're authenticated when you deploy, so the platform sets the owner to your handle automatically. If you do set one (for local-dev/tests), it's a bare key under `[service]` — `owner = "alice"` — never a `[service.owner]` table.
+
+`service.id` must be ASCII alphanumeric plus `-` and `_` (no dots, slashes, or Unicode). See [`manifest.md`](manifest.md) for the full field reference.
 
 ---
 

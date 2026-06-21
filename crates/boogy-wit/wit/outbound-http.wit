@@ -4,9 +4,9 @@ package boogy:platform@0.1.0;
 ///
 /// Every call is mediated by the host: capability gate, egress
 /// allowlist, SSRF firewall (RFC1918 / loopback / link-local
-/// default-deny), body-size + timeout caps, secret injection (not yet
-/// active; any non-empty `secret-headers` returns `unknown-secret`),
-/// telemetry. See
+/// default-deny), body-size + timeout caps, secret injection
+/// (`secret-headers` are resolved and injected host-side via credops —
+/// the wasm never sees the plaintext), telemetry. See
 /// [`docs/outbound-http-design.md`](../../../docs/outbound-http-design.md)
 /// and [`docs/data-protection.md`](../../../docs/data-protection.md).
 ///
@@ -99,9 +99,7 @@ interface outbound-http {
         request-too-large(string),
         /// Caller referenced a secret name not declared in the
         /// manifest's `[secrets]` block, or the named secret has no
-        /// value bound for this deployment. (Currently ANY
-        /// non-empty `secret-headers` returns this — the secret
-        /// storage backend is not yet wired up.)
+        /// value bound for this deployment.
         unknown-secret(string),
         /// Internal host error (TLS error not covered above, panic,
         /// pool exhausted, etc.). String for human consumption only.
