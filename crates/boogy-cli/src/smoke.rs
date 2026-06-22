@@ -328,7 +328,14 @@ pub async fn run_smoke(
                     Some(o) => resp_url.starts_with(o.as_str()),
                     None => true,
                 };
-                if status >= 400 && same_origin {
+                // The browser auto-requests /favicon.ico; a 404 there is not a
+                // page-declared sub-resource failure and must not fail a smoke.
+                let is_favicon = resp_url
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or(resp_url)
+                    .ends_with("/favicon.ico");
+                if status >= 400 && same_origin && !is_favicon {
                     fr.lock().unwrap().push(format!("{status} {resp_url}"));
                 }
             }
