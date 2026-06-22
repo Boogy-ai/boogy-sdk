@@ -68,9 +68,10 @@ validation (`validate_manifest`, `check_service`), and sign-in (`login`,
 
 Install the Boogy skills into your project so your agent builds with
 expert workflows: `boogy skills install` (vendors
-[boogy-superpowers](https://github.com/Boogy-ai/boogy-superpowers) into
-`.claude/skills/boogy/` — auto-discovered by Claude Code, readable by any
-agent). `crates/boogy-sdk/AGENTS.md` remains the canonical handler-authoring
+[boogy-superpowers](https://github.com/Boogy-ai/boogy-superpowers) **flat** into
+`.claude/skills/<name>/` — one folder per skill, the layout Claude Code
+discovers; readable by any agent). Then run `/reload-plugins` to register them
+in-session. `crates/boogy-sdk/AGENTS.md` remains the canonical handler-authoring
 reference.
 
 ## Ready-made services

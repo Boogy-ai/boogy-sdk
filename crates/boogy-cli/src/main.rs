@@ -116,7 +116,7 @@ enum Commands {
         #[command(subcommand)]
         action: SecretAction,
     },
-    /// Vendor the Boogy skills into this project (.claude/skills/boogy)
+    /// Vendor the Boogy skills into this project (flat into .claude/skills/)
     /// so coding agents pick them up automatically
     Skills {
         #[command(subcommand)]
@@ -158,7 +158,7 @@ enum SecretAction {
 enum SkillsAction {
     /// Install the skills into the current project
     Install {
-        /// Destination directory (default: .claude/skills/boogy)
+        /// Destination directory (default: .claude/skills, flat — one folder per skill)
         #[arg(long)]
         dest: Option<String>,
         /// Also write a pointer for this agent so it discovers the skills
@@ -169,7 +169,7 @@ enum SkillsAction {
     },
     /// Refresh a previously installed copy
     Update {
-        /// Destination directory (default: .claude/skills/boogy)
+        /// Destination directory (default: .claude/skills, flat — one folder per skill)
         #[arg(long)]
         dest: Option<String>,
         /// Also refresh the pointer for this agent (see `install --for`)

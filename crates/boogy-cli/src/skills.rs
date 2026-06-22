@@ -1,6 +1,10 @@
 //! `boogy skills` — vendor the Boogy skills into a project so coding
-//! agents discover them natively. The skill FILES are always vendored to
-//! `.claude/skills/boogy` (Claude Code auto-discovers `.claude/skills/`).
+//! agents discover them natively. The skill FILES are vendored **flat** into
+//! `.claude/skills/`, one folder per skill (`.claude/skills/<name>/SKILL.md`) —
+//! the only layout Claude Code's one-level skill scan discovers (a wrapper
+//! subdirectory would be silently ignored). Each vendored skill carries a
+//! `.boogy-skill` marker so an update replaces ONLY Boogy's skills and never
+//! touches the user's own `.claude/skills` entries.
 //! For agents that don't auto-discover skills (Codex, Gemini, …), `--for`
 //! also writes a managed pointer block into the agent's instruction file
 //! (`AGENTS.md` / `GEMINI.md`) so they're routed to the entry skill.
@@ -8,14 +12,21 @@
 //! and replace the vendored copy.
 
 use anyhow::{bail, Context};
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const SKILLS_REPO: &str = "https://github.com/Boogy-ai/boogy-superpowers";
-const DEFAULT_DEST: &str = ".claude/skills/boogy";
-const MARKER_FILE: &str = ".boogy-skills";
+/// Flat — one folder per skill directly under `.claude/skills/` (NOT a wrapper
+/// subdir: Claude Code only scans one level deep, so a `boogy/` wrapper hides
+/// every skill).
+const DEFAULT_DEST: &str = ".claude/skills";
+/// Per-skill ownership marker written inside each vendored skill folder. Lets an
+/// update target only Boogy's skills, leaving the user's own skills untouched.
+const SKILL_MARKER: &str = ".boogy-skill";
 const MARKER_CONTENT: &str =
-    "vendored by 'boogy skills install' — this directory is replaced wholesale on update\n";
+    "vendored by 'boogy skills install' — safe to delete; replaced on update\n";
 
 /// Delimiters of the managed pointer block written into agent-instruction
 /// files. Idempotent: re-running replaces the content between them rather
@@ -58,7 +69,18 @@ pub fn run(dest: Option<&str>, verb: &str, target: AgentTarget) -> anyhow::Resul
 
     let n = vendor_skills(&tmp.join("skills"), &dest)?;
     let _ = fs::remove_dir_all(&tmp);
-    println!("{verb} {n} skills into {}", dest.display());
+    let entry = dest.join("using-boogy/SKILL.md");
+    println!(
+        "{verb} {n} Boogy skills into {}/ (flat — one folder per skill).",
+        dest.display()
+    );
+    println!("  Entry point: {}", entry.display());
+    if matches!(target, AgentTarget::Claude) {
+        // Claude Code discovers .claude/skills/ natively; new folders register
+        // with /reload-plugins (no session restart). Editing an existing
+        // SKILL.md is picked up automatically.
+        println!("  Claude Code: run /reload-plugins to register them this session (no restart).");
+    }
 
     // Write agent-instruction pointers for non-Claude targets so they're
     // routed to the entry skill (Claude needs none — it auto-discovers the dir).
@@ -154,38 +176,86 @@ fn upsert_managed_block(existing: &str, block: &str) -> String {
     out
 }
 
-/// Replace `dest` with a copy of every skill directory under `src`.
-/// Returns the number of skills copied.
+/// Vendor every skill directory under `src` **flat** into `dest`, one folder per
+/// skill at `dest/<name>/`. Each vendored skill gets a `.boogy-skill` marker so
+/// the operation is safe to repeat over a shared `.claude/skills/` that also
+/// holds the user's own skills:
+///
+/// - **Foreign skills are never touched** — only marker-bearing folders are
+///   replaced or removed.
+/// - **Name collisions refuse loudly** — if an incoming skill name matches a
+///   non-empty, unmarked (user-owned) folder, the whole op bails with the list
+///   rather than overwrite it.
+/// - **Orphans are pruned** — marker-bearing folders no longer present upstream
+///   (renamed/removed skills) are deleted, so an update tracks the source.
+///
+/// Returns the number of skills vendored.
 fn vendor_skills(src: &Path, dest: &Path) -> anyhow::Result<usize> {
     if !src.is_dir() {
         bail!("no skills/ directory found in the fetched repo");
     }
-    if dest.exists() {
-        // A pre-existing dest is only removable if it is empty or was
-        // created by a previous `boogy skills install` (marker present).
-        let is_empty = dest.is_dir() && fs::read_dir(dest)?.next().is_none();
-        let has_marker = dest.join(MARKER_FILE).is_file();
-        if !is_empty && !has_marker {
-            bail!(
-                "refusing to replace '{}': it wasn't created by 'boogy skills install' \
-                 (missing .boogy-skills marker) and is not empty. Choose an empty --dest \
-                 or remove it yourself.",
-                dest.display()
-            );
-        }
-        fs::remove_dir_all(dest).with_context(|| format!("clearing {}", dest.display()))?;
-    }
-    fs::create_dir_all(dest)?;
-    let mut n = 0;
+
+    // Incoming skill folder names.
+    let mut incoming: Vec<OsString> = Vec::new();
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
-            copy_dir(&entry.path(), &dest.join(entry.file_name()))?;
-            n += 1;
+            incoming.push(entry.file_name());
         }
     }
-    fs::write(dest.join(MARKER_FILE), MARKER_CONTENT)
-        .with_context(|| format!("writing marker to {}", dest.display()))?;
+    let incoming_set: BTreeSet<&OsString> = incoming.iter().collect();
+
+    fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+
+    // Pre-flight: never clobber a user-owned skill that shares a Boogy name.
+    let mut collisions: Vec<String> = Vec::new();
+    for name in &incoming {
+        let target = dest.join(name);
+        if target.exists() {
+            let ours = target.join(SKILL_MARKER).is_file();
+            let empty = target.is_dir() && fs::read_dir(&target)?.next().is_none();
+            if !ours && !empty {
+                collisions.push(name.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if !collisions.is_empty() {
+        bail!(
+            "refusing to overwrite your own skill folder(s) in {}: {} — these names \
+             collide with Boogy skills. Rename/move them, or install the plugin instead \
+             (namespaced as /boogy:<name>).",
+            dest.display(),
+            collisions.join(", ")
+        );
+    }
+
+    // Prune orphaned Boogy skills (marker-bearing, no longer upstream).
+    for entry in fs::read_dir(dest)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if path.join(SKILL_MARKER).is_file() && !incoming_set.contains(&entry.file_name()) {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("pruning orphaned skill {}", path.display()))?;
+        }
+    }
+
+    // Vendor each incoming skill: replace our prior copy (or empty dir), copy
+    // fresh, and stamp the ownership marker.
+    let mut n = 0;
+    for name in &incoming {
+        let target = dest.join(name);
+        if target.exists() {
+            fs::remove_dir_all(&target)
+                .with_context(|| format!("clearing {}", target.display()))?;
+        }
+        copy_dir(&src.join(name), &target)?;
+        fs::write(target.join(SKILL_MARKER), MARKER_CONTENT)
+            .with_context(|| format!("writing marker to {}", target.display()))?;
+        n += 1;
+    }
     Ok(n)
 }
 
@@ -225,7 +295,7 @@ mod tests {
 
     #[test]
     fn upsert_is_idempotent() {
-        let block = pointer_block(Path::new(".claude/skills/boogy"));
+        let block = pointer_block(Path::new(".claude/skills"));
         let once = upsert_managed_block("# Proj\n", &block);
         let twice = upsert_managed_block(&once, &block);
         assert_eq!(once, twice, "re-running must not change a file that already has the block");
@@ -249,8 +319,8 @@ mod tests {
 
     #[test]
     fn pointer_block_references_the_entry_skill() {
-        let block = pointer_block(Path::new(".claude/skills/boogy"));
-        assert!(block.contains(".claude/skills/boogy/using-boogy/SKILL.md"));
+        let block = pointer_block(Path::new(".claude/skills"));
+        assert!(block.contains(".claude/skills/using-boogy/SKILL.md"));
         assert!(block.starts_with(POINTER_BEGIN));
         assert!(block.ends_with(POINTER_END));
     }
@@ -285,7 +355,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agents = tmp.path().join("AGENTS.md");
         fs::write(&agents, "# House rules\n\nUse tabs.\n").unwrap();
-        let skills = Path::new(".claude/skills/boogy");
+        let skills = Path::new(".claude/skills");
 
         write_pointer_file(&agents, skills).unwrap();
         let after_first = fs::read_to_string(&agents).unwrap();
@@ -298,27 +368,36 @@ mod tests {
         assert_eq!(after_second.matches(POINTER_BEGIN).count(), 1);
     }
 
+    /// Build a fake fetched `skills/` dir with the given skill folder names.
+    fn make_src(base: &Path, names: &[&str]) -> PathBuf {
+        let src = base.join("skills");
+        for name in names {
+            fs::create_dir_all(src.join(name)).unwrap();
+            fs::write(src.join(name).join("SKILL.md"), format!("# {name}")).unwrap();
+        }
+        src
+    }
+
     #[test]
-    fn vendor_skills_replaces_dest_and_counts_dirs() {
+    fn vendor_skills_installs_flat_one_folder_per_skill_with_markers() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("skills");
-        fs::create_dir_all(src.join("using-boogy")).unwrap();
-        fs::write(src.join("using-boogy/SKILL.md"), "x").unwrap();
+        let src = make_src(tmp.path(), &["using-boogy", "boogy-auth"]);
+        // a nested ref file inside a skill must be copied too.
         fs::create_dir_all(src.join("boogy-auth/sub")).unwrap();
         fs::write(src.join("boogy-auth/sub/ref.md"), "y").unwrap();
 
-        let dest = tmp.path().join("out");
-        // Pre-existing stale content must be replaced, not merged.
-        // Give dest the ownership marker so the guard accepts it.
-        fs::create_dir_all(&dest).unwrap();
-        fs::write(dest.join(MARKER_FILE), MARKER_CONTENT).unwrap();
-        fs::create_dir_all(dest.join("stale-skill")).unwrap();
-
+        let dest = tmp.path().join(".claude/skills");
         let n = vendor_skills(&src, &dest).unwrap();
+
         assert_eq!(n, 2);
+        // Flat: skill is exactly one level under dest (NOT under a wrapper).
         assert!(dest.join("using-boogy/SKILL.md").exists());
         assert!(dest.join("boogy-auth/sub/ref.md").exists());
-        assert!(!dest.join("stale-skill").exists());
+        // Each vendored skill carries the per-skill ownership marker.
+        assert!(dest.join("using-boogy").join(SKILL_MARKER).is_file());
+        assert!(dest.join("boogy-auth").join(SKILL_MARKER).is_file());
+        // No dest-level wrapper marker.
+        assert!(!dest.join(SKILL_MARKER).exists());
     }
 
     #[test]
@@ -329,61 +408,69 @@ mod tests {
     }
 
     #[test]
-    fn vendor_skills_refuses_unmarked_nonempty_dest() {
+    fn vendor_skills_preserves_foreign_skills() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("skills");
-        fs::create_dir_all(src.join("skill-a")).unwrap();
-        fs::write(src.join("skill-a/SKILL.md"), "a").unwrap();
+        let src = make_src(tmp.path(), &["boogy-auth"]);
 
-        let dest = tmp.path().join("out");
-        fs::create_dir_all(&dest).unwrap();
-        // A stray file with no marker — guard must refuse.
-        fs::write(dest.join("precious.txt"), "keep me").unwrap();
+        // A shared .claude/skills that already holds the USER's own skill.
+        let dest = tmp.path().join(".claude/skills");
+        fs::create_dir_all(dest.join("my-own-skill")).unwrap();
+        fs::write(dest.join("my-own-skill/SKILL.md"), "mine").unwrap();
+
+        vendor_skills(&src, &dest).unwrap();
+
+        // Boogy skill installed; the user's own skill is untouched.
+        assert!(dest.join("boogy-auth/SKILL.md").exists());
+        assert!(dest.join("my-own-skill/SKILL.md").exists(), "foreign skill must survive");
+        assert!(!dest.join("my-own-skill").join(SKILL_MARKER).exists(), "we must not stamp foreign skills");
+    }
+
+    #[test]
+    fn vendor_skills_refuses_name_collision_with_user_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = make_src(tmp.path(), &["boogy-auth"]);
+
+        // The user already has a non-empty, unmarked folder of the same name.
+        let dest = tmp.path().join(".claude/skills");
+        fs::create_dir_all(dest.join("boogy-auth")).unwrap();
+        fs::write(dest.join("boogy-auth/precious.txt"), "keep me").unwrap();
 
         let err = vendor_skills(&src, &dest).unwrap_err();
-        assert!(
-            err.to_string().contains("refusing to replace"),
-            "unexpected error: {err}"
-        );
-        // The precious file must still exist — nothing was deleted.
-        assert!(dest.join("precious.txt").exists());
+        assert!(err.to_string().contains("refusing to overwrite"), "unexpected error: {err}");
+        assert!(err.to_string().contains("boogy-auth"), "names the collision");
+        // Nothing was deleted.
+        assert!(dest.join("boogy-auth/precious.txt").exists());
     }
 
     #[test]
-    fn vendor_skills_replaces_marked_dest() {
+    fn vendor_skills_update_replaces_ours_and_prunes_orphans() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("skills");
-        fs::create_dir_all(src.join("new-skill")).unwrap();
-        fs::write(src.join("new-skill/SKILL.md"), "new").unwrap();
+        let dest = tmp.path().join(".claude/skills");
 
-        let dest = tmp.path().join("out");
-        fs::create_dir_all(&dest).unwrap();
-        // Simulate a previous install: marker + old content.
-        fs::write(dest.join(MARKER_FILE), MARKER_CONTENT).unwrap();
-        fs::create_dir_all(dest.join("old-skill")).unwrap();
-        fs::write(dest.join("old-skill/SKILL.md"), "old").unwrap();
+        // First install: two Boogy skills.
+        let src1 = make_src(&tmp.path().join("v1"), &["boogy-auth", "boogy-old"]);
+        vendor_skills(&src1, &dest).unwrap();
+        assert!(dest.join("boogy-old/SKILL.md").exists());
 
-        vendor_skills(&src, &dest).unwrap();
+        // Update: boogy-old is gone upstream, boogy-new appears.
+        let src2 = make_src(&tmp.path().join("v2"), &["boogy-auth", "boogy-new"]);
+        let n = vendor_skills(&src2, &dest).unwrap();
 
-        assert!(!dest.join("old-skill").exists(), "old content should be gone");
-        assert!(dest.join("new-skill/SKILL.md").exists(), "new skill should be present");
-        assert!(dest.join(MARKER_FILE).exists(), "marker should be re-written");
+        assert_eq!(n, 2);
+        assert!(dest.join("boogy-auth/SKILL.md").exists(), "kept skill refreshed");
+        assert!(dest.join("boogy-new/SKILL.md").exists(), "new skill added");
+        assert!(!dest.join("boogy-old").exists(), "orphaned Boogy skill pruned");
     }
 
     #[test]
-    fn vendor_skills_accepts_empty_dest_dir() {
+    fn vendor_skills_into_empty_dest() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("skills");
-        fs::create_dir_all(src.join("skill-x")).unwrap();
-        fs::write(src.join("skill-x/SKILL.md"), "x").unwrap();
-
-        // Pre-created empty dest — no marker needed for an empty dir.
-        let dest = tmp.path().join("out");
-        fs::create_dir_all(&dest).unwrap();
+        let src = make_src(tmp.path(), &["skill-x"]);
+        let dest = tmp.path().join(".claude/skills");
+        fs::create_dir_all(&dest).unwrap(); // pre-created, empty
 
         vendor_skills(&src, &dest).unwrap();
-
         assert!(dest.join("skill-x/SKILL.md").exists());
-        assert!(dest.join(MARKER_FILE).exists(), "marker should be written after install");
+        assert!(dest.join("skill-x").join(SKILL_MARKER).is_file());
     }
 }
