@@ -77,9 +77,9 @@ pub fn run(dest: Option<&str>, verb: &str, target: AgentTarget) -> anyhow::Resul
     println!("  Entry point: {}", entry.display());
     if matches!(target, AgentTarget::Claude) {
         // Claude Code discovers .claude/skills/ natively; new folders register
-        // with /reload-plugins (no session restart). Editing an existing
+        // with /reload-skills (no session restart). Editing an existing
         // SKILL.md is picked up automatically.
-        println!("  Claude Code: run /reload-plugins to register them this session (no restart).");
+        println!("  Claude Code: run /reload-skills to register them this session (no restart).");
     }
 
     // Write agent-instruction pointers for non-Claude targets so they're

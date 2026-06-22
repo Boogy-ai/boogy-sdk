@@ -6,7 +6,7 @@ Build and deploy a Boogy service in five steps.
 > front — it writes the Boogy agent skills **flat** into `.claude/skills/<name>/`
 > (one folder per skill — the only layout Claude Code discovers) where coding
 > agents (and any implementer subagents) auto-discover and read them directly.
-> Then run `/reload-plugins` to register them in-session (no restart). The
+> Then run `/reload-skills` to register them in-session (no restart). The
 > anonymous MCP's `get_skill` is great for ad-hoc lookup by the *driving* agent,
 > but its results don't persist into a fresh subagent's context; vendored skills
 > are the durable copy your agents actually build from. Re-run `boogy skills

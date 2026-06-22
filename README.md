@@ -70,7 +70,7 @@ Install the Boogy skills into your project so your agent builds with
 expert workflows: `boogy skills install` (vendors
 [boogy-superpowers](https://github.com/Boogy-ai/boogy-superpowers) **flat** into
 `.claude/skills/<name>/` — one folder per skill, the layout Claude Code
-discovers; readable by any agent). Then run `/reload-plugins` to register them
+discovers; readable by any agent). Then run `/reload-skills` to register them
 in-session. `crates/boogy-sdk/AGENTS.md` remains the canonical handler-authoring
 reference.
 
