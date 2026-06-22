@@ -8,6 +8,7 @@ mod manage;
 mod provision;
 mod secret;
 mod skills;
+mod smoke;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -47,6 +48,17 @@ enum Commands {
         /// version without a bump. Fails if a live service still references it.
         #[arg(long)]
         replace: bool,
+        /// After deploy, load the live deployed URL in a headless browser and
+        /// assert it renders with a clean console (best-effort: no browser ⇒
+        /// a warning, never a failure). Frontend deployments only.
+        #[arg(long)]
+        smoke: bool,
+        /// CSS selector expected to render non-empty content (smoke).
+        #[arg(long, default_value = "#app")]
+        smoke_selector: String,
+        /// Render-wait budget in milliseconds (smoke).
+        #[arg(long, default_value_t = 10_000)]
+        smoke_timeout: u64,
     },
     /// Publish a module (immutable, versioned wasm+manifest artifact)
     Publish {
@@ -59,6 +71,16 @@ enum Commands {
         /// (re-publish the same version without a bump). See `deploy --replace`.
         #[arg(long)]
         replace: bool,
+        /// Post-deploy headless-browser smoke (requires `--provision`). See
+        /// `deploy --smoke`.
+        #[arg(long)]
+        smoke: bool,
+        /// CSS selector expected to render non-empty content (smoke).
+        #[arg(long, default_value = "#app")]
+        smoke_selector: String,
+        /// Render-wait budget in milliseconds (smoke).
+        #[arg(long, default_value_t = 10_000)]
+        smoke_timeout: u64,
     },
     /// Provision a service instance from a published module
     Provision {
@@ -163,17 +185,36 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Login => login::run(&cli.host).await?,
         Commands::Build { path } => build::run(&path).await?,
-        Commands::Deploy { manifest, replace } => {
+        Commands::Deploy {
+            manifest,
+            replace,
+            smoke,
+            smoke_selector,
+            smoke_timeout,
+        } => {
             let token = resolve_token(&cli.token)?;
-            deploy::run(&cli.host, &token, &manifest, replace).await?
+            let smoke_opts = smoke::SmokeOptions {
+                enabled: smoke,
+                selector: smoke_selector,
+                timeout_ms: smoke_timeout,
+            };
+            deploy::run(&cli.host, &token, &manifest, replace, smoke_opts).await?
         }
         Commands::Publish {
             manifest,
             provision,
             replace,
+            smoke,
+            smoke_selector,
+            smoke_timeout,
         } => {
             let token = resolve_token(&cli.token)?;
-            provision::publish(&cli.host, &token, &manifest, provision, replace).await?
+            let smoke_opts = smoke::SmokeOptions {
+                enabled: smoke,
+                selector: smoke_selector,
+                timeout_ms: smoke_timeout,
+            };
+            provision::publish(&cli.host, &token, &manifest, provision, replace, smoke_opts).await?
         }
         Commands::Provision {
             module,
@@ -290,6 +331,53 @@ mod tests {
             cli.host, "https://boogy.ai",
             "default --host must be the hosted platform, not localhost"
         );
+    }
+
+    /// `deploy --smoke` flags: defaults present, overrides parsed.
+    #[test]
+    fn deploy_smoke_flags_parse() {
+        // Default: smoke off, selector `#app`, timeout 10000.
+        let cli = Cli::try_parse_from(["boogy", "deploy", "app.boogy.toml"]).expect("parse");
+        match cli.command {
+            Commands::Deploy { smoke, smoke_selector, smoke_timeout, .. } => {
+                assert!(!smoke, "smoke must default off (explicit opt-in)");
+                assert_eq!(smoke_selector, "#app");
+                assert_eq!(smoke_timeout, 10_000);
+            }
+            other => panic!("expected Deploy, got {other:?}"),
+        }
+
+        // Overrides.
+        let cli = Cli::try_parse_from([
+            "boogy", "deploy", "app.boogy.toml",
+            "--smoke", "--smoke-selector", "#root", "--smoke-timeout", "20000",
+        ])
+        .expect("parse");
+        match cli.command {
+            Commands::Deploy { smoke, smoke_selector, smoke_timeout, .. } => {
+                assert!(smoke);
+                assert_eq!(smoke_selector, "#root");
+                assert_eq!(smoke_timeout, 20_000);
+            }
+            other => panic!("expected Deploy, got {other:?}"),
+        }
+    }
+
+    /// `publish --smoke` also carries the flags.
+    #[test]
+    fn publish_smoke_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "boogy", "publish", "app.boogy.toml", "--provision", "--smoke",
+        ])
+        .expect("parse");
+        match cli.command {
+            Commands::Publish { provision, smoke, smoke_selector, .. } => {
+                assert!(provision);
+                assert!(smoke);
+                assert_eq!(smoke_selector, "#app");
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
     }
 
     /// `--version` / `-V` is wired to the crate version.

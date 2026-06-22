@@ -161,12 +161,16 @@ pub async fn publish(
     manifest_path: &str,
     provision: bool,
     replace: bool,
+    smoke: crate::smoke::SmokeOptions,
 ) -> Result<()> {
     let PublishArtifacts {
         manifest_content,
         wasm,
         frontend_tar_gz,
     } = read_publish_artifacts(manifest_path)?;
+    // Capture before the bundle is consumed into the multipart form — the smoke
+    // step only applies to deployments that actually serve a frontend.
+    let has_frontend = frontend_tar_gz.is_some();
 
     // --replace: GC this module version first (if it exists + is unreferenced)
     // so the same version can be re-published without a bump. A version a live
@@ -263,6 +267,26 @@ pub async fn publish(
     }
 
     println!("  Provisioned: {provisioned}");
+
+    // Opt-in post-deploy smoke. Only meaningful once a service is actually
+    // serving — i.e. provision succeeded. Best-effort otherwise.
+    if smoke.enabled {
+        if provision && provisioned {
+            let service_uri = crate::smoke::service_uri_from_module(module);
+            crate::smoke::run_post_deploy_smoke(
+                &smoke,
+                host,
+                service_uri.as_deref(),
+                has_frontend,
+            )
+            .await?;
+        } else {
+            println!(
+                "  Smoke: skipped (requires a provisioned service — \
+                 use `deploy` or `publish --provision`)"
+            );
+        }
+    }
 
     Ok(())
 }
