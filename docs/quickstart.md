@@ -2,6 +2,14 @@
 
 Build and deploy a Boogy service in five steps.
 
+> **Coding agents: vendor the skills first.** Run `boogy skills install` (CLI) up
+> front — it writes the Boogy agent skills into `.claude/skills/boogy/<name>/` where
+> coding agents (and any implementer subagents) auto-discover and read them
+> directly. The anonymous MCP's `get_skill` is great for ad-hoc lookup by the
+> *driving* agent, but its results don't persist into a fresh subagent's context;
+> vendored skills are the durable copy your agents actually build from. Re-run
+> `boogy skills update` to refresh. (Do this before generating service code.)
+
 ---
 
 ## 1. Prerequisites
@@ -59,6 +67,11 @@ boogy-wit = { git = "https://github.com/Boogy-ai/boogy-sdk", rev = "<pin-rev>" }
 ```
 
 Replace `<pin-rev>` with the commit SHA you want to pin (e.g. the latest from `main`).
+Discover the current SHA without cloning:
+
+```bash
+git ls-remote https://github.com/Boogy-ai/boogy-sdk HEAD   # prints the latest main SHA
+```
 
 ### The `build.rs` WIT-sync mechanism
 
@@ -189,6 +202,8 @@ If your coding agent is already connected to Boogy's MCP server, no install need
 
 The returned `token` is your Boogy bearer token. Set it as `BOOGY_TOKEN` in the session (or pass `--token` per command) for any subsequent CLI calls.
 
+> **The anonymous builder MCP does not deploy.** The public `POST /mcp` server gives a coding agent guidance (`get_started`, `list_skills`, `get_skill`, `manifest_reference`), validation (`validate_manifest`, `check_service`), and `login`/`login_status` — but **no deploy tool**. After you have a token, deploy via the **CLI** (below), the **`/v1` REST API** (`POST /v1/modules` then `POST /v1/services`, or the `boogy deploy` shortcut), or the **authenticated admin MCP** (`deploy_service` / `deploy_api`, which also accepts `frontend_files`). The cold-entry `/mcp` is for getting *ready* to deploy, not deploying.
+
 **Via the CLI**
 
 Requires [installing the CLI](#install-the-cli) first, then:
@@ -207,7 +222,9 @@ You can also sign in through the Boogy web app and copy the token from your acco
 
 ### Install the CLI
 
-Required for the CLI path above. Skip this if you are working exclusively through an MCP session.
+Required to deploy (the anonymous builder MCP can't — see the note above). Even an
+agent working through the MCP session needs the CLI or the `/v1` REST API (or the
+authenticated admin MCP) to actually deploy.
 
 ```bash
 cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli
@@ -227,10 +244,11 @@ The CLI reads `BOOGY_TOKEN` automatically; you can also pass `--token <value>` p
 
 ### Default host URL
 
-The CLI targets `http://localhost:3000` by default. Override it with:
+The CLI targets the hosted platform (`https://boogy.ai`) by default. Point it at
+your own host (e.g. local development) with:
 
 ```bash
-export BOOGY_HOST_URL=https://your-boogy-host.example.com
+export BOOGY_HOST_URL=http://localhost:3000
 # or per-command:
 boogy deploy boogy.toml --host https://your-boogy-host.example.com
 ```

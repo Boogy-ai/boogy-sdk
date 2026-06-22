@@ -13,13 +13,15 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "boogy", about = "Boogy service management CLI")]
+#[command(name = "boogy", about = "Boogy service management CLI", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Host URL (falls back to BOOGY_HOST_URL)
-    #[arg(long, env = "BOOGY_HOST_URL", default_value = "http://localhost:3000", global = true)]
+    /// Host URL (falls back to BOOGY_HOST_URL, then the hosted platform).
+    /// For local development against your own host, set BOOGY_HOST_URL or pass
+    /// --host http://localhost:3000.
+    #[arg(long, env = "BOOGY_HOST_URL", default_value = "https://boogy.ai", global = true)]
     host: String,
 
     /// Bearer token for authenticated commands (falls back to BOOGY_TOKEN)
@@ -69,12 +71,14 @@ enum Commands {
     },
     /// List deployed services (requires admin scope)
     List,
-    /// Remove a deployed service (requires admin scope)
+    /// Remove a deployed service you own (no admin scope required)
     Remove {
-        /// Owner user ID
-        owner: String,
         /// Service ID to remove
         service_id: String,
+        /// Admin only: remove another owner's service (requires admin scope).
+        /// Omit to remove your own service via the owner-scoped endpoint.
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Manage per-service secrets (sealed client-side before binding)
     Secret {
@@ -186,7 +190,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Remove { owner, service_id } => {
             let token = resolve_token(&cli.token)?;
-            manage::remove(&cli.host, &token, &owner, &service_id).await?
+            match owner {
+                // Admin: remove another owner's service via the admin endpoint.
+                Some(owner) => manage::remove_admin(&cli.host, &token, &owner, &service_id).await?,
+                // Default: remove your own service via the owner-scoped endpoint
+                // (ownership derived from the token — no admin scope needed).
+                None => manage::remove(&cli.host, &token, &service_id).await?,
+            }
         }
         Commands::Secret { action } => match action {
             SecretAction::Set {
