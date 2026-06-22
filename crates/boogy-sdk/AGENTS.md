@@ -1128,8 +1128,11 @@ use crate::bindings;  // if you need to reach into raw WIT bindings
 
 | Category | Names |
 |---|---|
-| Modules | `store` (= WIT `bindings::boogy::platform::store`), `auth`, `bindings` |
-| Types | `Request`, `Params` |
+| Modules | `store` (= WIT `bindings::boogy::platform::store`), `auth`, `bindings`, the `peer`/`secrets`/`signing`/`background_jobs`/`websockets` binding modules, plus `response` and `json` |
+| Router / request | `Router`, `Req`, `Params`, `Request`, `Path`, `FromRequest`, `Principal`, `Ctx`, `QueryExtractor` (the `Query` *request extractor*, aliased so it doesn't clash with the `Query` DSL builder — both are in scope) |
+| Response wrappers | `Json`, `Created`, `NoContent`, `Redirect`, `IntoResponse` |
+| Errors / parsing | `ApiError`, `parse_body`, `validate_body` |
+| Serde derives | `Serialize`, `Deserialize` — **in scope already; no `use serde::…`** |
 | Constants | `DEFAULT_OWNER_COL` |
 | Schema | `create_table_from`, `migration`, `migrations` |
 | Row reads | `to_sdk_row`, `get_row`, `find_all_rows`, `find_row_by`, `find_rows_by`, `find_rows`, `find_rows_grouped`, `upsert_increment`, `for_each_batch` |
@@ -1140,9 +1143,21 @@ If `api_keys_glue!` is also invoked, add: the `api_key_routes` module
 with `create` / `list` / `revoke` / `rotate` / `guard` / `resolve_caller`
 / `install_table` / `ResolvedKey`.
 
+**All of the above are already in scope in `lib.rs` after `wit_glue!` —
+do NOT also `use boogy_sdk::{Router, Json, ApiError, …}` (or `use
+serde::{Serialize, Deserialize}`) there. That re-imports a name the macro
+already injected (`E0252` / "unused import" / shadowing) — the exact
+double-import trap.** And `wit_glue!(bindings, MyApi)` does **not** define
+`struct MyApi` — you declare the unit struct and `impl Api for MyApi`
+yourself. The `boogy_sdk::` import line below is for **submodules** (where
+crate-root names aren't visible unless you `use crate::*`) and for crates
+that don't invoke `wit_glue!`.
+
 ### From `boogy_sdk::` — re-exports from the SDK crate
 
 ```rust
+// In a SUBMODULE (or a crate without wit_glue!) — in lib.rs these names
+// are already injected by wit_glue!, so importing them there double-imports.
 use boogy_sdk::{Api, ApiError, Created, Json, NoContent, Redirect, Req, Router,
                 Row, StoreError, Table, parse_body, validate_body};
 use boogy_sdk::ids::IdCodec;  // optional: opaque-id translation
@@ -1167,9 +1182,11 @@ SDK re-exports (`boogy_sdk::`) are the bindings-independent surface:
 they're the same across every crate.
 
 **Practical rule:** if it has anything to do with `store::`, `tx`,
-`auth::*`, or `bindings::*`, it's a `crate::` name. If it's
-`ApiError` / `Req` / `Created` / a response wrapper, it's available
-from either path — pick `boogy_sdk::` for clarity in submodules.
+`auth::*`, or `bindings::*`, it's a `crate::` name. `ApiError` / `Req` /
+`Created` / a response wrapper / the serde derives are available from
+either path — but in `lib.rs` they're **already injected by `wit_glue!`,
+so don't re-`use` them there**; in a submodule, import them from
+`boogy_sdk::` (or `use crate::*`).
 
 ## Opaque public ids (`boogy_sdk::ids`)
 

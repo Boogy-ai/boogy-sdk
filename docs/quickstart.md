@@ -244,16 +244,11 @@ export BOOGY_TOKEN=v4.public.<your-token>
 
 The CLI reads `BOOGY_TOKEN` automatically; you can also pass `--token <value>` per command. (If you used `boogy login`, the token is already saved and no export is needed.)
 
-### Default host URL
+### Host URL
 
-The CLI targets the hosted platform (`https://boogy.ai`) by default. Point it at
-your own host (e.g. local development) with:
-
-```bash
-export BOOGY_HOST_URL=http://localhost:3000
-# or per-command:
-boogy deploy boogy.toml --host https://your-boogy-host.example.com
-```
+Boogy is a hosted, cloud platform — the CLI targets `https://boogy.ai` by
+default, and that's the only host you need. (Self-hosted/CI setups can override
+with `BOOGY_HOST_URL` or `--host https://your-boogy-host.example.com`.)
 
 ### Deploy
 
@@ -269,7 +264,7 @@ The platform API is self-describing: `GET <host>/openapi.json` returns an OpenAP
 
 ```bash
 boogy list                          # list deployed services (requires admin scope)
-curl http://localhost:3000/your-user-id/api/ping
+curl https://boogy.ai/your-user-id/api/ping
 ```
 
 ### Other useful commands
