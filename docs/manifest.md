@@ -142,6 +142,7 @@ derives the **deployment shape**:
 | `build` | string | `"ts"` | `"ts"` (platform transpiles TypeScript) or `"none"` (assets are already built). |
 | `private` | bool | `false` | `true` gates asset serving behind the service ingress (a private app). Default public. |
 | `allow_cdn` | bool | `false` | When a bare import isn't vendored under `/vendor/`, resolve it to an `esm.sh` CDN URL in the generated import map instead of failing the build. |
+| `minify` | bool | on when `build = "ts"` | Minify (compact) the transpiled `.ts` → `.js` output at deploy. Defaults on whenever the bundle is transpiled; set `minify = false` to ship readable JS for debugging. Compaction only (whitespace/optional tokens); passthrough `.js` is served verbatim. |
 | `csp` | string | — | Opt-in `Content-Security-Policy`, emitted verbatim on served responses. Unset = no CSP header. A safe baseline (`X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`) is always on. |
 | `frame_options` | string | `"same_origin"` | `same_origin` (→ `SAMEORIGIN`), `deny` (→ `DENY`), or `none` (omit the header, for apps meant to be embedded). |
 

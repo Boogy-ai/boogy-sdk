@@ -42,6 +42,11 @@ enum Commands {
     Deploy {
         /// Path to the deployment manifest (.boogy.toml)
         manifest: String,
+        /// Dev loop: first delete this module version if it already exists and
+        /// is unreferenced, then publish — so you can re-publish the same
+        /// version without a bump. Fails if a live service still references it.
+        #[arg(long)]
+        replace: bool,
     },
     /// Publish a module (immutable, versioned wasm+manifest artifact)
     Publish {
@@ -50,6 +55,10 @@ enum Commands {
         /// Also provision the publisher's own service from it
         #[arg(long)]
         provision: bool,
+        /// Dev loop: delete this unreferenced module version first, then publish
+        /// (re-publish the same version without a bump). See `deploy --replace`.
+        #[arg(long)]
+        replace: bool,
     },
     /// Provision a service instance from a published module
     Provision {
@@ -154,16 +163,17 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Login => login::run(&cli.host).await?,
         Commands::Build { path } => build::run(&path).await?,
-        Commands::Deploy { manifest } => {
+        Commands::Deploy { manifest, replace } => {
             let token = resolve_token(&cli.token)?;
-            deploy::run(&cli.host, &token, &manifest).await?
+            deploy::run(&cli.host, &token, &manifest, replace).await?
         }
         Commands::Publish {
             manifest,
             provision,
+            replace,
         } => {
             let token = resolve_token(&cli.token)?;
-            provision::publish(&cli.host, &token, &manifest, provision).await?
+            provision::publish(&cli.host, &token, &manifest, provision, replace).await?
         }
         Commands::Provision {
             module,
@@ -272,5 +282,25 @@ mod tests {
         unsafe {
             std::env::remove_var("BOOGY_HOST_URL");
         }
+
+        // --- with no env + no flag, the default is the hosted platform, NOT
+        //     localhost (a localhost default is wrong for the common case). ---
+        let cli = Cli::try_parse_from(["boogy", "list"]).expect("parse");
+        assert_eq!(
+            cli.host, "https://boogy.ai",
+            "default --host must be the hosted platform, not localhost"
+        );
+    }
+
+    /// `--version` / `-V` is wired to the crate version.
+    #[test]
+    fn version_flag_is_set() {
+        use clap::CommandFactory;
+        let v = Cli::command().get_version().map(|s| s.to_string());
+        assert_eq!(
+            v.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "boogy --version should report the crate version"
+        );
     }
 }

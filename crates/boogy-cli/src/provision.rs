@@ -94,16 +94,88 @@ fn read_publish_artifacts(manifest_path: &str) -> Result<PublishArtifacts> {
     })
 }
 
+/// Extract `(module_name, version)` = `([service].id, [service].version)` from a
+/// manifest's TOML (accepts the legacy `[api]` alias). The module name in the
+/// `boogy://owner/modules/<name>@<version>` URI is `[service].id`, not the
+/// display `name`. Used by `--replace`.
+fn module_name_version(manifest_content: &str) -> Result<(String, String)> {
+    let manifest: toml::Value =
+        toml::from_str(manifest_content).context("failed to parse manifest")?;
+    let svc = manifest
+        .get("service")
+        .or_else(|| manifest.get("api"))
+        .context("manifest has no [service] section")?;
+    let id = svc
+        .get("id")
+        .and_then(|v| v.as_str())
+        .context("manifest [service].id missing")?;
+    let version = svc
+        .get("version")
+        .and_then(|v| v.as_str())
+        .context("manifest [service].version missing")?;
+    Ok((id.to_string(), version.to_string()))
+}
+
+/// Delete one unreferenced module version — the `--replace` pre-step.
+/// 404 (nothing to delete: first publish of this version) is fine; 409 (a live
+/// service references it) is a hard error with a clear next step; success is
+/// reported. Hits the owner-scoped `DELETE /v1/modules/{name}/{version}`.
+async fn delete_module_version(host: &str, token: &str, name: &str, version: &str) -> Result<()> {
+    let url = format!("{host}/v1/modules/{name}/{version}");
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .context("failed to reach host")?;
+    match resp.status() {
+        s if s.is_success() => {
+            println!("  Replaced: deleted existing {name}@{version}");
+            Ok(())
+        }
+        reqwest::StatusCode::NOT_FOUND => Ok(()), // nothing to replace — fine
+        reqwest::StatusCode::CONFLICT => {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "--replace: {name}@{version} is still referenced by a live service, so it \
+                 can't be replaced in place. Bump the version, or upgrade/delete the \
+                 service first.\n{body}"
+            )
+        }
+        s => {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("--replace: delete {name}@{version} failed ({s}): {body}")
+        }
+    }
+}
+
 /// Publish a module: an immutable, versioned wasm+manifest artifact.
 ///
 /// When `provision` is true the host also provisions the publisher's own
-/// service from the manifest in the same call.
-pub async fn publish(host: &str, token: &str, manifest_path: &str, provision: bool) -> Result<()> {
+/// service from the manifest in the same call. When `replace` is true, an
+/// existing unreferenced copy of this version is deleted first (dev loop).
+pub async fn publish(
+    host: &str,
+    token: &str,
+    manifest_path: &str,
+    provision: bool,
+    replace: bool,
+) -> Result<()> {
     let PublishArtifacts {
         manifest_content,
         wasm,
         frontend_tar_gz,
     } = read_publish_artifacts(manifest_path)?;
+
+    // --replace: GC this module version first (if it exists + is unreferenced)
+    // so the same version can be re-published without a bump. A version a live
+    // service still references is refused by the host (409) — surfaced here.
+    if replace {
+        let (name, version) = module_name_version(&manifest_content)
+            .context("--replace needs [service].name and [service].version in the manifest")?;
+        delete_module_version(host, token, &name, &version).await?;
+    }
 
     println!("Publishing module...");
     println!("  Manifest: {manifest_path}");
@@ -312,6 +384,34 @@ mod tests {
             std::fs::write(&wasm_path, b"\0asm").expect("write wasm");
         }
         (base, manifest_path)
+    }
+
+    // --replace: extract (module_name, version) = ([service].id, [service].version).
+    #[test]
+    fn module_name_version_reads_id_and_version() {
+        let toml = "[service]\nid = \"notes\"\nname = \"Notes API\"\nversion = \"0.5.1\"\n";
+        let (name, ver) = module_name_version(toml).expect("parse");
+        // The URI slug is [service].id, NOT the display name.
+        assert_eq!(name, "notes");
+        assert_eq!(ver, "0.5.1");
+    }
+
+    #[test]
+    fn module_name_version_accepts_legacy_api_alias() {
+        let toml = "[api]\nid = \"legacy\"\nversion = \"1.0.0\"\n";
+        let (name, ver) = module_name_version(toml).expect("parse alias");
+        assert_eq!(name, "legacy");
+        assert_eq!(ver, "1.0.0");
+    }
+
+    #[test]
+    fn module_name_version_errors_without_id_or_version() {
+        // Missing version.
+        assert!(module_name_version("[service]\nid = \"x\"\n").is_err());
+        // Missing id.
+        assert!(module_name_version("[service]\nversion = \"1.0.0\"\n").is_err());
+        // No service section at all.
+        assert!(module_name_version("[frontend]\nroot = \"web\"\n").is_err());
     }
 
     /// FIX 4: [service] section resolves wasm path correctly.
