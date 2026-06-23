@@ -267,6 +267,9 @@ pub async fn publish(
     }
 
     println!("  Provisioned: {provisioned}");
+    if let Some(url) = body.get("service_url").and_then(|u| u.as_str()) {
+        println!("  URL: {url}");
+    }
 
     // Opt-in post-deploy smoke. Only meaningful once a service is actually
     // serving — i.e. provision succeeded. Best-effort otherwise.
@@ -339,6 +342,9 @@ pub async fn provision(
 
     println!("Provisioned: {service}");
     println!("  Deployment: {deployment_id}");
+    if let Some(url) = body.get("service_url").and_then(|u| u.as_str()) {
+        println!("  URL: {url}");
+    }
 
     Ok(())
 }
