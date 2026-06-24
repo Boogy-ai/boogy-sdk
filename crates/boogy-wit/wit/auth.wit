@@ -6,9 +6,14 @@ interface auth {
     /// `principal` is opaque to wasm and may be one of:
     /// - `agent_<uuid>` — a human or AI agent acting in their own
     ///   right.
-    /// - `pw_<...>` — an end-user, masked per-app (a pairwise
-    ///   pseudonym; stable for this user at this app, distinct
-    ///   from their identity at any other app).
+    /// - `pw_<...>` — an end-user, masked per service (a pairwise
+    ///   pseudonym; stable for this user at this service, distinct
+    ///   from their identity at any other service). Appears on both
+    ///   direct app sign-in and on delegated (on-behalf-of) peer
+    ///   calls — when an end-user's identity rides a call chain,
+    ///   it is re-masked for each service it reaches, so the same
+    ///   user always lands on the same per-service pairwise
+    ///   regardless of the path taken to arrive.
     /// - `boogy://<owner>/<api>` — a workload calling on its
     ///   own behalf (cross-API peer call with no agent context).
     ///
