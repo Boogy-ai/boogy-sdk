@@ -3,9 +3,12 @@ package boogy:platform@0.1.0;
 interface auth {
     /// The caller's resolved identity.
     ///
-    /// `principal` is opaque to wasm and may be either:
+    /// `principal` is opaque to wasm and may be one of:
     /// - `agent_<uuid>` — a human or AI agent acting in their own
     ///   right.
+    /// - `pw_<...>` — an end-user, masked per-app (a pairwise
+    ///   pseudonym; stable for this user at this app, distinct
+    ///   from their identity at any other app).
     /// - `boogy://<owner>/<api>` — a workload calling on its
     ///   own behalf (cross-API peer call with no agent context).
     ///

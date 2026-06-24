@@ -264,7 +264,7 @@ The platform API is self-describing: `GET <host>/openapi.json` returns an OpenAP
 
 ```bash
 boogy list                          # list deployed services (requires admin scope)
-curl https://boogy.ai/your-user-id/api/ping
+curl https://<your-handle>.boogy.ai/my-service/api/ping
 ```
 
 ### Other useful commands
@@ -281,7 +281,7 @@ boogy remove <owner-user-id> <service-id>
 
 ## 6. Next steps
 
-- **Your service self-describes.** Once deployed, `GET /<owner>/<service-id>/openapi.json` returns an OpenAPI 3.0.3 document for your service automatically — no extra code required. Add `schemars::JsonSchema` to your DTO types and the schema will include request/response shapes. See `boogy:boogy-api-specs` in the skills catalog for the full spec-endpoint reference.
+- **Your service self-describes.** Once deployed, `GET https://<your-handle>.boogy.ai/<service-id>/openapi.json` returns an OpenAPI 3.0.3 document for your service automatically — no extra code required. Add `schemars::JsonSchema` to your DTO types and the schema will include request/response shapes. See `boogy:boogy-api-specs` in the skills catalog for the full spec-endpoint reference.
 - **Handler reference**: [`../crates/boogy-sdk/AGENTS.md`](../crates/boogy-sdk/AGENTS.md) — the canonical guide for writing handlers, guards, store access, auth patterns, MCP tools, and more. Feed this to your coding agent before writing service code.
 - **Manifest reference**: [`manifest.md`](manifest.md) — every manifest field, all ingress modes, outbound HTTP policy, secrets, background jobs, and common errors.
 - **`smoke/` template**: [`../smoke/`](../smoke/) in this repo — the working template this quickstart is based on.
