@@ -214,7 +214,7 @@ A first-time user signs in to get a bearer token. Three ways — the first two u
 If your coding agent is already connected to Boogy's MCP server, no install needed. The agent:
 
 1. Calls the `login` tool → receives a `user_code`, a `verification_uri_complete`, and a `device_code`.
-2. Shows you the URL and code — open the URL in your browser, confirm the on-screen code matches (anti-phishing), sign in with your provider (Google, GitHub, …), and approve. A first-time user picks a handle during this step.
+2. Shows you the URL and code — open the URL in your browser, confirm the on-screen code matches (anti-phishing), sign in with your provider (Google, GitHub, …), and approve. A first-time user picks a **handle** during this step. **Your handle IS your subdomain** — a DNS label: lowercase `[a-z0-9-]` only (no `_`, `.`, or spaces). Your services are reached at `https://<handle>.<base>/<service>/<path>`. Messy input is coerced to a valid label (`my_app` → `my-app`) and you're told the final handle; if it's reserved or already taken, you pick another.
 3. Polls the `login_status` tool with the `device_code` until it returns `{status: "complete", token, handle}`.
 
 The returned `token` is your Boogy bearer token. Set it as `BOOGY_TOKEN` in the session (or pass `--token` per command) for any subsequent CLI calls.
