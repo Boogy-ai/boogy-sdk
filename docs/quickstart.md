@@ -2,15 +2,30 @@
 
 Build and deploy a Boogy service in five steps.
 
-> **Coding agents: vendor the skills first.** Run `boogy skills install` (CLI) up
-> front — it writes the Boogy agent skills **flat** into `.claude/skills/<name>/`
-> (one folder per skill — the only layout Claude Code discovers) where coding
-> agents (and any implementer subagents) auto-discover and read them directly.
-> Then run `/reload-skills` to register them in-session (no restart). The
-> anonymous MCP's `get_skill` is great for ad-hoc lookup by the *driving* agent,
-> but its results don't persist into a fresh subagent's context; vendored skills
-> are the durable copy your agents actually build from. Re-run `boogy skills
-> install` to refresh. (Do this before generating service code.)
+> **Agents — start here.** If you're a coding agent helping someone build on
+> Boogy, do these two things **first, before writing any service code**:
+>
+> **1. Authenticate the session — log the user in now.** Call the `login` tool
+> (MCP) or run `boogy login` (CLI). It returns a sign-in link and a one-time
+> code; **ask the user to open the link, confirm the code matches (anti-phishing),
+> sign in, and come back to the terminal** — then poll the `login_status` tool
+> (MCP) until the token returns (the CLI polls for you). A first-time user picks
+> a handle here. Use that token as `BOOGY_TOKEN` (or `--token`) for everything
+> after. Do this up front: deploying needs it, and the browser sign-in is the one
+> step only the human can do — kick it off early so you're not blocked at the end.
+>
+> **2. Vendor the build skills.** Run `boogy skills install` — it writes the Boogy
+> agent skills **flat** into `.claude/skills/<name>/` (one folder per skill — the
+> only layout Claude Code discovers), where you and any implementer subagents
+> auto-discover and read them directly. Then run `/reload-skills` to load them
+> in-session (no restart). The anonymous MCP's `get_skill` is fine for ad-hoc
+> lookup by the *driving* agent, but its results don't persist into a fresh
+> subagent's context; the vendored copy is what your agents actually build from.
+> Re-run `boogy skills install` to refresh.
+>
+> With the session authenticated and the skills loaded, follow the five steps
+> below — the vendored skills carry the design → scaffold → deploy workflow from
+> here.
 
 ---
 
