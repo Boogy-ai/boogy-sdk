@@ -1,0 +1,50 @@
+# Boogy — start here (for coding agents)
+
+Boogy is a cloud platform: you write a small Rust service, compile it to
+WebAssembly, and deploy it; the platform serves its HTTP / REST / MCP routes
+(and an optional web frontend).
+
+## Do this FIRST — do not improvise
+
+Do NOT hand-derive a service from the API endpoints, and do NOT read stray local
+copies of the SDK, skills, or example apps you find on disk (e.g. under /tmp) —
+they drift from this host and will mislead you. Follow this bootstrap instead:
+
+1. Install the CLI (uniform; works from any shell):
+
+       cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli
+
+2. Sign the user in NOW (deploying needs a token, and the browser step is the one
+   thing only the human can do — start it early so you're not blocked at the end):
+
+       boogy login
+
+   It prints a link + a one-time code; ask the user to open it, confirm the code
+   matches, sign in, and return. A first-time user picks a HANDLE — and the handle
+   IS their subdomain: lowercase `[a-z0-9-]`, reached at
+   `https://<handle>.<base>/<service>/<path>`.
+
+3. Vendor the build skills as INVOKABLE skills (not text to paraphrase):
+
+       boogy skills install      # writes them flat into .claude/skills/<name>/
+
+   Then have the user reload skills (e.g. `/reload-skills`). INVOKE them via your
+   Skill tool — your subagents inherit only the installed copy, never a paraphrase
+   you hold in context. Reading a skill's text and summarizing it is the #1 way
+   agents drift; install and invoke instead.
+
+4. Build. The skills carry the whole workflow (design → scaffold → deploy → test).
+   Start with the `using-boogy` entry skill. `boogy deploy` publishes + provisions.
+
+## Zero-install alternative (only if you cannot install the CLI)
+
+Connect the anonymous builder MCP at `POST <this-host>/mcp` and call `get_started`,
+`login` / `login_status`, `validate_manifest`, `check_service`. The MCP cannot
+deploy — you still need the CLI (or the `/v1` REST API) for that.
+
+## Reference (consume via the skills + CLI, not by hand-deriving)
+
+- Agent skills:  https://github.com/Boogy-ai/boogy-superpowers
+- SDK:           https://github.com/Boogy-ai/boogy-sdk
+- Platform API:  <this-host>/openapi.json   (deploy lifecycle only — NOT the guest
+  programming model; that lives in the skills + SDK)
