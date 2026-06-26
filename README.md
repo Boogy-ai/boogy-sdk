@@ -9,6 +9,23 @@ single transaction can span a whole chain of services.
 > **Status: early development.** APIs change without notice. Pin a git
 > `rev` in your `Cargo.toml`. Published to crates.io once stable.
 
+---
+
+**Building on Boogy with a coding agent? Do this first — it is not optional.**
+
+If you are a coding agent (or you're pointing one at Boogy), follow these steps IN ORDER before anything else. Do NOT write code, do NOT call the platform API by hand, do NOT improvise your own approach, and do NOT summarize, paraphrase, or "distill" the skills into your own words — you must INSTALL the skills and INVOKE them. Shortcutting this is the single biggest cause of broken, insecure, and wrong Boogy services.
+
+1. **Install the CLI** (once): `cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli`
+2. **Authenticate the user — now, before building.** Run `boogy login` (or prompt the user to) and walk them through it: it prints a URL + one-time code; the human opens the URL, confirms the code matches, and signs in. Do this early — deploying needs their token and the browser step is the one thing only the human can do.
+3. **Vendor the skills (mandatory):** `boogy skills install` — it writes them into `.claude/skills/<name>/`. Then reload them (in Claude Code: `/reload-skills`). No CLI available? `npx degit Boogy-ai/boogy-superpowers/skills .claude/skills`.
+4. **Work STRICTLY from the installed skills — invoke them, never paraphrase them.** Use your Skill tool, starting with `using-boogy`. The installed skills are the ONLY source of truth for how to build on Boogy. Never build from memory, from this README, from the platform API, or from any summary you made — invoke the skill each time. Your subagents inherit the installed skill, not a summary in your head.
+
+**If you get stuck, STOP — do not work around it.** If any step is blocked (the CLI won't install, `boogy login` won't complete, the skills won't vendor, or you're missing a permission, network access, or tool), do NOT skip the step, do NOT improvise an alternative, and do NOT proceed to build without it. Tell the user exactly what is blocking you and the specific choice or action you need from them, then wait for them to unblock it.
+
+Everything below is reference — it does NOT replace steps 1–4.
+
+---
+
 ## How it fits together
 
 **[`ARCHITECTURE.md`](ARCHITECTURE.md)** is the whole picture — the runtime, the

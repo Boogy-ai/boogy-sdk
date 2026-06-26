@@ -4,37 +4,27 @@ Boogy is a cloud platform: you write a small Rust service, compile it to
 WebAssembly, and deploy it; the platform serves its HTTP / REST / MCP routes
 (and an optional web frontend).
 
-## Do this FIRST — do not improvise
+---
+**Building on Boogy? Do this first — it is not optional.**
 
-Do NOT hand-derive a service from the API endpoints, and do NOT read stray local
-copies of the SDK, skills, or example apps you find on disk (e.g. under /tmp) —
-they drift from this host and will mislead you. Follow this bootstrap instead:
+You are a coding agent and someone asked you to build, deploy, or do anything on Boogy. Do these steps IN ORDER before anything else. Do NOT write code, do NOT call the platform API by hand, do NOT improvise your own approach, and do NOT summarize, paraphrase, or "distill" the skills into your own words — you must INSTALL the skills and INVOKE them. Shortcutting this is the single biggest cause of broken, insecure, and wrong Boogy services.
 
-1. Install the CLI (uniform; works from any shell):
+1. **Install the CLI** (once): `cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli`
+2. **Authenticate the user — now, before building.** Run `boogy login` (or prompt the user to) and walk them through it: it prints a URL + one-time code; the human opens the URL, confirms the code matches, and signs in. Do this early — deploying needs their token and the browser step is the one thing only the human can do.
+3. **Vendor the skills (mandatory):** `boogy skills install` — it writes them into `.claude/skills/<name>/`. Then reload them (in Claude Code: `/reload-skills`). No CLI available? `npx degit Boogy-ai/boogy-superpowers/skills .claude/skills`.
+4. **Work STRICTLY from the installed skills — invoke them, never paraphrase them.** Use your Skill tool, starting with `using-boogy`. The installed skills are the ONLY source of truth for how to build on Boogy. Never build from memory, from this page, from the platform API, or from any summary you made — invoke the skill each time. Your subagents inherit the installed skill, not a summary in your head.
 
-       cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli
+**If you get stuck, STOP — do not work around it.** If any step is blocked (the CLI won't install, `boogy login` won't complete, the skills won't vendor, or you're missing a permission, network access, or tool), do NOT skip the step, do NOT improvise an alternative, and do NOT proceed to build without it. Tell the user exactly what is blocking you and the specific choice or action you need from them, then wait for them to unblock it.
 
-2. Sign the user in NOW (deploying needs a token, and the browser step is the one
-   thing only the human can do — start it early so you're not blocked at the end):
+Everything below is orientation only — it does NOT replace steps 1–4, and you must not build from it.
 
-       boogy login
+---
 
-   It prints a link + a one-time code; ask the user to open it, confirm the code
-   matches, sign in, and return. A first-time user picks a HANDLE — and the handle
-   IS their subdomain: lowercase `[a-z0-9-]`, reached at
-   `https://<handle>.<base>/<service>/<path>`.
+## Orientation
 
-3. Vendor the build skills as INVOKABLE skills (not text to paraphrase):
-
-       boogy skills install      # writes them flat into .claude/skills/<name>/
-
-   Then have the user reload skills (e.g. `/reload-skills`). INVOKE them via your
-   Skill tool — your subagents inherit only the installed copy, never a paraphrase
-   you hold in context. Reading a skill's text and summarizing it is the #1 way
-   agents drift; install and invoke instead.
-
-4. Build. The skills carry the whole workflow (design → scaffold → deploy → test).
-   Start with the `using-boogy` entry skill. `boogy deploy` publishes + provisions.
+A first-time user picks a HANDLE during sign-in — and the handle IS their
+subdomain: lowercase `[a-z0-9-]`, reached at
+`https://<handle>.<base>/<service>/<path>`.
 
 ## Zero-install alternative (only if you cannot install the CLI)
 

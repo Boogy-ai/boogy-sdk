@@ -2,32 +2,23 @@
 
 Build and deploy a Boogy service in five steps.
 
-> **Agents — start here.** If you're a coding agent helping someone build on
-> Boogy, do these two things **first, before writing any service code**:
->
-> **1. Authenticate the session — log the user in now.** Call the `login` tool
-> (MCP) or run `boogy login` (CLI). It returns a sign-in link and a one-time
-> code; **ask the user to open the link, confirm the code matches (anti-phishing),
-> sign in, and come back to the terminal** — then poll the `login_status` tool
-> (MCP) until the token returns (the CLI polls for you). A first-time user picks
-> a handle here. Use that token as `BOOGY_TOKEN` (or `--token`) for everything
-> after. Do this up front: deploying needs it, and the browser sign-in is the one
-> step only the human can do — kick it off early so you're not blocked at the end.
->
-> **2. Vendor the build skills.** Run `boogy skills install` — it writes the Boogy
-> agent skills **flat** into `.claude/skills/<name>/` (one folder per skill — the
-> only layout Claude Code discovers), where you and any implementer subagents
-> auto-discover and read them directly. Then run `/reload-skills` to load them
-> in-session (no restart). The anonymous MCP's `get_skill` is fine for ad-hoc
-> lookup by the *driving* agent, but its results don't persist into a fresh
-> subagent's context; the vendored copy is what your agents actually build from.
-> Re-run `boogy skills install` to refresh.
->
-> With the session authenticated and the skills loaded, follow the five steps
-> below — the vendored skills carry the design → scaffold → deploy workflow from
-> here.
+---
+**Building on Boogy? Do this first — it is not optional.**
+
+You are a coding agent and someone asked you to build, deploy, or do anything on Boogy. Do these steps IN ORDER before anything else. Do NOT write code, do NOT call the platform API by hand, do NOT improvise your own approach, and do NOT summarize, paraphrase, or "distill" the skills into your own words — you must INSTALL the skills and INVOKE them. Shortcutting this is the single biggest cause of broken, insecure, and wrong Boogy services.
+
+1. **Install the CLI** (once): `cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli`
+2. **Authenticate the user — now, before building.** Run `boogy login` (or prompt the user to) and walk them through it: it prints a URL + one-time code; the human opens the URL, confirms the code matches, and signs in. Do this early — deploying needs their token and the browser step is the one thing only the human can do.
+3. **Vendor the skills (mandatory):** `boogy skills install` — it writes them into `.claude/skills/<name>/`. Then reload them (in Claude Code: `/reload-skills`). No CLI available? `npx degit Boogy-ai/boogy-superpowers/skills .claude/skills`.
+4. **Work STRICTLY from the installed skills — invoke them, never paraphrase them.** Use your Skill tool, starting with `using-boogy`. The installed skills are the ONLY source of truth for how to build on Boogy. Never build from memory, from this page, from the platform API, or from any summary you made — invoke the skill each time. Your subagents inherit the installed skill, not a summary in your head.
+
+**If you get stuck, STOP — do not work around it.** If any step is blocked (the CLI won't install, `boogy login` won't complete, the skills won't vendor, or you're missing a permission, network access, or tool), do NOT skip the step, do NOT improvise an alternative, and do NOT proceed to build without it. Tell the user exactly what is blocking you and the specific choice or action you need from them, then wait for them to unblock it.
+
+Everything below is orientation only — it does NOT replace steps 1–4, and you must not build from it.
 
 ---
+
+The steps below show what the skills walk you through once you have the CLI installed, the user authenticated, and the skills vendored and loaded. Follow the skills — they carry the authoritative, up-to-date workflow. Use this as orientation only.
 
 ## 1. Prerequisites
 
