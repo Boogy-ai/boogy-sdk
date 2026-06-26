@@ -23,7 +23,7 @@ struct Cli {
     /// Host URL (falls back to BOOGY_HOST_URL, then the hosted platform).
     /// For local development against your own host, set BOOGY_HOST_URL or pass
     /// --host http://localhost:3000.
-    #[arg(long, env = "BOOGY_HOST_URL", default_value = "https://boogy.ai", global = true)]
+    #[arg(long, env = "BOOGY_HOST_URL", default_value = "https://api.boogy.ai", global = true)]
     host: String,
 
     /// Bearer token for authenticated commands (falls back to BOOGY_TOKEN)
@@ -335,7 +335,7 @@ mod tests {
         //     localhost (a localhost default is wrong for the common case). ---
         let cli = Cli::try_parse_from(["boogy", "list"]).expect("parse");
         assert_eq!(
-            cli.host, "https://boogy.ai",
+            cli.host, "https://api.boogy.ai",
             "default --host must be the hosted platform, not localhost"
         );
     }

@@ -76,8 +76,8 @@ from your SDK version.
 ## For coding agents
 
 Fastest start: connect to Boogy's **public, anonymous MCP server** at
-`https://boogy.ai/mcp` (no account, no install — e.g.
-`claude mcp add boogy https://boogy.ai/mcp`). It serves guidance
+`https://api.boogy.ai/mcp` (no account, no install — e.g.
+`claude mcp add boogy https://api.boogy.ai/mcp`). It serves guidance
 (`get_started`, `list_skills`, `get_skill`, `manifest_reference`), host-truth
 validation (`validate_manifest`, `check_service`), and sign-in (`login`,
 `login_status`). It does not deploy — after `login`, ship with the CLI
