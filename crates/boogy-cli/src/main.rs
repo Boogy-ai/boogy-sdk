@@ -2,6 +2,7 @@ mod build;
 mod check;
 mod config;
 mod deploy;
+mod domain;
 mod frontend;
 mod login;
 mod manage;
@@ -128,6 +129,8 @@ enum Commands {
         /// Path to scan (default: current directory)
         path: Option<String>,
     },
+    /// Manage custom domains for your services
+    Domain(domain::DomainArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -278,6 +281,10 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Check { path } => check::run(path.as_deref())?,
+        Commands::Domain(args) => {
+            let token = resolve_token(&cli.token)?;
+            domain::run(&cli.host, &token, args).await?
+        }
     }
 
     Ok(())
