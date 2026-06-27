@@ -85,7 +85,7 @@ Both fields are **required**.
 
 | Field | Type | Required / Default | Meaning |
 |---|---|---|---|
-| `path` | string | **required** | URL path prefix your service owns, e.g. `"/api/notes"`. Requests under `/{owner}/{path}` are dispatched to your service; the `/{owner}` prefix is stripped before your handler sees the URL. Use `"/"` to own the full owner subtree. |
+| `path` | string | **required** | URL path prefix your service owns, e.g. `"/api/notes"`. The host resolves the owner from the subdomain (`<handle>.boogy.app`) and internally synthesizes a `/{owner}/{path}` routing key; the `/{owner}` prefix is stripped before your handler sees the URL. Use `"/"` to own the full owner subtree. |
 | `methods` | string array | **required** | HTTP methods to accept: `["GET", "POST"]`. Use `["*"]` to match any method. |
 
 ---

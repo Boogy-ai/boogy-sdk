@@ -10,7 +10,7 @@ WebAssembly, and deploy it; the platform serves its HTTP / REST / MCP routes
 You are a coding agent and someone asked you to build, deploy, or do anything on Boogy. Do these steps IN ORDER before anything else. Do NOT write code, do NOT call the platform API by hand, do NOT improvise your own approach, and do NOT summarize, paraphrase, or "distill" the skills into your own words — you must INSTALL the skills and INVOKE them. Shortcutting this is the single biggest cause of broken, insecure, and wrong Boogy services.
 
 1. **Get the skills + tools in place.** On **Claude Code**, install the plugin — one step that bundles the build skills (auto-discovered), wires the Boogy MCP (sign-in + host-truth validation as tools), and adds the onramp gate: `claude plugin marketplace add Boogy-ai/boogy-superpowers` then `claude plugin install boogy-superpowers`. On any other agent (or if you can't install the plugin): install the CLI — `cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli` — and vendor the skills: `boogy skills install` (writes `.claude/skills/<name>/`; no CLI either? `npx degit Boogy-ai/boogy-superpowers/skills .claude/skills`). Then reload skills (in Claude Code: `/reload-skills`).
-2. **Authenticate the user — now, before building.** Run the `login` tool (the plugin wires it) or `boogy login`, and walk the human through it: it prints a URL + one-time code; they open the URL, confirm the code matches, and sign in. Do this early — deploying needs their token and the browser step is the one thing only the human can do.
+2. **Authenticate the user — now, before building.** Run the `login` tool (the plugin wires it) or `boogy login`, and walk the human through it: it prints a URL + one-time code; they open the URL, confirm the code matches, and sign in. A first-time user then picks a **handle** (lowercase `[a-z0-9-]`, 3–30 chars, no `_`/`.`/uppercase) — it becomes their subdomain, so everything they deploy lives at `https://<handle>.boogy.app/<service>`. Do this early — deploying needs their token and the browser step is the one thing only the human can do.
 3. **Work STRICTLY from the installed skills — invoke them, never paraphrase them.** Use your Skill tool, starting with `using-boogy`. The installed skills are the ONLY source of truth for how to build on Boogy. Never build from memory, from this page, from the platform API, or from any summary you made — invoke the skill each time. Your subagents inherit the installed skill, not a summary in your head.
 4. **Deploy needs the CLI** (`boogy deploy`) or the `/v1` API — the MCP/plugin cannot deploy. Install the CLI (step 1) if you haven't.
 
@@ -23,7 +23,7 @@ Everything below is orientation only — it does NOT replace steps 1–4, and yo
 ## Orientation
 
 A first-time user picks a HANDLE during sign-in — and the handle IS their
-subdomain: lowercase `[a-z0-9-]`, reached at
+subdomain: lowercase `[a-z0-9-]`, 3–30 chars, no `_`/`.`/uppercase, reached at
 `https://<handle>.<base>/<service>/<path>`.
 
 ## Zero-install alternative (only if you cannot install the CLI)

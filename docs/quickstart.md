@@ -252,7 +252,7 @@ The CLI reads `BOOGY_TOKEN` automatically; you can also pass `--token <value>` p
 
 ### Host URL
 
-Boogy is a hosted, cloud platform — the CLI targets `https://boogy.ai` by
+Boogy is a hosted, cloud platform — the CLI targets `https://api.boogy.ai` by
 default, and that's the only host you need. (Self-hosted/CI setups can override
 with `BOOGY_HOST_URL` or `--host https://your-boogy-host.example.com`.)
 
@@ -270,7 +270,7 @@ The platform API is self-describing: `GET <host>/openapi.json` returns an OpenAP
 
 ```bash
 boogy list                          # list deployed services (requires admin scope)
-curl https://<your-handle>.boogy.ai/my-service/api/ping
+curl https://<your-handle>.boogy.app/my-service/api/ping
 ```
 
 ### Other useful commands
@@ -287,7 +287,7 @@ boogy remove <owner-user-id> <service-id>
 
 ## 6. Next steps
 
-- **Your service self-describes.** Once deployed, `GET https://<your-handle>.boogy.ai/<service-id>/openapi.json` returns an OpenAPI 3.0.3 document for your service automatically — no extra code required. Add `schemars::JsonSchema` to your DTO types and the schema will include request/response shapes. See `boogy:boogy-api-specs` in the skills catalog for the full spec-endpoint reference.
+- **Your service self-describes.** Once deployed, `GET https://<your-handle>.boogy.app/<service-id>/openapi.json` returns an OpenAPI 3.0.3 document for your service automatically — no extra code required. Add `schemars::JsonSchema` to your DTO types and the schema will include request/response shapes. See `boogy:boogy-api-specs` in the skills catalog for the full spec-endpoint reference.
 - **Handler reference**: [`../crates/boogy-sdk/AGENTS.md`](../crates/boogy-sdk/AGENTS.md) — the canonical guide for writing handlers, guards, store access, auth patterns, MCP tools, and more. Feed this to your coding agent before writing service code.
 - **Manifest reference**: [`manifest.md`](manifest.md) — every manifest field, all ingress modes, outbound HTTP policy, secrets, background jobs, and common errors.
 - **`smoke/` template**: [`../smoke/`](../smoke/) in this repo — the working template this quickstart is based on.

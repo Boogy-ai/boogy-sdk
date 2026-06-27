@@ -5,6 +5,7 @@ edition = "2021"
 description = "Procedural macros for boogy-sdk (the #[derive(Model)] derive, and future SDK macros)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Boogy-ai/boogy-sdk"
+homepage = "https://boogy.ai"
 
 [lib]
 proc-macro = true

@@ -5,6 +5,7 @@ edition = "2021"
 description = "CLI tool for building and deploying Boogy components"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Boogy-ai/boogy-sdk"
+homepage = "https://boogy.ai"
 
 [[bin]]
 name = "boogy"
