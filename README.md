@@ -15,7 +15,7 @@ single transaction can span a whole chain of services.
 
 If you are a coding agent (or you're pointing one at Boogy), follow these steps IN ORDER before anything else. Do NOT write code, do NOT call the platform API by hand, do NOT improvise your own approach, and do NOT summarize, paraphrase, or "distill" the skills into your own words — you must INSTALL the skills and INVOKE them. Shortcutting this is the single biggest cause of broken, insecure, and wrong Boogy services.
 
-1. **Get the skills + tools in place.** On **Claude Code**, install the plugin — one step that bundles the build skills (auto-discovered), wires the Boogy MCP (sign-in + host-truth validation as tools), and adds the onramp gate: `claude plugin marketplace add Boogy-ai/boogy-superpowers` then `claude plugin install boogy-superpowers`. On any other agent (or if you can't install the plugin): install the CLI — `cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli` — and vendor the skills: `boogy skills install` (writes `.claude/skills/<name>/`; no CLI either? `npx degit Boogy-ai/boogy-superpowers/skills .claude/skills`). Then reload skills (in Claude Code: `/reload-skills`).
+1. **Get the skills + tools in place.** On **Claude Code**, the preferred path is: install the plugin — one step that bundles the build skills (auto-discovered), wires the Boogy MCP (sign-in + host-truth validation as tools), and adds the onramp gate: `claude plugin marketplace add Boogy-ai/boogy-superpowers` then `claude plugin install boogy-superpowers`. Then **tell the human to run `/reload-plugins`** in Claude Code — the plugin (skills + MCP + gate) won't activate until they do. On any other agent (or if you can't install the plugin): install the CLI — `cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli` — and vendor the skills: `boogy skills install` (writes `.claude/skills/<name>/`; no CLI either? `npx degit Boogy-ai/boogy-superpowers/skills .claude/skills`). Vendored skills load automatically; if `.claude/skills/` did not exist when the session started, **tell the human to restart Claude Code** for them to be picked up.
 2. **Authenticate the user — now, before building.** Run the `login` tool (the plugin wires it) or `boogy login`, and walk the human through it: it prints a URL + one-time code; they open the URL, confirm the code matches, and sign in. Do this early — deploying needs their token and the browser step is the one thing only the human can do.
 3. **Work STRICTLY from the installed skills — invoke them, never paraphrase them.** Use your Skill tool, starting with `using-boogy`. The installed skills are the ONLY source of truth for how to build on Boogy. Never build from memory, from this README, from the platform API, or from any summary you made — invoke the skill each time. Your subagents inherit the installed skill, not a summary in your head.
 4. **Deploy needs the CLI** (`boogy deploy`) or the `/v1` API — the MCP/plugin cannot deploy. Install the CLI (step 1) if you haven't.
@@ -87,8 +87,11 @@ Install the Boogy skills into your project so your agent builds with
 expert workflows: `boogy skills install` (vendors
 [boogy-superpowers](https://github.com/Boogy-ai/boogy-superpowers) **flat** into
 `.claude/skills/<name>/` — one folder per skill, the layout Claude Code
-discovers; readable by any agent). Then run `/reload-skills` to register them
-in-session. `crates/boogy-sdk/AGENTS.md` remains the canonical handler-authoring
+discovers; readable by any agent). Vendored skills load automatically — if
+`.claude/skills/` was just created, tell the human to restart Claude Code.
+**Preferred for Claude Code: install the plugin** (`claude plugin marketplace add Boogy-ai/boogy-superpowers` then
+`claude plugin install boogy-superpowers`) and tell the human to run **`/reload-plugins`** to activate it
+mid-session. `crates/boogy-sdk/AGENTS.md` remains the canonical handler-authoring
 reference.
 
 ## Ready-made services
