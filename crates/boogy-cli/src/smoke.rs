@@ -38,11 +38,19 @@ pub fn resolve_browser_in(names: &[&str], dirs: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-/// Derive the live deployed URL from the provision response's `service` URI.
+/// Fallback URL derivation from the control `host` + the provision response's
+/// `service` URI, used only when the host did not return a canonical
+/// `service_url` (older servers). Prefer `resolve_smoke_url`, which uses the
+/// server-provided URL first.
 ///
 /// `("https://boogy.ai", "boogy://alice/services/todos")` →
 /// `Some("https://boogy.ai/alice/todos/")`. Returns `None` for any URI that is
 /// not a 3-component `boogy://<owner>/services/<id>` (e.g. a `modules` URI).
+///
+/// NOTE: this assembles a **path-based URL on the control host**, which is NOT
+/// where tenants actually serve (tenants are subdomain-based on the public base
+/// domain, e.g. `https://<handle>.boogy.app/<service>/`). It is a last-resort
+/// fallback; the authoritative URL is the response's `service_url`.
 pub fn deployed_url(host: &str, service_uri: &str) -> Option<String> {
     let rest = service_uri.strip_prefix("boogy://")?;
     // Exactly three components: <owner>/<kind>/<id>, with kind == "services".
@@ -165,12 +173,39 @@ pub fn service_uri_from_module(module_uri: &str) -> Option<String> {
     Some(format!("boogy://{owner}/services/{name}"))
 }
 
+/// Append a trailing `/` to a service-root URL so a relative SPA index resolves,
+/// unless it already ends in `/` or carries a query/fragment.
+/// `"https://h.boogy.app/shout"` → `"https://h.boogy.app/shout/"`.
+fn with_trailing_slash(url: &str) -> String {
+    if url.ends_with('/') || url.contains('?') || url.contains('#') {
+        url.to_string()
+    } else {
+        format!("{url}/")
+    }
+}
+
+/// Resolve the URL the smoke should load.
+///
+/// **Prefer the canonical `service_url` the host returned** in the provision
+/// response — the same value printed as `URL:` — because it already encodes the
+/// real tenant origin (`https://<handle>.<base>/<service>/`). Only when the
+/// server returned none (older host) fall back to deriving a path-based URL from
+/// the control `host` + module-derived `service_uri`. Returns `None` when
+/// neither yields a URL.
+fn resolve_smoke_url(service_url: Option<&str>, host: &str, service_uri: Option<&str>) -> Option<String> {
+    if let Some(u) = service_url.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(with_trailing_slash(u));
+    }
+    service_uri.and_then(|u| deployed_url(host, u))
+}
+
 /// Run the opt-in post-deploy smoke. Best-effort: a missing browser, a
 /// non-frontend deployment, or an underivable URL is a clear note and a clean
 /// return — only a browser that ran and failed its assertions is an error.
 pub async fn run_post_deploy_smoke(
     opts: &SmokeOptions,
     host: &str,
+    service_url: Option<&str>,
     service_uri: Option<&str>,
     has_frontend: bool,
 ) -> anyhow::Result<()> {
@@ -181,7 +216,7 @@ pub async fn run_post_deploy_smoke(
         println!("  Smoke: skipped (no [frontend] to render)");
         return Ok(());
     }
-    let url = match service_uri.and_then(|u| deployed_url(host, u)) {
+    let url = match resolve_smoke_url(service_url, host, service_uri) {
         Some(u) => u,
         None => {
             println!("  Smoke: skipped (could not derive a deployed URL)");
@@ -436,6 +471,40 @@ mod tests {
         // missing scheme / wrong shape → None.
         assert!(deployed_url("https://boogy.ai", "alice/services/todos").is_none());
         assert!(deployed_url("https://boogy.ai", "boogy://alice/services").is_none());
+    }
+
+    #[test]
+    fn with_trailing_slash_appends_only_when_needed() {
+        assert_eq!(with_trailing_slash("https://h.boogy.app/shout"), "https://h.boogy.app/shout/");
+        assert_eq!(with_trailing_slash("https://h.boogy.app/shout/"), "https://h.boogy.app/shout/");
+        // a query/fragment means it's not a bare service root — leave it.
+        assert_eq!(with_trailing_slash("https://h.boogy.app/shout?x=1"), "https://h.boogy.app/shout?x=1");
+        assert_eq!(with_trailing_slash("https://h.boogy.app/shout#a"), "https://h.boogy.app/shout#a");
+    }
+
+    #[test]
+    fn resolve_smoke_url_prefers_server_canonical_url() {
+        // The server-provided canonical tenant URL wins over the control host —
+        // this is the bug fix: smoke must hit <handle>.boogy.app, not the
+        // path-based control-host derivation.
+        let url = resolve_smoke_url(
+            Some("https://allowing-swordtail.boogy.app/shout"),
+            "https://api.boogy.ai",
+            Some("boogy://allowing-swordtail/services/shout"),
+        );
+        assert_eq!(url.as_deref(), Some("https://allowing-swordtail.boogy.app/shout/"));
+    }
+
+    #[test]
+    fn resolve_smoke_url_falls_back_to_derivation_without_server_url() {
+        // Older host returns no service_url → fall back to host + service_uri.
+        let url = resolve_smoke_url(None, "https://boogy.ai", Some("boogy://alice/services/todos"));
+        assert_eq!(url.as_deref(), Some("https://boogy.ai/alice/todos/"));
+        // An empty/whitespace server URL is treated as absent.
+        let url = resolve_smoke_url(Some("   "), "https://boogy.ai", Some("boogy://alice/services/todos"));
+        assert_eq!(url.as_deref(), Some("https://boogy.ai/alice/todos/"));
+        // Neither available → None.
+        assert!(resolve_smoke_url(None, "https://boogy.ai", None).is_none());
     }
 
     #[test]

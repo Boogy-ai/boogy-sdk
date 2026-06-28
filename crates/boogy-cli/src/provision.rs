@@ -267,7 +267,10 @@ pub async fn publish(
     }
 
     println!("  Provisioned: {provisioned}");
-    if let Some(url) = body.get("service_url").and_then(|u| u.as_str()) {
+    // The host returns the canonical tenant URL (`https://<handle>.<base>/<id>`);
+    // it is both what we print and what the smoke must load.
+    let service_url = body.get("service_url").and_then(|u| u.as_str());
+    if let Some(url) = service_url {
         println!("  URL: {url}");
     }
 
@@ -279,6 +282,7 @@ pub async fn publish(
             crate::smoke::run_post_deploy_smoke(
                 &smoke,
                 host,
+                service_url,
                 service_uri.as_deref(),
                 has_frontend,
             )
