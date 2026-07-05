@@ -1812,6 +1812,30 @@ macro_rules! wit_glue {
                     .map_err(::std::string::String::from)
             }
 
+            /// Drop a table entirely — irreversibly removes ALL of its rows, every
+            /// index, the row-id counter, and its catalog entry. Idempotent: a
+            /// no-op if the table does not exist (re-run safe). DESTRUCTIVE — the
+            /// data cannot be recovered.
+            ///
+            /// Use to reset a table whose schema changed incompatibly. The table is
+            /// only removed here; recreate it explicitly (drop-then-recreate within
+            /// the migration) — `create_model`/`create_table` rebuild only a
+            /// *missing* table, so a fresh create after the drop yields the new
+            /// schema.
+            pub fn drop_table(
+                &self,
+                table: &str,
+            ) -> ::core::result::Result<(), ::std::string::String> {
+                if !$bindings::boogy::platform::store::list_tables()?
+                    .iter()
+                    .any(|t| t.name == table)
+                {
+                    return Ok(()); // already dropped
+                }
+                $bindings::boogy::platform::store::drop_table(table)
+                    .map_err(::std::string::String::from)
+            }
+
             // -- Data ops for backfills --
 
             /// Find rows matching `filters` in `table`. Returns

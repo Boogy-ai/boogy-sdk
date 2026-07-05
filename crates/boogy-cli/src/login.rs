@@ -9,7 +9,6 @@ use crate::config::{self, Credentials};
 struct AuthorizeResponse {
     device_code: String,
     user_code: String,
-    verification_uri: String,
     verification_uri_complete: String,
     expires_in: u64,
     interval: u64,
@@ -83,7 +82,6 @@ pub async fn run(host: &str) -> anyhow::Result<()> {
     eprintln!();
     eprintln!("To sign in, open:  {}", auth_resp.verification_uri_complete);
     eprintln!("and confirm this code:  {}", auth_resp.user_code);
-    eprintln!("(fallback URL: {})", auth_resp.verification_uri);
     eprintln!("Waiting for approval…");
 
     // Step 3: best-effort browser open.
