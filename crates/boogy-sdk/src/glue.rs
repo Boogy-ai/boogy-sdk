@@ -2326,6 +2326,14 @@ macro_rules! wit_glue {
                 $crate::request_state::_fallback_scopes().unwrap_or_default()
             }
 
+            /// The caller's platform handle, when they consented to share
+            /// it with this service. `None` for anonymous callers, API-key
+            /// callers, and callers who haven't shared a handle.
+            pub fn current_handle() -> ::core::option::Option<::std::string::String> {
+                super::$bindings::boogy::platform::auth::current_identity()
+                    .and_then(|i| i.handle)
+            }
+
             /// True iff the caller has the named scope. Returns
             /// `false` for anonymous callers and authenticated
             /// callers whose scopes don't include `scope`. Match is

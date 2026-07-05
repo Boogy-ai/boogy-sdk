@@ -35,6 +35,10 @@ interface auth {
         principal: string,
         actor: option<string>,
         scopes: list<string>,
+        /// The caller's platform handle, when they consented to share it
+        /// with this service. `none` otherwise. Verified by the platform —
+        /// safe to key or display on.
+        handle: option<string>,
     }
 
     /// Returns the caller's identity if any was resolved by the
