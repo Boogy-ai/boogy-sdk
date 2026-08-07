@@ -3,22 +3,6 @@
 Build and deploy a Boogy service in five steps.
 
 ---
-**Building on Boogy? Do this first — it is not optional.**
-
-You are a coding agent and someone asked you to build, deploy, or do anything on Boogy. Do these steps IN ORDER before anything else. Do NOT write code, do NOT call the platform API by hand, do NOT improvise your own approach, and do NOT summarize, paraphrase, or "distill" the skills into your own words — you must INSTALL the skills and INVOKE them. Shortcutting this is the single biggest cause of broken, insecure, and wrong Boogy services.
-
-1. **Get the skills + tools in place.** On **Claude Code**, the preferred path is: install the plugin — one step that bundles the build skills (auto-discovered), wires the Boogy MCP (sign-in + host-truth validation as tools), and adds the onramp gate: `claude plugin marketplace add Boogy-ai/boogy-superpowers` then `claude plugin install boogy-superpowers`. Then **tell the human to run `/reload-plugins`** in Claude Code — the plugin (skills + MCP + gate) won't activate until they do. On any other agent (or if you can't install the plugin): install the CLI — `cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli` — and vendor the skills: `boogy skills install` (writes `.claude/skills/<name>/`; no CLI either? `npx degit Boogy-ai/boogy-superpowers/skills .claude/skills`). Vendored skills load automatically; if `.claude/skills/` did not exist when the session started, **tell the human to restart Claude Code** for them to be picked up.
-2. **Authenticate the user — now, before building.** Run the `login` tool (the plugin wires it) or `boogy login`, and walk the human through it: it prints a URL + one-time code; they open the URL, confirm the code matches, and sign in. Do this early — deploying needs their token and the browser step is the one thing only the human can do.
-3. **Work STRICTLY from the installed skills — invoke them, never paraphrase them.** Use your Skill tool, starting with `using-boogy`. The installed skills are the ONLY source of truth for how to build on Boogy. Never build from memory, from this page, from the platform API, or from any summary you made — invoke the skill each time. Your subagents inherit the installed skill, not a summary in your head.
-4. **Deploy needs the CLI** (`boogy deploy`) or the `/v1` API — the MCP/plugin cannot deploy. Install the CLI (step 1) if you haven't.
-
-**If you get stuck, STOP — do not work around it.** If any step is blocked (the plugin or CLI won't install, `login` won't complete, the skills won't load, or you're missing a permission, network access, or tool), do NOT skip the step, do NOT improvise an alternative, and do NOT proceed to build without it. Tell the user exactly what is blocking you and the specific choice or action you need from them, then wait for them to unblock it.
-
-Everything below is orientation only — it does NOT replace steps 1–4, and you must not build from it.
-
----
-
-The steps below show what the skills walk you through once you have the CLI installed, the user authenticated, and the skills vendored and loaded. Follow the skills — they carry the authoritative, up-to-date workflow. Use this as orientation only.
 
 ## 1. Prerequisites
 
@@ -75,11 +59,6 @@ boogy-wit = { git = "https://github.com/Boogy-ai/boogy-sdk", rev = "<pin-rev>" }
 ```
 
 Replace `<pin-rev>` with the commit SHA you want to pin (e.g. the latest from `main`).
-Discover the current SHA without cloning:
-
-```bash
-git ls-remote https://github.com/Boogy-ai/boogy-sdk HEAD   # prints the latest main SHA
-```
 
 ### The `build.rs` WIT-sync mechanism
 
@@ -177,6 +156,9 @@ name = "My Service"
 version = "0.1.0"
 wasm = "target/wasm32-wasip2/release/my_service.wasm"
 
+[service.owner]
+user_id = "your-user-id"
+
 [routing]
 path = "/api/ping"
 methods = ["GET"]
@@ -188,51 +170,13 @@ store = false
 mode = "public"
 ```
 
-There's no `owner` field here on purpose: you're authenticated when you deploy, so the platform sets the owner to your handle automatically. If you do set one (for local-dev/tests), it's a bare key under `[service]` — `owner = "alice"` — never a `[service.owner]` table.
-
-`service.id` must be ASCII alphanumeric plus `-` and `_` (no dots, slashes, or Unicode). See [`manifest.md`](manifest.md) for the full field reference.
+`service.id` and `service.owner.user_id` must be ASCII alphanumeric plus `-` and `_` (no dots, slashes, or Unicode). See [`manifest.md`](manifest.md) for the full field reference.
 
 ---
 
 ## 5. Deploy
 
-### Signing in
-
-A first-time user signs in to get a bearer token. Three ways — the first two use the same OAuth device flow and need no password:
-
-**Via the MCP server (zero-install — recommended for agent sessions)**
-
-If your coding agent is already connected to Boogy's MCP server, no install needed. The agent:
-
-1. Calls the `login` tool → receives a `user_code`, a `verification_uri_complete`, and a `device_code`.
-2. Shows you the URL and code — open the URL in your browser, confirm the on-screen code matches (anti-phishing), sign in with your provider (Google, GitHub, …), and approve. A first-time user picks a **handle** during this step. **Your handle IS your subdomain** — a DNS label: lowercase `[a-z0-9-]` only (no `_`, `.`, or spaces). Your services are reached at `https://<handle>.<base>/<service>/<path>`. Messy input is coerced to a valid label (`my_app` → `my-app`) and you're told the final handle; if it's reserved or already taken, you pick another.
-3. Polls the `login_status` tool with the `device_code` until it returns `{status: "complete", token, handle}`.
-
-The returned `token` is your Boogy bearer token. Set it as `BOOGY_TOKEN` in the session (or pass `--token` per command) for any subsequent CLI calls.
-
-> **The anonymous builder MCP does not deploy.** The public `POST /mcp` server gives a coding agent guidance (`get_started`, `list_skills`, `get_skill`, `manifest_reference`), validation (`validate_manifest`, `check_service`), and `login`/`login_status` — but **no deploy tool**. After you have a token, deploy via the **CLI** (below), the **`/v1` REST API** (`POST /v1/modules` then `POST /v1/services`, or the `boogy deploy` shortcut), or the **authenticated admin MCP** (`deploy_service` / `deploy_api`, which also accepts `frontend_files`). The cold-entry `/mcp` is for getting *ready* to deploy, not deploying.
-
-**Via the CLI**
-
-Requires [installing the CLI](#install-the-cli) first, then:
-
-```bash
-boogy login
-```
-
-The CLI prints the one-time code and URL, opens your browser best-effort, and polls until your token arrives. The token is saved to `~/.config/boogy/credentials.toml` (0600) and auto-loaded by every subsequent `boogy` command — no export needed.
-
-Token resolution order: `--token` flag > `$BOOGY_TOKEN` env var > saved credentials file.
-
-**Via the web app**
-
-You can also sign in through the Boogy web app and copy the token from your account settings.
-
 ### Install the CLI
-
-Required to deploy (the anonymous builder MCP can't — see the note above). Even an
-agent working through the MCP session needs the CLI or the `/v1` REST API (or the
-authenticated admin MCP) to actually deploy.
 
 ```bash
 cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli
@@ -240,21 +184,25 @@ cargo install --locked --git https://github.com/Boogy-ai/boogy-sdk boogy-cli
 cargo run -p boogy-cli -- <command>
 ```
 
-### Set your token (CLI)
+### Set your token
 
-If you signed in via the MCP path or web app, export the token before using the CLI:
+Most commands require a bearer token:
 
 ```bash
 export BOOGY_TOKEN=v4.public.<your-token>
 ```
 
-The CLI reads `BOOGY_TOKEN` automatically; you can also pass `--token <value>` per command. (If you used `boogy login`, the token is already saved and no export is needed.)
+Obtain a token by logging in via the Boogy web app or `curl /_agents/login`. The CLI reads `BOOGY_TOKEN` automatically; you can also pass `--token <value>` per command.
 
-### Host URL
+### Default host URL
 
-Boogy is a hosted, cloud platform — the CLI targets `https://api.boogy.ai` by
-default, and that's the only host you need. (Self-hosted/CI setups can override
-with `BOOGY_HOST_URL` or `--host https://your-boogy-host.example.com`.)
+The CLI targets `http://localhost:3000` by default. Override it with:
+
+```bash
+export BOOGY_HOST_URL=https://your-boogy-host.example.com
+# or per-command:
+boogy deploy boogy.toml --host https://your-boogy-host.example.com
+```
 
 ### Deploy
 
@@ -270,7 +218,7 @@ The platform API is self-describing: `GET <host>/openapi.json` returns an OpenAP
 
 ```bash
 boogy list                          # list deployed services (requires admin scope)
-curl https://<your-handle>.boogy.app/my-service/api/ping
+curl http://localhost:3000/your-user-id/api/ping
 ```
 
 ### Other useful commands
@@ -287,7 +235,7 @@ boogy remove <owner-user-id> <service-id>
 
 ## 6. Next steps
 
-- **Your service self-describes.** Once deployed, `GET https://<your-handle>.boogy.app/<service-id>/openapi.json` returns an OpenAPI 3.0.3 document for your service automatically — no extra code required. Add `schemars::JsonSchema` to your DTO types and the schema will include request/response shapes. See `boogy:boogy-api-specs` in the skills catalog for the full spec-endpoint reference.
+- **Your service self-describes.** Once deployed, `GET /<owner>/<service-id>/openapi.json` returns an OpenAPI 3.0.3 document for your service automatically — no extra code required. Add `schemars::JsonSchema` to your DTO types and the schema will include request/response shapes. See `boogy:boogy-api-specs` in the skills catalog for the full spec-endpoint reference.
 - **Handler reference**: [`../crates/boogy-sdk/AGENTS.md`](../crates/boogy-sdk/AGENTS.md) — the canonical guide for writing handlers, guards, store access, auth patterns, MCP tools, and more. Feed this to your coding agent before writing service code.
 - **Manifest reference**: [`manifest.md`](manifest.md) — every manifest field, all ingress modes, outbound HTTP policy, secrets, background jobs, and common errors.
 - **`smoke/` template**: [`../smoke/`](../smoke/) in this repo — the working template this quickstart is based on.

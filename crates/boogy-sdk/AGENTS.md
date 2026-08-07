@@ -1,21 +1,53 @@
 # boogy-sdk: handler-authoring reference
 
 Canonical reference for everything available inside a Boogy service
-handler or guard. **This is the doc to read first when writing or
-generating a Boogy service.** The SDK README has the long-form
-narrative; this file is the dense, scannable cheat sheet that the
-codegen LLM and human authors both work from.
+handler or guard. The SDK README has the long-form narrative; this
+file is the dense, scannable cheat sheet that the codegen LLM and
+human authors both work from.
 
-If you find a pattern in this codebase that contradicts what's in this
-file, treat the file as authoritative and fix the codebase.
+**Scope of authority — read this before treating anything below as a
+rule.** This file is authoritative for **SDK call signatures**: the
+names, argument shapes, and return types that `wit_glue!` and
+`boogy_sdk` actually emit. It is **not** authoritative for
+**patterns** — *which* surface to reach for, and how a service should
+be shaped, is owned by the Boogy skills (`boogy-data-modeling`,
+`boogy-access-patterns`, `boogy-rest-apis`, `boogy-transactions`, …).
+And above both sits the service-conventions check that gates a
+service: where a convention check rejects something described here,
+the check wins and this file is the defect. Signatures here are
+verified against the SDK source at the time of writing and **must be
+re-verified whenever the SDK surface changes** — a signature that
+disagrees with the SDK is stale, and the SDK wins.
 
 ## File shape
 
 A Boogy service is a single Rust crate. The boilerplate is tiny — the
 `wit_glue!` macro emits everything needed for the WIT host bridge, so
-user code stays focused on tables, routes, and handlers.
+user code stays focused on models, routes, and handlers.
+
+Tables are Rust structs deriving `Model`; conventionally they live in
+their own `src/models.rs`:
 
 ```rust
+// src/models.rs — one struct per table.
+use boogy_sdk::model::{Id, Timestamp};
+use boogy_sdk::Model;
+
+/// `list_by(filter = "owner_principal", newest = "created_at")` declares the
+/// access pattern ("my things, newest first"); the derive shapes the index.
+#[derive(Model)]
+#[model(table = "things", list_by(filter = "owner_principal", newest = "created_at"))]
+pub struct Thing {
+    #[pk]
+    pub id: Id<Thing>,
+    pub name: String,
+    pub owner_principal: String,
+    pub created_at: Timestamp,
+}
+```
+
+```rust
+// src/lib.rs
 mod bindings {
     wit_bindgen::generate!({ world: "service", path: "../../boogy-wit/wit" });
 }
@@ -24,25 +56,40 @@ boogy_sdk::wit_glue!(bindings, MyApi);
 // Optional — adds /_keys management endpoints + a sk_* bearer guard.
 boogy_sdk::api_keys_glue!(bindings);
 
+mod models;
+
+use boogy_sdk::model::{Id, Model, Timestamp};   // the trait: TABLE, from_row, …
 use boogy_sdk::Api;
+use crate::models::Thing;
 
 struct MyApi;
 
 impl Api for MyApi {
     fn init_tables() {
-        create_table_from(&Table::new("things").text("name").text(DEFAULT_OWNER_COL));
+        // Registers the table + every index its declared access patterns
+        // imply. Idempotent; no hand-built `Table`.
+        create_model::<Thing>();
     }
 
     fn build_router() -> Router {
         Router::new()
+            .info("Things API", env!("CARGO_PKG_VERSION"), Some("Thing CRUD"))
+            .summary("List things")
             .get("/api/things", list_things)
+            .summary("Create a thing")
             .post("/api/things", create_thing)
-            .group([auth::owns_resource("things", DEFAULT_OWNER_COL, "id")], |g| g
+            .group([auth::owns_resource(Thing::TABLE, DEFAULT_OWNER_COL, "id")], |g| g
+                .summary("Get a thing")
                 .get("/api/things/{id}", get_thing)
+                .summary("Delete a thing")
                 .delete("/api/things/{id}", delete_thing))
     }
 }
 ```
+
+Every route carries a `.summary(...)`, and the router carries
+`.info(...)` — both are required by the service-conventions check, and
+they are what make the generated `openapi.json` usable by another agent.
 
 ### Two WIT worlds
 
@@ -136,26 +183,36 @@ directly.
 
 **Two auth patterns you'll write most often:**
 
+Response DTOs are **typed structs**, never `json::Value` — the
+service-conventions check rejects `Json<json::Value>` /
+`Created<json::Value>` (they render as an "any" schema in the generated
+`openapi.json`, i.e. an undocumented endpoint) unless the line carries an
+`// untyped-response: <reason>` marker.
+
 REST resource access — guard does the work, handler just reads:
 ```rust
-.group([auth::owns_resource("notes", DEFAULT_OWNER_COL, "id")], |g| g
+#[derive(Serialize, schemars::JsonSchema)]
+struct NoteOut { id: u64, title: String, body: String }
+
+.group([auth::owns_resource(Note::TABLE, DEFAULT_OWNER_COL, "id")], |g| g
+    .summary("Get a note")
     .get("/api/notes/{id}", get_note))
 
-fn get_note(req: &mut Req<'_>) -> Json<json::Value> {
-    let row = req.ctx.require::<Row>();
-    Json(row.to_json(&["title", "body"]))
+fn get_note(req: &mut Req<'_>) -> Json<NoteOut> {
+    let note = Note::from_row(req.ctx.require::<Row>());
+    Json(NoteOut { id: note.id.get(), title: note.title, body: note.body })
 }
 ```
 
 REST list endpoint — `auth::find_owned` carries the auth check;
 its `RpcError` converts to `ApiError` via `?`:
 ```rust
-#[derive(Serialize)]
-struct NotesList { items: Vec<json::Value>, count: usize }
+#[derive(Serialize, schemars::JsonSchema)]
+struct NotesList { items: Vec<NoteOut>, count: usize }
 
 fn list_notes(_req: &mut Req<'_>) -> Result<Json<NotesList>, ApiError> {
-    let rows = auth::find_owned("notes", DEFAULT_OWNER_COL)?;
-    let items: Vec<_> = rows.iter().map(|r| r.to_json(&["title", "body"])).collect();
+    let rows = auth::find_owned(Note::TABLE, DEFAULT_OWNER_COL)?;
+    let items: Vec<NoteOut> = rows.iter().map(NoteOut::from_row).collect();
     let count = items.len();
     Ok(Json(NotesList { items, count }))
 }
@@ -229,130 +286,254 @@ already in a code path producing `HttpResponse` directly.
 
 ## Tables & storage
 
-`init_tables()` runs on every request — every `create_table_from` call
-is `IF NOT EXISTS`, so it's idempotent and effectively free. Use the
-SDK's `Table` builder; pass it to `create_table_from`.
+**A table is a Rust struct.** Declare it with `#[derive(Model)]` and
+register it in `init_tables` with `create_model::<M>()`. The derive maps
+each field to a typed column, **emits the per-field column-name consts**,
+and generates `schema()` — the columns *and* the indexes implied by the
+access patterns declared on the struct. There is no hand-built schema and
+no hand-written column-name module.
+
+`init_tables()` runs on every request; `create_model` is idempotent
+(table + indexes are `IF NOT EXISTS`), so it's effectively free. Don't
+try to "optimize" it away.
 
 ```rust
-create_table_from(
-    &Table::new("things")
-        .text("name")                    // NOT NULL TEXT
-        .nullable_text("description")
-        .integer("priority")
-        .boolean("done")
-        .text(DEFAULT_OWNER_COL)
-        .unique_index("by_name", &["name"]),
-);
+use boogy_sdk::model::{Id, Timestamp};
+use boogy_sdk::Model;
+
+#[derive(Model)]
+#[model(
+    table = "things",
+    list_by(filter = "owner_principal", newest = "created_at")
+)]
+pub struct Thing {
+    #[pk]
+    pub id: Id<Thing>,
+    #[lookup_by]                       // unique point-lookup index
+    pub public_id: String,
+    pub name: String,
+    pub description: Option<String>,   // Option<T> is the ONLY thing that makes a column nullable
+    pub priority: i64,
+    pub done: bool,
+    pub owner_principal: String,
+    pub created_at: Timestamp,
+}
+
+// in init_tables():
+create_model::<Thing>();
 ```
 
-Available column types: `.text`, `.nullable_text`, `.integer`,
-`.nullable_integer`, `.real`, `.boolean`, `.blob`. Constraints:
-`.unique()`, `.references(table, col)`, `.on_delete(CascadeAction::*)`,
-`.on_update(CascadeAction::*)`. Indexes: `.index(name, &cols)` and
-`.unique_index(name, &cols)`.
+**Field types** — the field's Rust type picks the column type via the
+`Field` trait. Implemented for `String` (text), `i64` / `u64` /
+`Timestamp` / `Id<T>` (integer), `bool` (boolean), `f64` (real),
+`Decimal` (6-dp text), and `Option<T>` (nullable `T`). `Id<T>`,
+`Timestamp`, and `Decimal` live in `boogy_sdk::model`; build them with
+`Id::new(0)` (the placeholder PK on insert — the store assigns the real
+`_id` and `db_insert` returns it), `Timestamp::new(millis)`,
+`Decimal::new(f)`. Implement `Field` yourself to add a type.
 
-**Composite + unique indexes are fully enforced.** `Table::unique_index(name, &cols)` (and the raw `IndexDef { columns, unique: true }`) creates a real composite unique constraint in the built-in store. Duplicate rows that violate the constraint are rejected at insert time with a `StoreError::Conflict`. The enforcement is required by `upsert_increment` — always create a unique index on the key columns first.
+**Attributes.**
 
-### Column + table names go in constants, not string literals
+| Field-level | Effect |
+|---|---|
+| `#[pk]` | maps to the store auto-PK `_id`; excluded from `to_columns`, read back from `_id`. At most one per struct; a model may have none. |
+| `#[unique]` | column-level UNIQUE |
+| `#[index]` | single-column index |
+| `#[covering_index]` | single-column covering index (the index entry carries a row copy, so a walk skips the row fetch; costs write amplification) |
+| `#[lookup_by]` | unique point-lookup access pattern → UNIQUE single-column index. Cannot be the `#[pk]` field. |
+| `#[model(column = "name")]` | override the column name |
 
-The illustrative snippet above uses bare string literals (`"things"`,
-`"name"`, `"priority"`) for brevity, but **production handlers must
-not**. Every table name, column name, and index name your crate uses
-belongs in a single `cols` module — one tag struct per table holding
-associated `pub const` items for `TABLE` plus every column. Handlers,
-jobs, init_tables, and migrations reference the constants so that a
-rename is one edit and a typo is a compile error, not a silent 500.
+| Struct-level `#[model(...)]` | Effect |
+|---|---|
+| `table = "name"` | table name (defaults to the struct name in snake_case) |
+| `list_by(filter = "col", newest = "col" \| oldest = "col")` | filtered, ordered list → covering composite `(filter, order)` index |
+| `ranked_by(highest = "col" \| lowest = "col")` | global ranked feed → covering single-column index |
+| `tagged_by(tag = "col", refs = "col")` | junction / membership → covering `(tag, refs)` index |
+| `index(name = …, cols = […])`, `unique_index(…)`, `covering_index(…)` | explicit composite indexes, for shapes no access-pattern verb expresses |
+
+The declared `name` on an explicit index is **vestigial** — the index is
+canonically named `ix_<table>_<cols>` regardless. Never use a declared
+index name as a handle and never hardcode an index name in a handler:
+reference data by *columns* and let the planner pick the index. See
+`boogy:boogy-data-modeling` and `boogy:boogy-access-patterns`.
+
+**`upsert_increment` requires a UNIQUE index on its key columns** — the
+operation is undefined without one. `#[lookup_by]` (single column) or a
+struct-level `unique_index(...)` (composite) is what supplies it.
+Composite + unique indexes are fully enforced: a row that violates one is
+rejected at insert time with `StoreError::Conflict`.
+
+### Typed CRUD (`db_*`)
+
+All emitted by `wit_glue!`, all generic over `M: Model`.
+
+| Call | Returns |
+|---|---|
+| `create_model::<M>()` | `()` — register `M`'s table + indexes. `init_tables` only. |
+| `db_insert(&M)` | `Result<u64, StoreError>` — the new row's `_id`. |
+| `db_get::<M>(id: u64)` | `Result<Option<M>, StoreError>` |
+| `db_find_by::<M>(col: &str, val: Val)` | `Result<Vec<M>, StoreError>` — every row where `col == val` (paginates internally). `Val` is `boogy_sdk::store::Val`, not the WIT `store::Value`. |
+| `db_update::<M>(id: u64, &M)` | `Result<(), StoreError>` — overwrite the row at `id`. |
+| `db_delete::<M>(id: u64)` | `Result<(), StoreError>` |
+| `create_model_as::<M>(table: &str, indices: Vec<store::Index>)` | `()` — register `M`'s column set under a runtime-chosen table name with a caller-supplied index set (families of identically-shaped tables, e.g. one per time window). |
+
+Column names come from the derive's consts — never bare string literals:
 
 ```rust
-// crates/your-api/src/cols.rs
-pub struct Common;
-impl Common {
-    /// Store auto-PK as it appears in row data + FindOptions sort/filter columns.
-    pub const AUTO_ID: &str = "_id";
-}
+use boogy_sdk::store::Val;
 
-pub struct Things;
-impl Things {
-    pub const TABLE: &str = "things";
-    pub const NAME: &str = "name";
-    pub const DESCRIPTION: &str = "description";
-    pub const PRIORITY: &str = "priority";
-    pub const DONE: &str = "done";
-    pub const OWNER: &str = DEFAULT_OWNER_COL;
+let mine: Vec<Thing> = db_find_by::<Thing>(Thing::OWNER_PRINCIPAL, Val::Text(principal))?;
 
-    pub const IDX_BY_NAME: &str = "by_name";
-}
-
-// crates/your-api/src/lib.rs
-mod cols;
-
-fn init_tables() {
-    use crate::cols::Things;
-    create_table_from(
-        &Table::new(Things::TABLE)
-            .text(Things::NAME)
-            .nullable_text(Things::DESCRIPTION)
-            .integer(Things::PRIORITY)
-            .boolean(Things::DONE)
-            .text(Things::OWNER)
-            .unique_index(Things::IDX_BY_NAME, &[Things::NAME]),
-    );
-}
-
-// crates/your-api/src/handlers.rs
-use crate::cols::Things;
-
-// PK lookup: use get_row(table, id), NOT find_row_by(table, "_id", ...).
-// `find_row_by` filters on a named column; the auto-PK is not a column
-// the store find-scan recognises, so PK lookups go through the dedicated
-// get-by-id helper.
-let row = get_row(Things::TABLE, id)?;
-row.as_ref().map(|r| r.text(Things::NAME))
+let mut t = db_get::<Thing>(id)?.ok_or_else(ApiError::not_found)?;
+t.done = true;
+db_update(t.id.get(), &t)?;
 ```
+
+`Model` also gives you `M::TABLE`, `M::schema()`, `M::from_row(&Row)`,
+`M::to_columns()`, and `M::id() -> Option<u64>` — bring the trait into
+scope with `use boogy_sdk::model::Model;`.
+
+### Escape hatch: runtime-shaped schema (`Table` / `create_table_from`)
+
+`Table::new(...)` + `create_table_from(&table)` build a schema by hand.
+This is the **escape hatch for genuinely dynamic, unknown-at-compile-time
+schemas only** — a table whose columns aren't known until runtime.
+Essentially every table you will ever write has a fixed shape, so this is
+essentially never the right call, and **the service-conventions check
+hard-fails `Table::new(` / `create_table_from(` in a service crate**
+(there is no escape-hatch marker for it). If a table's columns *are*
+known at compile time and you reached for this, that's a regression off
+the standard layer — derive `Model`.
+
+(For a family of same-shaped tables whose *names* are dynamic, the answer
+is `create_model_as::<M>(table, indices)`, not a hand-built `Table`.)
+
+The builder, for the case that genuinely needs it: column types `.text` /
+`.nullable_text` / `.integer` / `.nullable_integer` / `.real` /
+`.boolean` / `.blob`; indexes
+`.index(name, &cols)`, `.covering_index(name, &cols)`,
+`.unique_index(name, &cols)`; access-pattern verbs
+`.list_by(filter, order)`, `.ranked_by(order)`, `.lookup_by(col)`,
+`.tagged_by(tag, refs)` (the `Order` comes from `boogy_sdk::store`'s
+`newest` / `oldest` / `highest` / `lowest`).
+
+### Names: use the derive's consts, never string literals
+
+Table, column, and index names must never appear as bare string literals
+in handlers, jobs, or queries. The **derive emits them**: `M::TABLE` plus
+one `pub const` per field, SCREAMING_SNAKE of the field name
+(`Message::PEER`, `Poll::CLOSED_AT`, `Thing::OWNER_PRINCIPAL`). A
+hand-written `cols` module of `pub const` strings duplicates what the
+derive already emits and drifts from it — that's a regression, not a
+style choice.
 
 The store exposes its auto-PK as `_id` in row data and in `FindOptions`
-sort/filter columns. For **PK lookups** use `get_row(table, id)` (or
-`t.get(table, id)` in-tx) — it routes through the host's dedicated
-`store::get(table, id)` op. `find_row_by` is for filtering on **named columns** (indexed
-or otherwise), not the auto-PK. (Historical: an earlier `PK_ALIAS = "id"`
-constant in tokenfeed presumed the SDK aliased `"id"` → `"_id"`; it
-doesn't.)
+sort/filter columns. For **PK lookups** use `db_get::<M>(id)` or
+`get_row(table, id)` — they route through the host's dedicated
+`store::get(table, id)` op. `find_row_by` filters on **named columns**;
+the auto-PK is not one the find-scan recognises, so a PK lookup through
+it does not work.
 
-Exceptions to the constants rule:
-- Migration literals (the table/column names passed to
-  `m.add_column("things", &col("priority", ...))` etc.) stay literal,
-  **not** cols-module constants. A shipped migration is immutable history;
-  if you rename `Things::NAME`, you write a new migration that does the
-  rename, not edit the old one.
-- Router path-parameter names (`req.params.get("id")`) are HTTP
-  route concerns, not column concerns — they live in their route
-  definition, not the cols module.
+Two things are legitimately *not* covered by the derive's consts:
 
-Reference example: the tokenfeed example's `cols.rs` in the Boogy repository.
+- **Migration literals.** The table/column names passed to
+  `m.add_column("things", &col("priority", ...))` stay literal, **not**
+  model consts. A shipped migration is immutable history: if you rename a
+  field later you write a *new* migration that renames it, you never edit
+  the old one — so the old one must not follow the const.
+- **Router path-parameter names.** `req.params.get("id")` is an HTTP
+  route concern, not a column concern; it belongs with its route
+  definition.
 
 ### Reading rows
 
-`Row` is the typed row accessor returned by `to_sdk_row` and the
-SDK helpers. Read columns by name:
+The typed path is `db_get` / `db_find_by` (above) and the `Query` DSL
+(below), which hand back `M` values. The row-level helpers here are the
+layer underneath — reach for them when you need a shape the typed layer
+doesn't express, and still name columns with the model's consts.
+
+`Row` is the typed row accessor returned by `to_sdk_row` and the SDK
+helpers. Read columns by name — every accessor is infallible and yields
+the type's zero value for a missing / `Null` column:
 
 ```rust
-row.id()            // shorthand for row.text("_id")
-row.text("title")   // String
-row.int("priority") // i64
-row.real("score")   // f64
-row.bool("done")    // bool
-row.text_opt("description")  // Option<String> for nullable cols
-row.to_json(&["title", "body"])  // serde_json::Value, includes id
+row.id()                          // u64 — the auto-PK (`_id` as an integer)
+row.text(Thing::NAME)             // String
+row.int(Thing::PRIORITY)          // i64
+row.real("score")                 // f64
+row.bool(Thing::DONE)             // bool
+row.get(Thing::DESCRIPTION)       // &Val — match on Val::Null to detect a NULL
+row.to_json(&[Thing::NAME])       // serde_json::Value, `_id` included as "id"
+row.to_json_all()                 // every column, `_id` renamed to "id"
 ```
+
+### The `Query` DSL
+
+`Query` (emitted by `wit_glue!`) is the general read surface: a chained
+builder over one table, with five terminal methods. It picks the index
+from the query's *columns* — never name an index.
+
+```rust
+use boogy_sdk::store::SortDir;
+
+// Point read.
+let room: Option<Row> = Query::on(Room::TABLE)
+    .where_eq(Room::SLUG, slug)
+    .fetch_one()?;
+
+// Filtered, ordered list.
+let rows: Vec<Row> = Query::on(Room::TABLE)
+    .where_eq(Room::VISIBILITY, "public")
+    .order_by_desc(Room::LAST_POST_AT)
+    .limit(50)
+    .fetch_all()?;
+
+// Keyset page — `fetch_page` extracts the cursor from the keyset column.
+let page: CursorPage<PostSummary> = Query::on(Post::TABLE)
+    .where_eq(Post::ROOM_ID, room_id)
+    .where_null(Post::DELETED_AT)
+    .keyset_by(Post::CREATED_AT, SortDir::Desc)
+    .limit(limit)
+    .cursor(cursor)
+    .fetch_page(PostSummary::from_row)?;
+```
+
+| Chain | |
+|---|---|
+| Construct | `Query::on(table)` |
+| Filters | `where_eq` / `where_neq` / `where_gt` / `where_gte` / `where_lt` / `where_lte` / `where_like` / `where_not_like` / `where_null` / `where_not_null` / `where_in(col, vals)` — the value takes any `IntoVal` (`&str`, `String`, `i32`/`i64`/`u32`/`u64`, `f64`, `bool`, `Val`) |
+| OR-of-AND | `.or(\|q\| q.where_eq(…)…)` — each closure is one AND-group; groups are ORed on top of the base AND-filters |
+| Sort | `order_by(col, SortDir)` / `order_by_asc(col)` / `order_by_desc(col)` |
+| Page | `limit(n)` / `offset(n)` / `cursor(Option<Cursor>)` / `keyset_by(col, SortDir)` |
+| Full-scan opt-in | `allow_full_scan(reason)` / `allow_scan(reason)` (the latter also logs the justification) |
+
+| Terminal | Returns |
+|---|---|
+| `fetch_one()` | `Result<Option<Row>, ApiError>` — forces `limit = 1`, `offset = 0` |
+| `fetch_all()` | `Result<Vec<Row>, ApiError>` |
+| `fetch_all_with_total()` | `Result<(Vec<Row>, u64), ApiError>` — total ignores the page |
+| `count()` | `Result<u64, ApiError>` — **base AND-filters only**: `.or(…)`, sort, and paging are ignored (the host `count` op is filters-only) |
+| `fetch_page(\|row\| item)` | `Result<CursorPage<T>, ApiError>` — requires a prior `.keyset_by(...)`, else `ApiError::internal`. Defaults to `limit = 20`. |
+
+The terminals return `ApiError` (not `StoreError`), so bare `?` works
+straight out of a handler. `find_many(Vec<Query>)` runs a batch of
+independent queries (possibly across tables) as one pipelined host
+round-trip, returning `Result<Vec<Vec<Row>>, StoreError>` positionally —
+prefer it over a loop of `.fetch_all()`.
 
 | Helper | Returns | Use for |
 |---|---|---|
 | `get_row(table, id)` | `Result<Option<Row>, StoreError>` | Single row by `_id`. |
+| `get_many(table, &[u64])` | `Result<Vec<Option<Row>>, StoreError>` | Batch get by PK, positional (missing row → `None`). The host pipelines these into ~1 round-trip — always prefer this over a `get_row` loop when hydrating a known id set. |
+| `find_many(Vec<Query>)` | `Result<Vec<Vec<Row>>, StoreError>` | A batch of independent `Query`s (possibly different tables) as one pipelined round-trip; `out[i]` is the rows for `queries[i]`. Totals discarded. |
+| `load_has_many(child_table, fk_column, &[u64])` | `Result<HashMap<u64, Vec<Row>>, StoreError>` | Eager-load children for a set of parent ids, grouped by FK — one `IN (...)` query regardless of parent count. The N+1 fix for list endpoints that splice children onto parents. |
 | `find_all_rows(table)` | `Result<(Vec<Row>, u64), StoreError>` | Unfiltered list + total count. Use only when you specifically need all rows; for principal-scoping prefer `auth::find_owned`. |
 | `find_row_by(table, column, store::Value)` | `Result<Option<Row>, StoreError>` | First row matching `column = val`. Takes the WIT `store::Value` directly (e.g. `store::Value::Text("alice".into())`), same value type used by `store::insert` / `store::update`. |
 | `find_rows_by(table, column, store::Value)` | `Result<Vec<Row>, StoreError>` | **All** rows matching `column = val` (no limit). Use for unbounded backer lists, owned-resource enumeration, etc. — the index makes this an indexed scan. |
 | `find_rows(table, filters, sort, page)` | `Result<(Vec<Row>, u64), StoreError>` | General-purpose composite query: multi-filter, composite sort, optional page. `filters` is `Vec<store::Filter>`, `sort` is `Vec<store::SortBy>`. Composite sort lets you tiebreak (e.g. `created_at DESC, _id ASC`). For one-filter cases prefer `find_rows_by`; for an OR clause use `find_rows_grouped`. |
-| `find_rows_grouped(table, filters, or_groups, sort, page)` | `Result<(Vec<Row>, u64), StoreError>` | Like `find_rows` but with an OR-of-AND clause: a row matches when `ALL(filters) AND (or_groups empty OR ANY(group: ALL(group)))`. `or_groups` is `Vec<Vec<store::Filter>>` — each inner `Vec` is one AND-group, groups are ORed. Use for composite keyset pagination (see below). Empty `or_groups` == `find_rows`. |
+| `find_rows_grouped(table, filters, or_groups, sort, page, allow_full_scan, skip_total)` | `Result<(Vec<Row>, u64), StoreError>` | Like `find_rows` but with an OR-of-AND clause: a row matches when `ALL(filters) AND (or_groups empty OR ANY(group: ALL(group)))`. `or_groups` is `Vec<Vec<store::Filter>>` — each inner `Vec` is one AND-group, groups are ORed. The two trailing bools opt into a full scan and elide the total count. `find_rows` is this with `or_groups` empty and both bools `false`. **The `Query` DSL is the ergonomic front for this** — prefer `Query::on(...).or(...)`. |
+| `count_rows(table, filters)` | `Result<u64, StoreError>` | Row count for the AND-filters. Free-fn sibling of `find_rows`; `Query::count()` wraps it. |
+| `upsert(table, key, set)` | `Result<u64, StoreError>` | Atomic insert-or-update keyed on a unique index: updates `set` on the matching row, or inserts `key + set`. Returns the row id. Same unique-index precondition as `upsert_increment`. |
 | `upsert_increment(table, key, counter, delta, set)` | `Result<u64, StoreError>` | Atomic keyed counter: inserts the row (counter = delta + set columns) if it doesn't exist, or increments the counter and overwrites the set columns if it does. `key` is `&[store::Column]` identifying the unique key. `counter` is the column name. `delta` must be `store::Value::Integer` or `store::Value::Real` — the host rejects other types. `set` is `&[store::Column]` for extra columns to write on every call. Returns the row id. **Requires a `unique_index` on the key columns** — the operation is undefined without it. Use for per-key aggregations (e.g. view counts, score accumulators, per-tag event counts). |
 | `for_each_batch(table, filters, or_groups, order_col, dir, batch_size, f)` | `Result<(), StoreError>` | Bounded-memory ordered streaming over a table. Opens a stateless `row-cursor`, calls `f(&[Row])` once per batch of up to `batch_size` rows, and loops until the table is exhausted. Every matching row is visited exactly once, in `order_col` / `dir` order — **on the built-in engine `order_col` is an *index name*, not a column name**: pass a declared index's name, or `None` for primary-key order (a bare column name errors with `NotFound`) — with no gaps or duplicates, no offset re-scan. **Read-committed, not snapshot-isolated**: rows inserted or modified after the cursor opens may or may not appear depending on timing. **Cannot be called inside `tx(...)`** — the transaction view has no cursor, so it returns `Unsupported` (501); gather the ids you need before opening the tx, or use `find_rows` inside it. This is the bounded-memory alternative to `find_all_rows` / offset pagination for large-table batch jobs (e.g. decay sweeps, export pipelines, fan-out tasks): only `batch_size` rows are ever in memory at a time. If `f` returns `Err`, iteration stops and the error propagates. |
 | `filter_eq(column, val)` | `store::Filter` | One-liner builder for `column = val`. One of a family (see below) — never hand-write the `Filter { column, op, val, in_values }` literal. |
@@ -376,42 +557,56 @@ All return `store::Filter`; compose them in the `Vec<store::Filter>` you pass to
 
 **OR clauses + composite keyset pagination.** `find_rows`'s `filters` are AND-only. When you need OR — most commonly *correct* keyset pagination over a composite sort — use `find_rows_grouped`. The page after `(score, _id) = (c, cursor)` ordered `score DESC, _id DESC` is `score < c OR (score = c AND _id < cursor)`:
 
+Express it with the `Query` DSL — `.or(...)` builds the AND-groups and
+the base filters stay the AND-prefix:
+
 ```rust
-let (page_rows, _total) = find_rows_grouped(
-    "posts",
-    vec![filter_eq("deleted_at", store::Value::Text(String::new()))],   // AND-prefix
-    vec![
-        vec![filter_lt("score", store::Value::Integer(c))],
-        vec![filter_eq("score", store::Value::Integer(c)),
-             filter_lt("_id",   store::Value::Integer(cursor))],
-    ],
-    vec![sort_desc("score"), sort_desc("_id")],
-    Some(page(limit, 0)),
-)?;
+let page_rows: Vec<Row> = Query::on(Post::TABLE)
+    .where_null(Post::DELETED_AT)                      // AND-prefix
+    .or(|q| q.where_lt(Post::SCORE, c))
+    .or(|q| q.where_eq(Post::SCORE, c).where_lt("_id", cursor))
+    .order_by_desc(Post::SCORE)
+    .order_by_desc("_id")
+    .limit(limit)
+    .fetch_all()?;
 ```
+
+For the common single-column keyset case, don't hand-roll this at all —
+`.keyset_by(col, dir).cursor(c).fetch_page(...)` builds the comparison
+and the next cursor for you.
 
 The built-in store applies the OR-of-AND natively. Note: when `or_groups` is non-empty the query can't use the single-column index/scan fast paths, so the AND-prefix `filters` is what keeps it cheap — keep a selective prefix where you can.
 
 **`upsert_increment` — atomic keyed counter.** Requires a unique composite index on the key columns. First call inserts; subsequent calls increment and overwrite the set columns atomically. Returns the row id (same id across all calls for the same key).
 
 ```rust
+// The unique index on the key columns is a precondition, so declare it on
+// the model — it is not incidental to the schema, it is what makes the
+// counter atomic.
+#[derive(Model)]
+#[model(
+    table = "post_views",
+    unique_index(name = "by_post_region", cols = ["post_id", "region"])
+)]
+pub struct PostView {
+    #[pk]
+    pub id: Id<PostView>,
+    pub post_id: String,
+    pub region: String,
+    pub count: i64,
+}
+
 // init_tables():
-create_table_from(
-    &Table::new("post_views")
-        .text("post_id")
-        .text("region")
-        .integer("count")
-        .unique_index("by_post_region", &["post_id", "region"]),
-);
+create_model::<PostView>();
 
 // in a handler / background job:
 upsert_increment(
-    "post_views",
+    PostView::TABLE,
     &[
-        store::Column { name: "post_id".into(), val: store::Value::Text(post_id.clone()) },
-        store::Column { name: "region".into(),  val: store::Value::Text(region.clone()) },
+        store::Column { name: PostView::POST_ID.into(), val: store::Value::Text(post_id.clone()) },
+        store::Column { name: PostView::REGION.into(),  val: store::Value::Text(region.clone()) },
     ],
-    "count",
+    PostView::COUNT,
     store::Value::Integer(1),
     &[],  // no extra set columns
 )?;
@@ -419,19 +614,29 @@ upsert_increment(
 
 **`for_each_batch` — bounded-memory ordered streaming.** The alternative to `find_all_rows` / offset pagination for large-table batch jobs. Only `batch_size` rows are materialized at a time; the cursor resumes strictly after the last row of the prior batch (no offset re-scan). Read-committed: rows inserted or modified after the cursor opens may or may not appear.
 
+`order_col` is an **index name**, not a column name — a bare column name
+errors with `NotFound`. Index names are schema-canonical
+(`ix_<table>_<cols>`), and the name you declared on the model is
+vestigial, so a hand-typed literal here silently drifts. The
+service-conventions check flags any string-literal `order_col`; the
+`// index-name-ok:` marker is the documented opt-out for the genuine
+low-level-cursor case. Prefer `None` (primary-key order) whenever the
+order doesn't matter, and prefer the `Query` DSL whenever the read fits
+in one page.
+
 ```rust
-// Stream "post_views" ordered by count DESC, 100 rows at a time.
+// Stream post_views in primary-key order, 100 rows at a time.
 for_each_batch(
-    "post_views",
+    PostView::TABLE,
     vec![],         // no filters — all rows
     vec![],         // no or_groups
-    Some("count"),  // order by count; None = primary-key order
-    store::SortDir::Desc,
+    None,           // primary-key order; Some("ix_post_views_count") to walk an index
+    store::SortDir::Asc,
     100,
     |batch| {
         for row in batch {
             // row is a &Row; process it here.
-            let count = row.int("count");
+            let count = row.int(PostView::COUNT);
             // ...
         }
         Ok(())
@@ -439,21 +644,24 @@ for_each_batch(
 )?;
 ```
 
-`StoreError` variants (9 arms, all carry a `String` message):
+`StoreError` variants (10 arms, all carry a `String` message):
 `QuotaExceeded(String)`, `NotFound(String)`, `Conflict(String)`,
 `ConstraintViolation(String)`, `InvalidArgument(String)`,
 `Unsupported(String)`, `Timeout(String)`, `VersionMismatch(String)`,
-`Internal(String)`. The `From<StoreError> for ApiError` impl maps them to
-507 / 404 / 409 / 409 / 400 / 501 / 504 / 409 / 500 respectively.
+`ResourceExhausted(String)`, `Internal(String)`. The
+`From<StoreError> for ApiError` impl maps them to
+507 / 404 / 409 / 409 / 400 / 501 / 504 / 409 / 503 / 500 respectively.
 Unique-index violations surface as `Conflict`; FK / check / not-null
-violations surface as `ConstraintViolation`.
+violations surface as `ConstraintViolation`; `ResourceExhausted` is
+transient (a host concurrency cap) — retry shortly.
 
 **Error-handling pattern by return type:**
 
 | Function returns | Idiom |
 |---|---|
-| `Result<_, StoreError>` (the typed helpers: `get_row`, `find_all_rows`, `find_row_by`, `find_rows`, `find_rows_by`) | Use bare `?` — the `From<StoreError> for ApiError` conversion preserves the semantic class (404 / 409 / 500). |
+| `Result<_, StoreError>` (the typed helpers: `db_insert`/`db_get`/`db_find_by`/`db_update`/`db_delete`, `get_row`, `get_many`, `find_all_rows`, `find_row_by`, `find_rows`, `find_rows_by`) | Use bare `?` — the `From<StoreError> for ApiError` conversion preserves the semantic class (404 / 409 / 500). |
 | `Result<_, store::StoreError>` (raw WIT calls: `store::insert`, `store::update`, `store::delete`, plus everything on the `Transaction` resource) | The host carries a typed `store-error` variant; bare `?` into an `ApiError`-returning handler preserves the semantic class (quota → 507, conflict → 409, …) via the macro-emitted `From<store::StoreError> for ApiError`. `.map_err(ApiError::internal)` still works (flattens to 500) if you want that. Inside a tx closure the error type is `String`; bare `?` lifts WIT errors to it lossily. |
+| `Result<_, ApiError>` (the `Query` terminals: `fetch_one`, `fetch_all`, `fetch_all_with_total`, `count`, `fetch_page`) | Bare `?` straight out of an `ApiError`-returning handler — the DSL has already done the conversion. |
 | `Result<_, PeerError>` (`peer_fetch`) | Bare `?` — `From<PeerError> for ApiError` lifts a dependency failure (`TargetNotFound`/`Denied`/`Timeout`/`DepthExceeded`/`Internal`) to **502 `/errors/upstream`**, and a *this-service* misconfig (`CapabilityDenied`/`InvalidTarget`) to **500**. Match the variant before `?` if you want a different status (e.g. treat the callee's 404 as your own resource's 404). The wire `detail` carries only the failure class; the full error (target URI, policy text) is logged request-correlated to your service's log stream — debug there. |
 | `Result<_, serde_json::Error>` (`PeerRequest::body_json`, `resp.json()`, `serde_json::to_*` on bodies you construct) | Bare `?` — `From<serde_json::Error> for ApiError` lifts to **500** (framing failure: a body the service itself built/parsed). Client-supplied bodies should go through `parse_body`/`validate_body` instead, which map malformed input to 400/422. |
 
@@ -472,14 +680,13 @@ match store::insert("links", &row).map_err(StoreError::from_wit) {
 ### Migrations
 
 Schema evolution after first deploy uses the `migrations` runner.
-Declare versioned migrations in `init_tables` (after the
-`create_table_from` calls); the runner records applied versions in a
-per-service `__boogy_schema_version` table and skips them on
-subsequent requests.
+Declare versioned migrations in `init_tables` (after the `create_model`
+calls); the runner records applied versions in a per-service
+`__boogy_schema_version` table and skips them on subsequent requests.
 
 ```rust
 fn init_tables() {
-    create_table_from(&Table::new("notes").text("title").text(DEFAULT_OWNER_COL));
+    create_model::<Note>();
 
     migrations(&[
         migration(1, "add_priority", |m| {
@@ -494,6 +701,7 @@ fn init_tables() {
                 name: "idx_notes_owner".into(),
                 columns: vec![DEFAULT_OWNER_COL.into()],
                 unique: false,
+                covering: false,
             })?;
             Ok(())
         }),
@@ -552,40 +760,44 @@ so the closure can return `Result<R, E>` for any such `E`:
   `db_*` / `find_row_by`. `ApiError` implements `From<store::StoreError>`,
   so bare `?` lifts the typed store error and preserves its variant → HTTP
   status.
-- **Store-only.** When the closure does *only* `store::*` ops, the error
-  type is `store::StoreError`. Name it (`tx::<_, _, store::StoreError>`)
-  when inference can't pin `E` from context.
+- **`ApiError` is the default answer**, including for closures that only
+  write. It is the one error type with `From` impls for *both* the WIT
+  `store::StoreError` (raw `store::*`) and `boogy_sdk::StoreError` (the
+  `db_*` / `find_*` helpers), so bare `?` works on either inside the same
+  closure. Every service in the examples uses `tx::<_, _, ApiError>`.
+- **Other `E`.** Any type implementing `From<store::StoreError>` works —
+  `String` does, so `tx::<_, _, String>` compiles (message-only, no HTTP
+  status). Note that the WIT `store::StoreError` and the SDK's
+  `boogy_sdk::StoreError` are *distinct* types with no `From` between
+  them, so neither is usable as `E` for a closure that mixes both layers.
 
-When `E` is unambiguous from the surrounding code, the turbofish is
-optional; when it isn't (e.g. a store-only closure whose result is consumed
-by a `?` into `ApiError`), name it.
+When `E` is unambiguous from the surrounding code the turbofish is
+optional; name it whenever it isn't.
 
 ```rust
-// store-only closure — name the error type when it can't be inferred.
-let user_id = tx::<_, _, store::StoreError>(|| {
-    let user_id = store::insert("users", &user_cols)?;
-    store::insert("profiles", &profile_cols_for(user_id))?;
+// writes-only closure — ApiError still, so `?` lifts db_* errors.
+let user_id = tx::<_, _, ApiError>(|| {
+    let user_id = db_insert(&User { id: Id::new(0), handle: handle.clone() })?;
+    db_insert(&Profile { id: Id::new(0), user_id: user_id as i64, bio: String::new() })?;
     Ok(user_id)
 })?;
 
 // mixed-error closure. Raise structured errors and call
-// the same store::* / db_* / find_row_by fns as outside a tx.
+// the same db_* / Query / store::* fns as outside a tx.
 let new_balance: f64 = tx::<_, _, ApiError>(|| {
-    let bal_row = find_row_by(
-        "balances", "principal", store::Value::Text(me.clone()),
-    )?;
-    let cur = bal_row
-        .map(|r| r.text("balance").parse::<f64>().unwrap_or(0.0))
-        .unwrap_or(default_balance);
-    if cur < amount {
+    let bal: Option<Balance> = db_find_by::<Balance>(
+        Balance::PRINCIPAL, Val::Text(me.clone()),
+    )?.into_iter().next();
+    let Some(mut bal) = bal else {
+        return Err(ApiError::not_found());
+    };
+    if bal.amount.get() < amount {
         // Raises a structured 422 from inside the tx; rolls back.
         return Err(ApiError::unprocessable("insufficient balance"));
     }
-    store::update("balances", bal_id, &[
-        store::Column { name: "balance".into(),
-            val: store::Value::Text(format!("{:.6}", cur - amount)) },
-    ])?;
-    Ok(cur - amount)
+    bal.amount = Decimal::new(bal.amount.get() - amount);
+    db_update(bal.id.get(), &bal)?;
+    Ok(bal.amount.get())
 })?;
 ```
 
@@ -629,22 +841,37 @@ ambient store transaction API.
 
 ### Writing rows
 
-The WIT bindings expose `store::insert`, `store::update`, `store::delete`.
-Use `store::Column { name, val: store::Value::* }` for the data; map
-errors into `ApiError` (or wrap with `StoreError::from_wit` first if
-you need to react to UNIQUE / FK violations) so `?` flows cleanly:
+Ordinary writes go through the typed layer — `db_insert(&M)`,
+`db_update::<M>(id, &M)`, `db_delete::<M>(id)` (see **Typed CRUD**
+above). Build the model, insert it, read the assigned id back:
 
 ```rust
-let id = store::insert("notes", &[
+let id = db_insert(&Note {
+    id: Id::new(0),                                  // placeholder; the store assigns `_id`
+    title: input.title.clone(),
+    body: input.body.clone(),
+    owner_principal: principal,
+    created_at: Timestamp::new(now_millis() as i64),
+})?;
+Ok(Created(NoteOut { id, title: input.title, body: input.body }))
+```
+
+Underneath, the WIT bindings expose `store::insert`, `store::update`,
+`store::delete`, taking `store::Column { name, val: store::Value::* }`.
+**The service-conventions check flags raw `store::insert` / `update` /
+`delete` / `find` / `get` (and `FindOptions`) in a service crate**
+unless the call carries an `// escape-hatch: <reason>` comment on it or
+the line above — because for a model-backed table the typed call is
+always available and always better. Use the raw form only when you
+genuinely have no model (a runtime-shaped table), and say so in the
+marker:
+
+```rust
+// escape-hatch: table shape is chosen at runtime, no compile-time model
+let id = store::insert(&table_name, &[
     store::Column { name: "title".into(), val: store::Value::Text(input.title.clone()) },
-    store::Column { name: "body".into(),  val: store::Value::Text(input.body.clone()) },
-    store::Column { name: DEFAULT_OWNER_COL.into(), val: store::Value::Text(principal) },
 ])
 .map_err(ApiError::internal)?;
-Ok(Created(NoteOut { id, title: input.title, body: input.body }))
-
-store::update("notes", id, &[/* same shape */]).map_err(ApiError::internal)?;
-store::delete("notes", id).map_err(ApiError::internal)?;
 ```
 
 For the unique-collision retry pattern (random slug generation,
@@ -653,78 +880,34 @@ share codes), use `StoreError::from_wit` and match on
 above.
 
 `store::Value::*` variants: `Text(String)`, `Integer(i64)`, `Real(f64)`,
-`Boolean(bool)`, `Blob(Vec<u8>)`, `Null`.
+`Boolean(bool)`, `Blob(Vec<u8>)`, `Null`. The read-side counterpart is
+`boogy_sdk::store::Val` (same variants) — `db_find_by` and the `Query`
+DSL take `Val`, raw `store::*` takes `store::Value`.
 
 ### Filtering / sorting / paginating
 
-**Keyset pagination is THE default for any list a client pages through — reach
-for it first.** It is O(page) regardless of depth (no offset re-scan), stable
-under concurrent inserts (no skipped/repeated rows), and the SDK makes it a
-one-liner. Offset/`find` is a fallback for tiny, fixed, non-paged sets only.
-
-Keyset is **two halves that must match**:
-
-1. **Declare the access pattern on the model** so the walk is an index walk, not
-   a scan (this is the part agents forget — without it the keyset query
-   degrades to a full scan):
-   - `#[model(list_by(filter = "owner_id", newest = "created_at"))]` — a filtered
-     newest-first list. Resolves to a covering composite index
-     `(owner_id, created_at DESC, _id)`; its prefix also serves a plain
-     `where_eq(owner_id)` equality seek, so you usually DON'T also need
-     `#[index]` on that column.
-   - `#[model(ranked_by(highest = "created_at"))]` — an UNfiltered newest-first
-     feed (or any score column, e.g. `highest = "score"`).
-   Repeat `list_by` once per filter axis a list endpoint exposes.
-
-2. **Page it with the Query DSL terminal** — `keyset_by` + `.cursor` + `.limit`
-   + `.fetch_page`, returning a `CursorPage<T>` (serializes `{ items,
-   next_cursor }`):
-
-   ```rust
-   use boogy_sdk::pagination::{decode, CursorPage};
-   use boogy_sdk::store::SortDir;
-
-   fn list_orders(req: &mut Req<'_>) -> Result<Json<CursorPage<OrderOut>>, ApiError> {
-       let limit  = req.query("limit").and_then(|s| s.parse().ok()).unwrap_or(50).clamp(1, 200);
-       let cursor = req.query("cursor").and_then(decode);
-       let page = Query::on(Order::TABLE)
-           .where_eq(Order::OWNER_ID, owner.as_str())     // optional filter(s)
-           .keyset_by(Order::CREATED_AT, SortDir::Desc)   // MUST match a list_by/ranked_by
-           .limit(limit)
-           .cursor(cursor)
-           .fetch_page(|r| order_out(r))?;                // over-fetch+1, builds next_cursor
-       Ok(Json(page))
-   }
-   ```
-
-   `fetch_page` over-fetches by one to detect the next page and builds the opaque
-   `next_cursor` for you — no manual cursor arithmetic. The client passes the
-   returned `next_cursor` straight back as `?cursor=`. Extra
-   `where_eq`/`where_gte`/… filters compose on the same walk (residual-filtered
-   when not the indexed axis), so multi-axis admin filters Just Work.
-   `next_cursor` is absent on the last page. Reference: `chat` (`list_by`),
-   `notes-api` (`ranked_by`), `stripe-base` / `resend-base` (multi-axis admin).
-
-**Bounded-memory batch jobs** (sweeps, exports — not a client page): use
-`for_each_batch` (above), not keyset.
-
-**Offset/`find` (fallback ONLY).** `store::find` takes `FindOptions { filters,
-sort, page: Some(Page { limit, offset }) }`. Offset re-scans `offset` rows every
-page and can skip/repeat rows under concurrent writes — use ONLY for a tiny,
-fixed, non-paged set where keyset would be overkill.
+Use the `Query` DSL (above). It is the same host `find` op with the
+argument plumbing done for you:
 
 ```rust
-let result = store::find("notes", &store::FindOptions {
-    filters: vec![store::Filter {
-        column: "done".into(), op: store::FilterOp::Eq, val: store::Value::Boolean(false),
-    }],
-    sort: vec![store::SortBy { column: "priority".into(), descending: true }],
-    page: Some(store::Page { limit: 20, offset: 0 }),
-})?;
+let rows = Query::on(Note::TABLE)
+    .where_eq(Note::DONE, false)
+    .order_by_desc(Note::PRIORITY)
+    .limit(20)
+    .fetch_all()?;
 ```
 
-Filter ops: `Eq`, `NotEq`, `Lt`, `Lte`, `Gt`, `Gte`, `Like`, `NotLike`,
-`In`, `NotIn`, `IsNull`, `IsNotNull`.
+Below it, `find_rows` / `find_rows_grouped` take pre-built
+`Vec<store::Filter>` / `Vec<store::SortBy>` / `Option<store::Page>` —
+build those with `filter_*` / `sort_asc` / `sort_desc` / `page`, never by
+hand. Hand-writing the raw `store::FindOptions` literal is both flagged
+by the service-conventions check and a compile hazard: the record carries
+`or_groups`, `allow_full_scan`, and `skip_total` alongside `filters` /
+`sort` / `page`, and `Filter` carries `in_values`.
+
+Filter ops (`store::FilterOp`): `Eq`, `Neq`, `Gt`, `Gte`, `Lt`, `Lte`,
+`Like`, `NotLike`, `IsNull`, `IsNotNull`, `In`. Sort direction is
+`store::SortDir::{Asc, Desc}`.
 
 ## Responses
 
@@ -768,11 +951,17 @@ captures the method shapes for `…/openrpc.json` in one call:
 The closure runs once at registration time (for spec capture) and once
 per request (for dispatch). Method handlers:
 
+Both the param and result types must derive `schemars::JsonSchema`
+alongside `Deserialize` / `Serialize` — `Dispatcher::method` requires it
+(`P: Deserialize + JsonSchema`, `R: Serialize + JsonSchema`) so it can
+capture the method shape for `openrpc.json`:
+
 ```rust
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 struct SearchParams { query: String }
-#[derive(Serialize)]
-struct SearchResult { items: Vec<json::Value> }
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct SearchResult { items: Vec<NoteOut> }
 
 fn search_notes(p: SearchParams) -> Result<SearchResult, RpcError> {
     // ... auth::find_owned / auth::load_owned available here
@@ -809,12 +998,17 @@ deserializer/serializer and the protocol surface can't drift.
 struct CreateNoteArgs { title: String, body: String }
 
 #[derive(Serialize, JsonSchema)]
-struct NoteOut { id: String, title: String, body: String }
+struct NoteOut { id: u64, title: String, body: String }
 
 fn create_note_tool(args: CreateNoteArgs) -> Result<NoteOut, ApiError> {
     let principal = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
-    let id = store::insert("notes", &columns_for(&args, &principal))
-        .map_err(ApiError::internal)?;
+    let id = db_insert(&Note {
+        id: Id::new(0),
+        title: args.title.clone(),
+        body: args.body.clone(),
+        owner_principal: principal,
+        created_at: Timestamp::new(now_millis() as i64),
+    })?;
     Ok(NoteOut { id, title: args.title, body: args.body })
 }
 ```
@@ -950,63 +1144,25 @@ non-default status. Requires `peer = true` in the manifest's `[capabilities]`. M
 `[ingress.delegation]` controls on-behalf-of (OBO) flow when one service
 calls another carrying an end-user identity.
 
-## Vector Search
+## Vector search — NOT IMPLEMENTED
 
-Boogy services can create and query vector collections for semantic search,
-recommendation, and similarity tasks. Enable the capability in the manifest
-and use the `vector::*` functions exposed by `wit_glue!`.
+> **Do not build on this.** The `vector` capability, the WIT interface, the
+> `boogy_sdk::vector` types, and the `create_vector_collection` /
+> `vector_insert` / `vector_search` family emitted by `wit_glue!` all
+> **exist and compile** — but nothing implements them behind the store.
+> Every call fails at runtime. A clean `cargo build` is not evidence the
+> feature ships; if you wrote `.expect(...)` around one of these calls, the
+> guest traps instead.
+>
+> The signatures are deliberately not documented here, so that no one
+> copies a worked example of an API that cannot work.
 
-**Manifest:**
-```toml
-[capabilities]
-vector = true
-```
+*What to do instead:* keyword search through the store's filter / `LIKE`
+queries (the `Query` DSL's `where_like`). If semantic search is a hard
+requirement, generate embeddings and search through an external service
+over `outbound_http`, keeping only metadata in the store.
 
-Vector collections live in the per-service store (the sole store
-engine); no `[store] engine` selection is needed.
-
-**SDK functions** (available unqualified after `wit_glue!`):
-
-| Function | Purpose |
-|---|---|
-| `vector::create_vector_collection(name, dims, metric)` | Create (or ensure) a named collection with `dims` dimensions and the given distance metric. |
-| `vector::vector_insert(collection, id, embedding)` | Insert a single vector with caller-supplied string id. |
-| `vector::vector_insert_batch(collection, items)` | Insert multiple vectors in one call. |
-| `vector::vector_update(collection, id, embedding)` | Replace the embedding for an existing id. |
-| `vector::vector_delete(collection, id)` | Remove a vector by id. |
-| `vector::vector_search(collection, query, k)` | Return the `k` nearest neighbours with distances. |
-| `vector::vector_search_filtered(collection, query, k, filters)` | Same, but restrict candidates by metadata filters before ranking. |
-
-**Distance metrics** (`vector::Metric`): `Cosine`, `Euclidean`, `DotProduct`.
-
-**Usage example:**
-
-```rust
-fn init_tables() {
-    // Collection is idempotent — safe to call on every request.
-    vector::create_vector_collection("docs", 1536, vector::Metric::Cosine)
-        .expect("create_vector_collection failed");
-}
-
-fn index_doc(req: &mut Req<'_>) -> Result<Created<json::Value>, ApiError> {
-    let input: IndexDocInput = validate_body(req.body())?;
-    vector::vector_insert("docs", &input.id, &input.embedding)
-        .map_err(ApiError::internal)?;
-    Ok(Created(json::json!({ "id": input.id })))
-}
-
-fn search_docs(req: &mut Req<'_>) -> Result<Json<json::Value>, ApiError> {
-    let input: SearchInput = validate_body(req.body())?;
-    let results = vector::vector_search("docs", &input.embedding, 10)
-        .map_err(ApiError::internal)?;
-    Ok(Json(json::json!({ "results": results })))
-}
-```
-
-`vector::vector_search` returns a `Vec<VectorMatch>` with `.id` (String)
-and `.distance` (f32) fields. Lower distance is better for Euclidean;
-higher dot product is better for DotProduct; Cosine returns values in
-[0, 2] where 0 is identical.
+See `boogy:boogy-capability-limits` for the other surfaces in this class.
 
 ## Websockets (real-time channels)
 
@@ -1044,18 +1200,27 @@ replay = 50               # optional: keep the last N messages for late joiners
 
 **Usage example:**
 
+`PublishError` / `GrantError` implement `Display` (and `Error`) but not
+`Into<String>`, so lift them with `|e| ApiError::internal(e.to_string())`
+— bare `.map_err(ApiError::internal)` does not compile. Better still,
+match the variant: `RateLimited` / `BackendUnavailable` are retryable,
+the rest are caller or manifest bugs.
+
 ```rust
 fn push_price(req: &mut Req<'_>) -> Result<NoContent, ApiError> {
     let input: PriceInput = validate_body(req.body())?;
     ws_publish("ticker", &json::json!({ "px": input.px }).to_string())
-        .map_err(ApiError::internal)?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(NoContent)
 }
 
-fn subscribe_inbox(req: &mut Req<'_>) -> Result<Json<json::Value>, ApiError> {
+#[derive(Serialize, schemars::JsonSchema)]
+struct GrantOut { grant: String }
+
+fn subscribe_inbox(_req: &mut Req<'_>) -> Result<Json<GrantOut>, ApiError> {
     let grant = ws_mint_subscribe_grant("inbox", 300)
-        .map_err(ApiError::internal)?;
-    Ok(Json(json::json!({ "grant": grant })))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(GrantOut { grant }))
 }
 ```
 
@@ -1093,7 +1258,18 @@ Router::new()
 
 ## Conventions
 
+- **Tables are models** — one `#[derive(Model)]` struct per table,
+  registered with `create_model::<M>()`; column names come from the
+  derive's consts. A hand-built `Table` / `create_table_from` in a
+  service crate is a hard failure of the service-conventions check.
 - **Owner column** — always `DEFAULT_OWNER_COL` (i.e. `"owner_principal"`).
+- **Every route is documented** — `.summary(...)` on each route and
+  `Router::info(...)` on the router; both are checked.
+- **Request and response bodies are typed structs** deriving
+  `schemars::JsonSchema`, never `json::Value`.
+- **Multi-write handlers use `tx`** — two or more `db_insert` /
+  `db_update` / `db_delete` calls in one function body must be inside a
+  `tx(...)`, or carry an `// independent-writes: <reason>` marker.
 - **Path params** — `{name}` syntax. Read with `req.params.get("name")`.
 - **Catch-all params** — `{*rest}` captures the remainder of the path.
 - **Response shape** — JSON for success, RFC 7807
@@ -1103,8 +1279,8 @@ Router::new()
 - **Auth** — never reach `bindings::boogy::platform::auth` directly.
   Always go through `auth::*` helpers.
 - **Tables run idempotently** — `init_tables` runs on every request;
-  every `create_table_from` is `IF NOT EXISTS`. Don't try to "optimize"
-  by running it once.
+  `create_model` is table + index `IF NOT EXISTS`. Don't try to
+  "optimize" by running it once.
 - **Existence-mask** — always 404 for "row exists but isn't yours."
   Never 403. The SDK's auth helpers do this for you; if you're hand-
   rolling an ownership check, match the convention.
@@ -1121,56 +1297,52 @@ work unqualified. **In submodules, you must `use crate::*` or qualify
 each name with `crate::`** — they are NOT globally available.
 
 ```rust
-// In a submodule like crates/examples/mycrate/src/posts.rs:
-use crate::{store, find_row_by, find_rows_by, tx, auth, now_millis};
+// In a submodule like src/posts.rs of your service crate:
+use crate::{store, Query, db_insert, db_get, db_find_by, tx, auth, now_millis};
 use crate::bindings;  // if you need to reach into raw WIT bindings
 ```
 
 | Category | Names |
 |---|---|
-| Modules | `store` (= WIT `bindings::boogy::platform::store`), `auth`, `bindings`, the `peer`/`secrets`/`signing`/`background_jobs`/`websockets` binding modules, plus `response` and `json` |
-| Router / request | `Router`, `Req`, `Params`, `Request`, `Path`, `FromRequest`, `Principal`, `Ctx`, `QueryExtractor` (the `Query` *request extractor*, aliased so it doesn't clash with the `Query` DSL builder — both are in scope) |
-| Response wrappers | `Json`, `Created`, `NoContent`, `Redirect`, `IntoResponse` |
-| Errors / parsing | `ApiError`, `parse_body`, `validate_body` |
-| Serde derives | `Serialize`, `Deserialize` — **in scope already; no `use serde::…`** |
+| Modules | `store` (= WIT `bindings::boogy::platform::store`), `auth`, `bindings` |
+| Types | `Request`, `Params`, `Query` (the typed query builder) |
 | Constants | `DEFAULT_OWNER_COL` |
-| Schema | `create_table_from`, `migration`, `migrations` |
-| Row reads | `to_sdk_row`, `get_row`, `find_all_rows`, `find_row_by`, `find_rows_by`, `find_rows`, `find_rows_grouped`, `upsert_increment`, `for_each_batch` |
-| Transactions | `tx` (no-arg closure, generic over error type; call the same `store::*`/`db_*`/`find_row_by` fns inside) |
-| Helpers | `filter_eq` (+ `filter_neq`/`filter_gt`/`filter_gte`/`filter_lt`/`filter_lte`/`filter_like`/`filter_not_like`/`filter_is_null`/`filter_is_not_null`/`filter_in`), `sort_asc`/`sort_desc`, `page`, `now_millis`, `peer_fetch` |
+| Schema | `create_model`, `create_model_as`, `migration`, `migrations`, `create_table_from` (dynamic-schema escape hatch) |
+| Typed CRUD | `db_insert`, `db_get`, `db_find_by`, `db_update`, `db_delete` |
+| Row reads | `to_sdk_row`, `get_row`, `get_many`, `find_many`, `load_has_many`, `find_all_rows`, `find_row_by`, `find_rows_by`, `find_rows`, `find_rows_grouped`, `count_rows`, `upsert`, `upsert_increment`, `for_each_batch` |
+| Transactions | `tx` (no-arg closure, generic over error type; call the same `db_*`/`Query`/`store::*` fns inside) |
+| Helpers | `filter_eq` (+ `filter_neq`/`filter_gt`/`filter_gte`/`filter_lt`/`filter_lte`/`filter_like`/`filter_not_like`/`filter_is_null`/`filter_is_not_null`/`filter_in`), `sort_asc`/`sort_desc`, `page`, `now_millis`, `self_identity`, `peer_fetch` |
+| Capability calls | `jobs_enqueue`/`jobs_cancel`/`jobs_status`, `ws_publish`/`ws_mint_subscribe_grant`, `secrets_verify_hmac`. (The `vector_*` / `create_vector_collection*` family is also emitted, but **is not implemented** — see above.) |
+| Random values (`entropy` capability) | `random_id`, `random_string`, `random_hex`, `random_int`, `random_int_exclusive`, `random_float`, `random_unit_float`, `random_bool`, `random_bool_with_probability`, `random_bytes`, `random_choose`, `random_shuffle`, `random_sample`, `random_vec_of`, `random_uuid_v4`, `random_uuid_v7`, `try_random_int`/`try_random_float`/`try_random_string`, `rng()`, `Alphabet` |
+
+Note: `wit_glue!` also emits a `Query` type into your crate root, which
+shadows `boogy_sdk::extract::Query` (the typed query-string extractor).
+If you need both, import the extractor under an alias
+(`use boogy_sdk::extract::Query as QueryParams;`).
 
 If `api_keys_glue!` is also invoked, add: the `api_key_routes` module
 with `create` / `list` / `revoke` / `rotate` / `guard` / `resolve_caller`
 / `install_table` / `ResolvedKey`.
 
-**All of the above are already in scope in `lib.rs` after `wit_glue!` —
-do NOT also `use boogy_sdk::{Router, Json, ApiError, …}` (or `use
-serde::{Serialize, Deserialize}`) there. That re-imports a name the macro
-already injected (`E0252` / "unused import" / shadowing) — the exact
-double-import trap.** And `wit_glue!(bindings, MyApi)` does **not** define
-`struct MyApi` — you declare the unit struct and `impl Api for MyApi`
-yourself. The `boogy_sdk::` import line below is for **submodules** (where
-crate-root names aren't visible unless you `use crate::*`) and for crates
-that don't invoke `wit_glue!`.
-
 ### From `boogy_sdk::` — re-exports from the SDK crate
 
 ```rust
-// In a SUBMODULE (or a crate without wit_glue!) — in lib.rs these names
-// are already injected by wit_glue!, so importing them there double-imports.
-use boogy_sdk::{Api, ApiError, Created, Json, NoContent, Redirect, Req, Router,
-                Row, StoreError, Table, parse_body, validate_body};
+use boogy_sdk::{Api, ApiError, Created, Json, Model, NoContent, Redirect, Req,
+                Router, Row, StoreError, parse_body, validate_body};
+use boogy_sdk::model::{Id, Model as _, Timestamp};   // the trait + value types
+use boogy_sdk::store::{SortDir, Val};
 use boogy_sdk::ids::IdCodec;  // optional: opaque-id translation
 ```
 
 | Category | Names |
 |---|---|
 | Trait | `Api` (your struct implements this) |
+| Model layer | `Model` (the **derive**; the trait of the same name is `boogy_sdk::model::Model`), `model::{Id, Timestamp, Decimal, Field}` |
 | Errors / parsing | `ApiError`, `parse_body`, `validate_body` |
 | Response wrappers | `Json`, `Created`, `NoContent`, `Redirect`, `HttpResponse` |
 | Router / request | `Req`, `Router` |
-| Store types | `Row`, `StoreError`, `Table` |
-| Submodules | `boogy_sdk::pagination`, `boogy_sdk::peer`, `boogy_sdk::rpc`, `boogy_sdk::mcp`, `boogy_sdk::ids` |
+| Store types | `Row`, `StoreError`, `store::Val`, `store::SortDir`, `Table` (escape hatch) |
+| Submodules | `boogy_sdk::model`, `boogy_sdk::query`, `boogy_sdk::pagination`, `boogy_sdk::peer`, `boogy_sdk::rpc`, `boogy_sdk::mcp`, `boogy_sdk::ids`, `boogy_sdk::websockets` (`boogy_sdk::vector` exists but its feature is not implemented) |
 
 ### Why two namespaces?
 
@@ -1182,11 +1354,60 @@ SDK re-exports (`boogy_sdk::`) are the bindings-independent surface:
 they're the same across every crate.
 
 **Practical rule:** if it has anything to do with `store::`, `tx`,
-`auth::*`, or `bindings::*`, it's a `crate::` name. `ApiError` / `Req` /
-`Created` / a response wrapper / the serde derives are available from
-either path — but in `lib.rs` they're **already injected by `wit_glue!`,
-so don't re-`use` them there**; in a submodule, import them from
-`boogy_sdk::` (or `use crate::*`).
+`auth::*`, or `bindings::*`, it's a `crate::` name. If it's
+`ApiError` / `Req` / `Created` / a response wrapper, it's available
+from either path — pick `boogy_sdk::` for clarity in submodules.
+
+## Random values (`random_*`, needs `entropy`)
+
+Never hand-roll byte→value conversion on top of `random_bytes`. The
+`random_*` functions `wit_glue!` emits cover the whole surface, and they
+are rejection-sampled, so they carry no modulo bias:
+
+```toml
+[capabilities]
+entropy = true
+```
+
+```rust
+let public_id = random_id();                     // 22 url-safe chars, ~131 bits
+let slug      = random_hex(6);                   // "9f3a1c"
+let code      = random_string(8, &Alphabet::BASE32_CROCKFORD);  // human-readable
+let die       = random_int(1, 6);                // BOTH ends inclusive
+let idx       = random_int_exclusive(0, len);    // end exclusive, slice-safe
+let sampled   = random_sample(&candidates, 3);   // distinct, random order
+let uuid      = random_uuid_v7(now_millis());    // time-ordered; v4 also available
+```
+
+Rules that matter:
+
+- **`random_id()` is the default for a user-facing id.** The auto-PK is a
+  `u64` and therefore enumerable — never expose it. Store the id in a
+  TEXT column with a `#[lookup_by]` (unique) index so a collision is a
+  409, not a silent overwrite.
+- **Ranges are inclusive of both ends** unless the name says
+  `exclusive`. `random_int(min, max)` **panics** when `min > max` (a
+  panic traps the guest and fails the request) — use `try_random_int`
+  whenever the bounds come from request input.
+- **Size the output for the use.** A 6-character hex slug is 24 bits and
+  *will* collide; retry against the unique index (that's what
+  `shortlinks` does) or use a wider id.
+- Without the `entropy` grant the host returns zero bytes, so values stay
+  in range but stop being random. Constant-looking ids ⇒ check the
+  manifest.
+- `random_uuid_v7` takes the timestamp as an argument (pass
+  `now_millis()`, which needs `clock`) — the random path never reads the
+  clock itself.
+
+Alphabets: `Alphabet::{HEX, HEX_UPPER, DIGITS, BASE32_CROCKFORD,
+ALPHANUMERIC, URL_SAFE, LOWERCASE_ALPHANUMERIC}`, or
+`Alphabet::new("...")` for a custom one. Prefer `BASE32_CROCKFORD` for
+anything a person retypes (no `I`/`L`/`O`/`U`).
+
+For several values from one handle, or anything above, use
+`rng()` — it returns a `boogy_sdk::random::Rng` with the full method
+set. The arithmetic lives in `boogy_sdk::random` and is host-testable
+against a fake byte source.
 
 ## Opaque public ids (`boogy_sdk::ids`)
 
@@ -1218,14 +1439,22 @@ crypto in isolation.
   `auth::current_principal()` instead.
 - Anything starting with `__` in your crate's namespace — these are
   macro-private (e.g. `__boogy_insert_row` is the SDK's internal
-  api_keys plumbing; user code uses `store::insert` directly).
-- `Val` (the SDK's portable read-side value type) is intentionally
-  not in the unqualified namespace. Writes always use the WIT
-  `store::Value::*` enum so there is one value-type per concern.
-  `Row::get(name)` returns `&Val` if you genuinely need to inspect
-  the read-side typed enum — qualify it as
-  `boogy_sdk::store::Val` at the (rare) callsite that needs it.
-- The raw WIT `store::find` for principal-scoped lists — use
-  `auth::find_owned`. Only fall back to raw `store::find` when you
-  need filtering / sorting / pagination beyond what `find_owned`
-  provides.
+  api_keys plumbing; user code uses `db_insert` / `store::insert`).
+- `Table::new` / `create_table_from` for a table whose columns are known
+  at compile time — derive `Model` (see **Tables & storage**). The
+  service-conventions check hard-fails these in a service crate.
+- A hand-written `cols` module of `pub const` column names — the `Model`
+  derive already emits them (`M::TABLE`, `M::FIELD_NAME`).
+- Bare string literals for table / column / index names anywhere in a
+  handler, job, or query.
+- The raw WIT `store::find` / `store::insert` / `store::update` /
+  `store::delete` for ordinary CRUD — use `db_*`, the `Query` DSL, or
+  `auth::find_owned` for principal-scoped lists. The raw calls are the
+  marked escape hatch (`// escape-hatch: <reason>`), not the default.
+
+**Two value enums, one per direction.** `boogy_sdk::store::Val` is the
+SDK's portable value type: it is what `Row::get(name)` returns and what
+`db_find_by` / the `Query` DSL's `IntoVal` take. The WIT
+`store::Value::*` enum is what raw `store::insert` / `store::update` /
+`filter_*` / `upsert_increment` take. Neither is wrong — pick the one
+the call you're making asks for.

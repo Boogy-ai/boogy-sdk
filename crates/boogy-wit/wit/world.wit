@@ -13,8 +13,8 @@ world service {
     import peer;
     import outbound-http;
     import secrets;
-    import signing;
     import background-jobs;
+    import vector;
     import websockets;
 }
 
@@ -37,7 +37,7 @@ world service-with-jobs {
     import peer;
     import outbound-http;
     import secrets;
-    import signing;
     import background-jobs;
+    import vector;
     import websockets;
 }

@@ -45,6 +45,15 @@
 ///   and lookup paths use the same value type.
 /// - `auth::*` — resource-level auth helpers (`current_principal`, `required`,
 ///   `owns_resource`, `find_owned`, `load_owned`).
+/// - `random_*` — random values over the platform entropy source
+///   (`entropy` capability): `random_int`, `random_int_exclusive`,
+///   `random_float`, `random_unit_float`, `random_bool`,
+///   `random_bool_with_probability`, `random_string`, `random_id`,
+///   `random_hex`, `random_bytes`, `random_choose`, `random_shuffle`,
+///   `random_sample`, `random_vec_of`, `random_uuid_v4`,
+///   `random_uuid_v7`, plus `try_random_int` / `try_random_float` /
+///   `try_random_string` and `rng()` for the full
+///   [`boogy_sdk::random::Rng`](crate::random::Rng) surface.
 /// - Typed-model CRUD over a `#[derive(Model)]` type `M` (see
 ///   [`boogy_sdk::model`]): `create_model::<M>()` (register in
 ///   `init_tables`), `db_insert(&M) -> u64`, `db_get::<M>(id) ->
@@ -54,8 +63,8 @@
 ///
 /// And these `use` statements are emitted so handlers don't need to repeat them:
 /// `Deserialize`, `Serialize`, `json`, `response`, `Params`, `Req`, `Router`,
-/// `Ctx`, `Row`, `Table`, `Val`, `DEFAULT_OWNER_COL`, `store` (the WIT
-/// bindings module).
+/// `Ctx`, `Row`, `Table`, `Val`, `DEFAULT_OWNER_COL`, `Alphabet`, `store`
+/// (the WIT bindings module).
 ///
 /// Two write paths exist. (1) **Raw**: `store::insert(table, &[store::Column {
 /// name, val: store::Value::* }])` and `store::update` / `store::delete` — used
@@ -88,7 +97,6 @@ macro_rules! wit_glue {
                     store::StoreError::Unsupported(m)         => S::Unsupported(m),
                     store::StoreError::Timeout(m)             => S::Timeout(m),
                     store::StoreError::VersionMismatch(m)     => S::VersionMismatch(m),
-                    store::StoreError::CommitUnknown(m)       => S::CommitUnknown(m),
                     store::StoreError::ResourceExhausted(m)   => S::ResourceExhausted(m),
                     store::StoreError::Internal(m)            => S::Internal(m),
                 }
@@ -120,9 +128,9 @@ macro_rules! wit_glue {
         #[allow(unused_imports)]
         use $bindings::boogy::platform::secrets as secrets_bindings;
         #[allow(unused_imports)]
-        use $bindings::boogy::platform::signing as signing_bindings;
-        #[allow(unused_imports)]
         use $bindings::boogy::platform::background_jobs as jobs_bindings;
+        #[allow(unused_imports)]
+        use $bindings::boogy::platform::vector as vector_bindings;
         #[allow(unused_imports)]
         use $bindings::boogy::platform::websockets as ws_bindings;
         #[allow(unused_imports)]
@@ -137,6 +145,9 @@ macro_rules! wit_glue {
         use $crate::DEFAULT_OWNER_COL;
         #[allow(unused_imports)]
         use $crate::error::{parse_body, validate_body, ApiError};
+        // Named symbol sets for `random_string(len, &Alphabet::HEX)`.
+        #[allow(unused_imports)]
+        use $crate::random::Alphabet;
         // Note: `Val` is intentionally NOT re-exported. `Val` is the
         // SDK's portable read-side value type returned by `Row`
         // accessors; user write paths always go through the WIT
@@ -1072,17 +1083,169 @@ macro_rules! wit_glue {
             $bindings::boogy::platform::runtime::self_identity()
         }
 
-        /// True iff the CALLER is this service's owner — the provisioner's own
-        /// agent (their human/dashboard token, resolved host-side) or one of
-        /// their own workloads. False for anonymous, a different owner, or an
-        /// unresolvable caller (fail-closed). Host-attested — safe to authorize
-        /// on. Lets a provisionable module gate an owner-only surface (e.g.
-        /// `/admin`) WITHOUT hardcoding an identity in its manifest:
-        /// ```ignore
-        /// if !crate::caller_is_service_owner() { return Err(ApiError::forbidden("operator only")); }
-        /// ```
-        fn caller_is_service_owner() -> bool {
-            $bindings::boogy::platform::runtime::caller_is_service_owner()
+        // -- Random values --
+        //
+        // `runtime::random_bytes` is the platform's only entropy
+        // primitive, and it is an import, so the call site has to live
+        // here. Everything above raw bytes — ranges, alphabets,
+        // shuffles, UUIDs — is host-testable arithmetic in
+        // `$crate::random`, and these wrappers are one line each.
+        //
+        // All of them need `entropy = true` in `[capabilities]`. Without
+        // it the host returns zero bytes, so values stay in range but
+        // stop being random.
+        //
+        // See `boogy_sdk::random` for the full method list, the
+        // rejection-sampling guarantee, and the `try_*` forms.
+
+        /// A `Rng` over this service's platform entropy source. Use it
+        /// when you want several values from one handle, or a method the
+        /// flat `random_*` wrappers below don't expose.
+        #[allow(dead_code)]
+        type HostRng = $crate::random::Rng<fn(usize) -> ::std::vec::Vec<u8>>;
+
+        /// Exactly `n` random bytes from the platform entropy source.
+        /// Short reads are NOT padded here — see [`rng()`] /
+        /// `boogy_sdk::random::Rng::bytes` for the padded form.
+        #[allow(dead_code)]
+        fn random_bytes(n: usize) -> ::std::vec::Vec<u8> {
+            $bindings::boogy::platform::runtime::random_bytes(n as u32)
+        }
+
+        /// A random-value generator over the platform entropy source.
+        /// Every `random_*` function below is `rng().<method>()`.
+        #[allow(dead_code)]
+        fn rng() -> HostRng {
+            $crate::random::Rng::new(random_bytes as fn(usize) -> ::std::vec::Vec<u8>)
+        }
+
+        /// A uniformly random integer in `[min, max]` — both ends
+        /// inclusive, free of modulo bias. Panics if `min > max`; use
+        /// `try_random_int` for bounds derived from request input.
+        #[allow(dead_code)]
+        fn random_int(min: i64, max: i64) -> i64 {
+            rng().int(min, max)
+        }
+
+        /// Total form of [`random_int`]: `Err(RandomError::EmptyRange)`
+        /// instead of a panic when `min > max`.
+        #[allow(dead_code)]
+        fn try_random_int(min: i64, max: i64) -> Result<i64, $crate::random::RandomError> {
+            rng().try_int(min, max)
+        }
+
+        /// A uniformly random integer in `[start, end)` — end exclusive.
+        /// Panics if `end <= start`.
+        #[allow(dead_code)]
+        fn random_int_exclusive(start: i64, end: i64) -> i64 {
+            rng().int_exclusive(start, end)
+        }
+
+        /// A uniformly random float in `[min, max)`. Panics if `min >
+        /// max` or a bound is not finite.
+        #[allow(dead_code)]
+        fn random_float(min: f64, max: f64) -> f64 {
+            rng().float(min, max)
+        }
+
+        /// Total form of [`random_float`].
+        #[allow(dead_code)]
+        fn try_random_float(min: f64, max: f64) -> Result<f64, $crate::random::RandomError> {
+            rng().try_float(min, max)
+        }
+
+        /// A uniformly random float in `[0.0, 1.0)`.
+        #[allow(dead_code)]
+        fn random_unit_float() -> f64 {
+            rng().unit_float()
+        }
+
+        /// `true` or `false`, each with probability 1/2.
+        #[allow(dead_code)]
+        fn random_bool() -> bool {
+            rng().bool()
+        }
+
+        /// `true` with probability `p` (clamped to `[0, 1]`).
+        #[allow(dead_code)]
+        fn random_bool_with_probability(p: f64) -> bool {
+            rng().bool_with_probability(p)
+        }
+
+        /// A random string of exactly `len` characters from `alphabet` —
+        /// e.g. `random_string(6, &Alphabet::HEX)`. Unbiased over the
+        /// alphabet whatever its size. Panics only on a malformed custom
+        /// alphabet; the `Alphabet` constants never panic.
+        #[allow(dead_code)]
+        fn random_string(len: usize, alphabet: &$crate::random::Alphabet<'_>) -> ::std::string::String {
+            rng().string(len, alphabet)
+        }
+
+        /// Total form of [`random_string`], for an alphabet built from
+        /// input.
+        #[allow(dead_code)]
+        fn try_random_string(
+            len: usize,
+            alphabet: &$crate::random::Alphabet<'_>,
+        ) -> Result<::std::string::String, $crate::random::RandomError> {
+            rng().try_string(len, alphabet)
+        }
+
+        /// An opaque public id: 22 URL-safe characters, ~131 bits. The
+        /// default answer for a user-facing id that must not leak row
+        /// counts. Store it in a TEXT column with a unique index.
+        #[allow(dead_code)]
+        fn random_id() -> ::std::string::String {
+            rng().id()
+        }
+
+        /// A lowercase hex string of exactly `len` characters.
+        #[allow(dead_code)]
+        fn random_hex(len: usize) -> ::std::string::String {
+            rng().hex(len)
+        }
+
+        /// `n` values, each produced by calling `f` with the generator.
+        #[allow(dead_code)]
+        fn random_vec_of<T, F>(n: usize, f: F) -> ::std::vec::Vec<T>
+        where
+            F: FnMut(&mut HostRng) -> T,
+        {
+            rng().vec_of(n, f)
+        }
+
+        /// One element of `items`, chosen uniformly. `None` for an empty
+        /// slice.
+        #[allow(dead_code)]
+        fn random_choose<T>(items: &[T]) -> Option<&T> {
+            rng().choose(items)
+        }
+
+        /// Shuffle `items` in place into a uniformly random permutation.
+        #[allow(dead_code)]
+        fn random_shuffle<T>(items: &mut [T]) {
+            rng().shuffle(items)
+        }
+
+        /// `k` distinct elements of `items`, in random order. Returns
+        /// everything (shuffled) when `k` exceeds the slice length.
+        #[allow(dead_code)]
+        fn random_sample<T>(items: &[T], k: usize) -> ::std::vec::Vec<&T> {
+            rng().sample(items, k)
+        }
+
+        /// A random (version 4) UUID in canonical hyphenated form.
+        #[allow(dead_code)]
+        fn random_uuid_v4() -> ::std::string::String {
+            rng().uuid_v4()
+        }
+
+        /// A time-ordered (version 7) UUID in canonical hyphenated form.
+        /// The timestamp is caller-supplied — pass `now_millis()`, which
+        /// needs the `clock` capability.
+        #[allow(dead_code)]
+        fn random_uuid_v7(unix_millis: u64) -> ::std::string::String {
+            rng().uuid_v7(unix_millis)
         }
 
         /// Build an ascending `SortBy` for `column`. Pairs with
@@ -1812,30 +1975,6 @@ macro_rules! wit_glue {
                     .map_err(::std::string::String::from)
             }
 
-            /// Drop a table entirely — irreversibly removes ALL of its rows, every
-            /// index, the row-id counter, and its catalog entry. Idempotent: a
-            /// no-op if the table does not exist (re-run safe). DESTRUCTIVE — the
-            /// data cannot be recovered.
-            ///
-            /// Use to reset a table whose schema changed incompatibly. The table is
-            /// only removed here; recreate it explicitly (drop-then-recreate within
-            /// the migration) — `create_model`/`create_table` rebuild only a
-            /// *missing* table, so a fresh create after the drop yields the new
-            /// schema.
-            pub fn drop_table(
-                &self,
-                table: &str,
-            ) -> ::core::result::Result<(), ::std::string::String> {
-                if !$bindings::boogy::platform::store::list_tables()?
-                    .iter()
-                    .any(|t| t.name == table)
-                {
-                    return Ok(()); // already dropped
-                }
-                $bindings::boogy::platform::store::drop_table(table)
-                    .map_err(::std::string::String::from)
-            }
-
             // -- Data ops for backfills --
 
             /// Find rows matching `filters` in `table`. Returns
@@ -2350,14 +2489,6 @@ macro_rules! wit_glue {
                 $crate::request_state::_fallback_scopes().unwrap_or_default()
             }
 
-            /// The caller's platform handle, when they consented to share
-            /// it with this service. `None` for anonymous callers, API-key
-            /// callers, and callers who haven't shared a handle.
-            pub fn current_handle() -> ::core::option::Option<::std::string::String> {
-                super::$bindings::boogy::platform::auth::current_identity()
-                    .and_then(|i| i.handle)
-            }
-
             /// True iff the caller has the named scope. Returns
             /// `false` for anonymous callers and authenticated
             /// callers whose scopes don't include `scope`. Match is
@@ -2545,7 +2676,7 @@ macro_rules! wit_glue {
                     .text("headers_json")
                     .text("body_b64")
                     .integer("created_at")
-                    .unique_index(&::std::format!("idx_{}_scope", $crate::idempotency::TABLE), &["scope_key"]),
+                    .unique_index_on(&["scope_key"]),
             );
         }
 
@@ -2863,137 +2994,6 @@ macro_rules! wit_glue {
             }
         }
 
-        // -- Host-mediated signing bridge --
-        //
-        // Translates the SDK `signing` types to/from their WIT-generated
-        // equivalents. The host generates + holds the private key and signs
-        // entirely host-side — the component only ever receives the public
-        // key, a produced signature, or a typed error; the private key never
-        // crosses back into wasm and there is no read/export op. The gate is
-        // the `[capabilities] signing = true` manifest grant; without it the
-        // bindings call returns `SignError::Internal`.
-
-        fn __signing_alg_to_wit(
-            alg: $crate::signing::SigAlg,
-        ) -> signing_bindings::SigAlg {
-            match alg {
-                $crate::signing::SigAlg::Ed25519 => signing_bindings::SigAlg::Ed25519,
-                $crate::signing::SigAlg::EcdsaSecp256k1 => {
-                    signing_bindings::SigAlg::EcdsaSecp256k1
-                }
-                $crate::signing::SigAlg::EcdsaP256 => signing_bindings::SigAlg::EcdsaP256,
-            }
-        }
-
-        fn __signing_alg_to_sdk(
-            alg: signing_bindings::SigAlg,
-        ) -> $crate::signing::SigAlg {
-            match alg {
-                signing_bindings::SigAlg::Ed25519 => $crate::signing::SigAlg::Ed25519,
-                signing_bindings::SigAlg::EcdsaSecp256k1 => {
-                    $crate::signing::SigAlg::EcdsaSecp256k1
-                }
-                signing_bindings::SigAlg::EcdsaP256 => $crate::signing::SigAlg::EcdsaP256,
-            }
-        }
-
-        fn __signing_signature_to_sdk(
-            sig: signing_bindings::Signature,
-        ) -> $crate::signing::Signature {
-            $crate::signing::Signature {
-                bytes: sig.bytes,
-                recovery_id: sig.recovery_id,
-            }
-        }
-
-        fn __signing_error_to_sdk(
-            e: signing_bindings::SignError,
-        ) -> $crate::signing::SignError {
-            match e {
-                signing_bindings::SignError::UnknownKey(s) => {
-                    $crate::signing::SignError::UnknownKey(s)
-                }
-                signing_bindings::SignError::BadInput(s) => {
-                    $crate::signing::SignError::BadInput(s)
-                }
-                signing_bindings::SignError::Internal(s) => {
-                    $crate::signing::SignError::Internal(s)
-                }
-            }
-        }
-
-        /// Generate a new signing key under `label`. Returns the public key.
-        /// The private key stays host-side and is never returned.
-        #[allow(dead_code)]
-        fn signing_create_key(
-            label: &str,
-            alg: $crate::signing::SigAlg,
-        ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::signing::SignError> {
-            match signing_bindings::create_key(&label.to_string(), __signing_alg_to_wit(alg)) {
-                Ok(pk) => Ok(pk),
-                Err(e) => Err(__signing_error_to_sdk(e)),
-            }
-        }
-
-        /// Sign a prehashed 32-byte digest (the ECDSA path). Non-32-byte
-        /// input is rejected `BadInput`; an Ed25519 key rejects here.
-        #[allow(dead_code)]
-        fn signing_sign_digest(
-            label: &str,
-            digest: &[u8],
-            alg: $crate::signing::SigAlg,
-        ) -> ::core::result::Result<$crate::signing::Signature, $crate::signing::SignError> {
-            match signing_bindings::sign_digest(
-                &label.to_string(),
-                &digest.to_vec(),
-                __signing_alg_to_wit(alg),
-            ) {
-                Ok(sig) => Ok(__signing_signature_to_sdk(sig)),
-                Err(e) => Err(__signing_error_to_sdk(e)),
-            }
-        }
-
-        /// Sign a full message (the Ed25519 path). An ECDSA key rejects here.
-        #[allow(dead_code)]
-        fn signing_sign_message(
-            label: &str,
-            message: &[u8],
-            alg: $crate::signing::SigAlg,
-        ) -> ::core::result::Result<$crate::signing::Signature, $crate::signing::SignError> {
-            match signing_bindings::sign_message(
-                &label.to_string(),
-                &message.to_vec(),
-                __signing_alg_to_wit(alg),
-            ) {
-                Ok(sig) => Ok(__signing_signature_to_sdk(sig)),
-                Err(e) => Err(__signing_error_to_sdk(e)),
-            }
-        }
-
-        /// List this service's signing keys (label + alg + public key only).
-        #[allow(dead_code)]
-        fn signing_list_keys() -> ::std::vec::Vec<$crate::signing::KeyInfo> {
-            signing_bindings::list_keys()
-                .into_iter()
-                .map(|k| $crate::signing::KeyInfo {
-                    label: k.label,
-                    alg: __signing_alg_to_sdk(k.alg),
-                    public_key: k.public_key,
-                })
-                .collect()
-        }
-
-        /// Remove a signing key. Idempotent.
-        #[allow(dead_code)]
-        fn signing_remove_key(
-            label: &str,
-        ) -> ::core::result::Result<(), $crate::signing::SignError> {
-            match signing_bindings::remove_key(&label.to_string()) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(__signing_error_to_sdk(e)),
-            }
-        }
-
         // -- Background-jobs bridging --
         //
         // Same shape as peer_fetch: clean SDK types in, WIT types out
@@ -3130,51 +3130,6 @@ macro_rules! wit_glue {
             }
         }
 
-        fn ws_publish_to_principal(
-            channel: &str,
-            principal: &str,
-            payload: &str,
-        ) -> ::core::result::Result<(), $crate::websockets::PublishError> {
-            match ws_bindings::publish_to_principal(
-                &channel.to_string(),
-                &principal.to_string(),
-                &payload.to_string(),
-            ) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(__ws_publish_error_to_sdk(e)),
-            }
-        }
-
-        fn ws_mint_principal_subscribe_grant(
-            channel: &str,
-            principal: &str,
-            ttl_seconds: u32,
-        ) -> ::core::result::Result<String, $crate::websockets::GrantError> {
-            match ws_bindings::mint_principal_subscribe_grant(
-                &channel.to_string(),
-                &principal.to_string(),
-                ttl_seconds,
-            ) {
-                Ok(g) => Ok(g),
-                Err(e) => Err(__ws_grant_error_to_sdk(e)),
-            }
-        }
-
-        /// Build a typed envelope and publish it to a principal's room. The
-        /// preferred publish entrypoint for per-principal channels — always
-        /// send an envelope, never a bare payload. `ts` is filled from the
-        /// host clock (milliseconds since Unix epoch).
-        fn ws_publish_event(
-            channel: &str,
-            principal: &str,
-            type_: &str,
-            v: u32,
-            data: ::serde_json::Value,
-        ) -> ::core::result::Result<(), $crate::websockets::PublishError> {
-            let env = $crate::websockets::Envelope::new(type_, v, now_millis(), data);
-            ws_publish_to_principal(channel, principal, &env.to_json())
-        }
-
         fn __ws_publish_error_to_sdk(
             e: ws_bindings::PublishError,
         ) -> $crate::websockets::PublishError {
@@ -3193,9 +3148,6 @@ macro_rules! wit_glue {
                 }
                 ws_bindings::PublishError::BackendUnavailable => {
                     $crate::websockets::PublishError::BackendUnavailable
-                }
-                ws_bindings::PublishError::WrongClass => {
-                    $crate::websockets::PublishError::WrongClass
                 }
             }
         }
@@ -3219,10 +3171,141 @@ macro_rules! wit_glue {
                 ws_bindings::GrantError::RateLimited => {
                     $crate::websockets::GrantError::RateLimited
                 }
-                ws_bindings::GrantError::WrongClass => {
-                    $crate::websockets::GrantError::WrongClass
-                }
             }
+        }
+
+        // -- Vector search bridging --
+        //
+        // Same pattern as peer_fetch / jobs: SDK types in, WIT types
+        // out via `vector_bindings::*`. Capability gate is host-side;
+        // if `[capabilities] vector = false`, the bindings calls will
+        // return an error string.
+
+        #[allow(dead_code)]
+        fn create_vector_collection(
+            table: &str,
+            name: &str,
+            dims: u32,
+            metric: $crate::vector::DistanceMetric,
+        ) -> Result<(), String> {
+            let wit_metric = match metric {
+                $crate::vector::DistanceMetric::Cosine => vector_bindings::DistanceMetric::Cosine,
+                $crate::vector::DistanceMetric::Euclidean => vector_bindings::DistanceMetric::Euclidean,
+                $crate::vector::DistanceMetric::DotProduct => vector_bindings::DistanceMetric::DotProduct,
+            };
+            vector_bindings::create_collection(table, name, vector_bindings::VectorCollectionOptions {
+                dimensions: dims,
+                metric: wit_metric,
+                m: None,
+                ef_construction: None,
+            })
+        }
+
+        #[allow(dead_code)]
+        fn create_vector_collection_with_options(
+            table: &str,
+            name: &str,
+            opts: &$crate::vector::VectorCollectionOptions,
+        ) -> Result<(), String> {
+            let wit_metric = match opts.metric {
+                $crate::vector::DistanceMetric::Cosine => vector_bindings::DistanceMetric::Cosine,
+                $crate::vector::DistanceMetric::Euclidean => vector_bindings::DistanceMetric::Euclidean,
+                $crate::vector::DistanceMetric::DotProduct => vector_bindings::DistanceMetric::DotProduct,
+            };
+            vector_bindings::create_collection(table, name, vector_bindings::VectorCollectionOptions {
+                dimensions: opts.dimensions,
+                metric: wit_metric,
+                m: opts.m,
+                ef_construction: opts.ef_construction,
+            })
+        }
+
+        #[allow(dead_code)]
+        fn drop_vector_collection(table: &str, name: &str) -> Result<(), String> {
+            vector_bindings::drop_collection(table, name)
+        }
+
+        #[allow(dead_code)]
+        fn unlock_vector_collection(table: &str, name: &str, key: &[u8]) -> Result<(), String> {
+            vector_bindings::unlock_collection(table, name, key)
+        }
+
+        #[allow(dead_code)]
+        fn vector_insert(table: &str, collection: &str, rowid: u64, vector: &[f32]) -> Result<(), String> {
+            vector_bindings::insert(table, collection, rowid, vector)
+        }
+
+        #[allow(dead_code)]
+        fn vector_insert_batch(table: &str, collection: &str, entries: &[(u64, Vec<f32>)]) -> Result<(), String> {
+            let wit_entries: Vec<(u64, Vec<f32>)> = entries.to_vec();
+            vector_bindings::insert_batch(table, collection, &wit_entries)
+        }
+
+        #[allow(dead_code)]
+        fn vector_update(table: &str, collection: &str, rowid: u64, vector: &[f32]) -> Result<(), String> {
+            vector_bindings::update(table, collection, rowid, vector)
+        }
+
+        #[allow(dead_code)]
+        fn vector_delete(table: &str, collection: &str, rowid: u64) -> Result<(), String> {
+            vector_bindings::delete(table, collection, rowid)
+        }
+
+        #[allow(dead_code)]
+        fn vector_search(
+            table: &str,
+            collection: &str,
+            query: &[f32],
+            k: u32,
+        ) -> Result<Vec<$crate::vector::VectorResult>, String> {
+            let results = vector_bindings::search(table, collection, query, &vector_bindings::VectorSearchOptions {
+                k,
+                ef_search: None,
+                filter: None,
+            })?;
+            Ok(results.into_iter().map(|r| $crate::vector::VectorResult {
+                rowid: r.rowid,
+                distance: r.distance,
+            }).collect())
+        }
+
+        #[allow(dead_code)]
+        fn vector_search_with_options(
+            table: &str,
+            collection: &str,
+            query: &[f32],
+            k: u32,
+            ef_search: Option<u32>,
+            filter: Option<store::Filter>,
+        ) -> Result<Vec<$crate::vector::VectorResult>, String> {
+            let results = vector_bindings::search(table, collection, query, &vector_bindings::VectorSearchOptions {
+                k,
+                ef_search,
+                filter,
+            })?;
+            Ok(results.into_iter().map(|r| $crate::vector::VectorResult {
+                rowid: r.rowid,
+                distance: r.distance,
+            }).collect())
+        }
+
+        #[allow(dead_code)]
+        fn vector_search_filtered(
+            table: &str,
+            collection: &str,
+            query: &[f32],
+            k: u32,
+            filter: store::Filter,
+        ) -> Result<Vec<$crate::vector::VectorResult>, String> {
+            let results = vector_bindings::search(table, collection, query, &vector_bindings::VectorSearchOptions {
+                k,
+                ef_search: None,
+                filter: Some(filter),
+            })?;
+            Ok(results.into_iter().map(|r| $crate::vector::VectorResult {
+                rowid: r.rowid,
+                distance: r.distance,
+            }).collect())
         }
 
         // -- The Guest impl that wires everything together --
@@ -3311,20 +3394,9 @@ macro_rules! wit_glue {
                         .map(|i| i.principal),
                 );
 
-                // Build the SDK-side JobContext mirror from the WIT context so
-                // handlers can read `ctx.attempts` (the terminal-attempt signal).
-                let sdk_ctx = $crate::JobContext {
-                    job_id: ctx.job_id.clone(),
-                    handler: ctx.handler.clone(),
-                    attempts: ctx.attempts,
-                    not_before_unix_s: ctx.not_before_unix_s,
-                };
-                match <$api_struct as $crate::Api>::build_job_router().dispatch(&sdk_ctx, &payload) {
+                match <$api_struct as $crate::Api>::build_job_router().dispatch(&ctx.handler, &payload) {
                     ::core::result::Result::Ok(bytes) => ::core::result::Result::Ok(bytes),
-                    ::core::result::Result::Err($crate::JobError::Retry(msg)) => ::core::result::Result::Err(
-                        $bindings::exports::boogy::platform::job_handler::HandlerError::Retry(msg),
-                    ),
-                    ::core::result::Result::Err($crate::JobError::Terminal(msg)) => ::core::result::Result::Err(
+                    ::core::result::Result::Err(msg)  => ::core::result::Result::Err(
                         $bindings::exports::boogy::platform::job_handler::HandlerError::Terminal(msg),
                     ),
                 }

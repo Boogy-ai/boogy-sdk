@@ -3,11 +3,9 @@ resolver = "2"
 members = [
     "crates/boogy-wit",
     "crates/boogy-auth-core",
-    "crates/boogy-conventions",
     "crates/boogy-sdk-macros",
     "crates/boogy-sdk",
     "crates/boogy-cli",
-    "crates/boogy-seal",
     "smoke",
 ]
 
@@ -15,7 +13,6 @@ members = [
 wit-bindgen = "0.46"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
 matchit = "0.8"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 garde = { version = "0.22", default-features = false, features = ["derive"] }

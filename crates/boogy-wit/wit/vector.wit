@@ -1,0 +1,36 @@
+interface vector {
+    use store.{filter};
+
+    enum distance-metric {
+        cosine,
+        euclidean,
+        dot-product,
+    }
+
+    record vector-collection-options {
+        dimensions: u32,
+        metric: distance-metric,
+        m: option<u32>,
+        ef-construction: option<u32>,
+    }
+
+    record vector-result {
+        rowid: u64,
+        distance: f32,
+    }
+
+    record vector-search-options {
+        k: u32,
+        ef-search: option<u32>,
+        filter: option<filter>,
+    }
+
+    create-collection: func(table: string, name: string, options: vector-collection-options) -> result<_, string>;
+    drop-collection: func(table: string, name: string) -> result<_, string>;
+    insert: func(table: string, collection: string, rowid: u64, vector: list<f32>) -> result<_, string>;
+    insert-batch: func(table: string, collection: string, entries: list<tuple<u64, list<f32>>>) -> result<_, string>;
+    update: func(table: string, collection: string, rowid: u64, vector: list<f32>) -> result<_, string>;
+    delete: func(table: string, collection: string, rowid: u64) -> result<_, string>;
+    search: func(table: string, collection: string, query: list<f32>, options: vector-search-options) -> result<list<vector-result>, string>;
+    unlock-collection: func(table: string, name: string, key: list<u8>) -> result<_, string>;
+}

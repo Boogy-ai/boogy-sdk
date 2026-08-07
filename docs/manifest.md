@@ -23,7 +23,9 @@ wasm = "target/wasm32-wasip2/release/notes_api.wasm"
 description = "Per-user notes with tagging and full-text search."
 keywords = ["notes", "personal", "storage"]
 category = "productivity"
-owner = "alice"   # optional — the platform sets this to your handle at deploy; normally omit it
+
+[service.owner]
+user_id = "alice"
 
 [routing]
 path = "/api/notes"
@@ -69,13 +71,18 @@ Top-level service identity. All fields in this section are **required** unless m
 | `id` | string | **required** | Stable identifier for this service. ASCII alphanumeric, `-`, `_`; max 64 chars; no leading `-`; no dots or slashes. Used in URLs and on-disk paths. |
 | `name` | string | **required** | Human-readable display name. |
 | `version` | string | **required** | SemVer string (e.g. `"0.2.0"`). Stored with the deployment; not used for routing. |
-| `wasm` | string | optional, `""` | Path to the compiled `.wasm` file, relative to the manifest (typically `target/wasm32-wasip2/release/<crate_name>.wasm`). **Omit it for a frontend-only (`Frontend` shape) deployment** — it runs no wasm. A `Service`/`FullStack` deploy with no wasm *and* no `[frontend]` is rejected ("nothing to deploy"). |
+| `wasm` | string | **required** | Path to the compiled `.wasm` file, relative to the manifest. Typically `target/wasm32-wasip2/release/<crate_name>.wasm`. |
 | `description` | string | optional, `null` | One-paragraph description. Max 2000 chars. |
 | `keywords` | string array | optional, `[]` | Searchable tags. At most 40 entries; each ≤ 64 chars. |
 | `category` | string | optional, `null` | Category tag for grouping. Max 64 chars. |
-| `owner` | string | optional, `""` | The owning user's handle, as a **bare key** (`owner = "alice"`), NOT a `[service.owner]` table. Normally **omit it** — you are authenticated when you deploy, so the platform sets the owner to your handle at publish/provision and overwrites any value here. Keep it only for local-dev/tests that provision under a fixed owner without the auth flow. Same character rules as `service.id`; not a platform-reserved name (`v1`, `healthz`, `_admin`, `_agents`, `_sys`). |
 
-> The `owner` + `id` pair is the unique key for a deployment: deploying the same pair replaces the running service. Since the platform fills `owner` from your authenticated handle, you normally only set `id`.
+### `[service.owner]`
+
+| Field | Type | Required / Default | Meaning |
+|---|---|---|---|
+| `user_id` | string | **required** | Owner's user ID. Same character rules as `service.id`. Must not be a platform-reserved name (`v1`, `healthz`, `_admin`, `_agents`, `_sys`). |
+
+> The combined `owner.user_id` + `id` pair is the unique key for a deployment. Deploying with the same pair replaces the running service.
 
 ---
 
@@ -85,14 +92,14 @@ Both fields are **required**.
 
 | Field | Type | Required / Default | Meaning |
 |---|---|---|---|
-| `path` | string | **required** | URL path prefix your service owns, e.g. `"/api/notes"`. The host resolves the owner from the subdomain (`<handle>.boogy.app`) and internally synthesizes a `/{owner}/{path}` routing key; the `/{owner}` prefix is stripped before your handler sees the URL. Use `"/"` to own the full owner subtree. |
+| `path` | string | **required** | URL path prefix your service owns, e.g. `"/api/notes"`. Requests under `/{owner}/{path}` are dispatched to your service; the `/{owner}` prefix is stripped before your handler sees the URL. Use `"/"` to own the full owner subtree. |
 | `methods` | string array | **required** | HTTP methods to accept: `["GET", "POST"]`. Use `["*"]` to match any method. |
 
 ---
 
 ## `[capabilities]`
 
-The `[capabilities]` section is **optional** — a missing or empty one grants nothing (deny-by-default). Each capability defaults to `false`; a service that doesn't declare a capability gets a host error if its wasm code attempts to use it. (A frontend-only deployment grants none and may omit the section entirely.)
+All capabilities default to `false`. Deny-by-default: a service that doesn't declare a capability will get a host error if its wasm code attempts to use it.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -104,14 +111,13 @@ The `[capabilities]` section is **optional** — a missing or empty one grants n
 | `peer` | bool | `false` | Call other deployed services via `peer::fetch` (in-process, no network hop). |
 | `outbound_http` | bool | `false` | Make HTTPS calls to external URLs. Requires a `[outbound]` block with non-empty `allowed_hosts`. |
 | `background_jobs` | bool | `false` | Enqueue and manage background jobs (`jobs::enqueue` / `jobs::cancel` / `jobs::status`). |
-| `signing` | bool | `false` | Produce cryptographic signatures (ECDSA secp256k1 / P-256, Ed25519) with a private key the host holds and your code never sees — only a public key and the signature come back. |
-| `websockets` | bool | `false` | Publish real-time messages to end-user clients over channels declared in `[[websockets.channels]]`. |
+| `vector` | bool | `false` | Vector search — create collections and run nearest-neighbour queries against the service's store. |
 
 ---
 
 ## `[limits]`
 
-The `[limits]` section is **optional** — a missing or empty one takes the per-field defaults below.
+All fields have defaults; the section itself may be present but empty (`[limits]`).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -119,43 +125,6 @@ The `[limits]` section is **optional** — a missing or empty one takes the per-
 | `timeout_ms` | u64 | `5000` | Legacy wall-clock timeout in ms. |
 | `cpu_deadline_ms` | u64 | `30000` | Per-request wall-clock budget `B_req` in ms. The scheduler uses this as the slot-holding ceiling. Epoch deadline traps a CPU-bound guest; an outer timeout returns HTTP 504. Range: 1–600000. |
 | `storage_mb` | u32 or null | `null` (platform default) | Soft storage quota in MiB. `null` = use the platform default; `0` = unlimited (trusted opt-out). |
-
----
-
-## `[frontend]`
-
-Optional. Declares a web frontend the **platform serves for you** — no
-bundler, no Node, no JS toolchain. You ship TypeScript/JS/HTML/CSS source;
-the control plane transpiles it at deploy and serves the assets from object
-storage, decoupled from your wasm. Presence + whether you publish a wasm
-derives the **deployment shape**:
-
-- `[frontend]` **+ wasm** → **full-stack** (UI + API, one origin).
-- `[frontend]`, **no wasm** → **frontend-only** (a static site / SPA).
-- no `[frontend]` → a plain **service** (wasm only).
-
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `root` | string | **required** | Source dir holding the frontend (e.g. `index.html` + `.ts`/`.css`/assets). Safe relative path — no `..`, no leading `/`. |
-| `api_prefix` | string | — | Full-stack only: requests under this prefix go to the wasm backend; everything else is served as a static asset. Must start with `/`. Omit for a frontend-only deployment. |
-| `index` | string | `"index.html"` | SPA entry document, served for extensionless / fallback routes. |
-| `build` | string | `"ts"` | `"ts"` (platform transpiles TypeScript) or `"none"` (assets are already built). |
-| `private` | bool | `false` | `true` gates asset serving behind the service ingress (a private app). Default public. |
-| `allow_cdn` | bool | `false` | When a bare import isn't vendored under `/vendor/`, resolve it to an `esm.sh` CDN URL in the generated import map instead of failing the build. |
-| `minify` | bool | on when `build = "ts"` | Minify (compact) the transpiled `.ts` → `.js` output at deploy. Defaults on whenever the bundle is transpiled; set `minify = false` to ship readable JS for debugging. Compaction only (whitespace/optional tokens); passthrough `.js` is served verbatim. |
-| `csp` | string | — | Opt-in `Content-Security-Policy`, emitted verbatim on served responses. Unset = no CSP header. A safe baseline (`X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`) is always on. |
-| `frame_options` | string | `"same_origin"` | `same_origin` (→ `SAMEORIGIN`), `deny` (→ `DENY`), or `none` (omit the header, for apps meant to be embedded). |
-
-```toml
-[frontend]
-root = "web"
-api_prefix = "/api"   # full-stack; omit for a frontend-only site
-build = "ts"
-private = false
-```
-
-A frontend-only deployment needs **no `[capabilities]`, `[ingress]`, or data
-model** — it runs no wasm. See the `boogy-serving-frontends` skill.
 
 ---
 
@@ -207,25 +176,6 @@ mode = "authenticated"
 [ingress.delegation]
 allow_actor = ["boogy://alice/services/gateway"]
 max_delegated_scopes = ["notes:*"]
-```
-
-### `[ingress.cors]`
-
-Opt-in, host-enforced cross-origin allowlist. Absent = no CORS headers emitted (default-deny; browsers block cross-origin reads). Only relevant when a **different** origin calls your API — a same-origin full-stack page needs none. The host answers `OPTIONS` preflights at the edge and reflects the allowed origin on actual responses. **CORS is not authorization** — an allowed origin still passes the normal ingress (token) check.
-
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `allowed_origins` | string array | `[]` | Exact origins (`https://app.example.com`), or `["*"]` to allow any — permitted only when `allow_credentials = false`. |
-| `allowed_methods` | string array | `[]` | Methods echoed on preflight. Empty = a safe default set. |
-| `allowed_headers` | string array | `[]` | Request headers echoed on preflight. |
-| `allow_credentials` | bool | `false` | Allow cookie/`Authorization` requests. `true` forbids `allowed_origins = ["*"]` (rejected at deploy). |
-| `max_age` | u64 | — | Preflight cache lifetime in seconds. |
-
-```toml
-[ingress.cors]
-allowed_origins = ["https://app.example.com"]
-allowed_methods = ["GET", "POST"]
-allow_credentials = false
 ```
 
 ---
@@ -330,7 +280,7 @@ If your Wasm component calls `store::*`, `auth::*`, etc. without the correspondi
 
 **Path traversal characters rejected**
 
-`service.id` (and `owner`, if you set it) must be ASCII alphanumeric plus `-` and `_`, max 64 chars, no leading `-`. Characters like `/`, `\`, `.`, `:`, and all Unicode are rejected. The validator also rejects `..` outright, and reserved owner names (`v1`, `healthz`, `_admin`, `_agents`, `_sys`).
+`service.id` and `service.owner.user_id` must be ASCII alphanumeric plus `-` and `_`, max 64 chars, no leading `-`. Characters like `/`, `\`, `.`, `:`, and all Unicode are rejected. The validator also rejects `..` outright, and reserved owner names (`v1`, `healthz`, `_admin`, `_agents`, `_sys`).
 
 **`outbound_http` with empty `allowed_hosts`**
 

@@ -23,7 +23,7 @@ use crate::error::ApiError;
 ///
 /// The `From<StoreError> for ApiError` impl produces the canonical
 /// status mapping (QuotaExceeded → 507, NotFound → 404, Conflict /
-/// ConstraintViolation / VersionMismatch / CommitUnknown → 409, InvalidArgument → 400,
+/// ConstraintViolation / VersionMismatch → 409, InvalidArgument → 400,
 /// Unsupported → 501, Timeout → 504, ResourceExhausted → 503,
 /// Internal → 500), so handler code
 /// can `.map_err` store calls into `ApiError` without thinking about it.
@@ -37,11 +37,6 @@ pub enum StoreError {
     Unsupported(String),
     Timeout(String),
     VersionMismatch(String),
-    /// Ambiguous commit (`commit_unknown_result`): the write MAY or MAY NOT
-    /// have been applied. Maps to HTTP 409, but unlike a clean conflict it is
-    /// NOT safe to blindly retry — reconcile state (query it) first, since a
-    /// retry could double-apply. The message body carries the distinction.
-    CommitUnknown(String),
     /// Transient: a host concurrency cap was hit (e.g. too many open
     /// cross-service transactions). Maps to HTTP 503 — retry shortly.
     ResourceExhausted(String),
@@ -68,7 +63,6 @@ impl std::fmt::Display for StoreError {
             | StoreError::Conflict(m) | StoreError::ConstraintViolation(m)
             | StoreError::InvalidArgument(m) | StoreError::Unsupported(m)
             | StoreError::Timeout(m) | StoreError::VersionMismatch(m)
-            | StoreError::CommitUnknown(m)
             | StoreError::ResourceExhausted(m)
             | StoreError::Internal(m) => write!(f, "{m}"),
         }
@@ -89,9 +83,6 @@ impl From<StoreError> for ApiError {
             StoreError::Unsupported(_)         => ApiError::unsupported(msg),
             StoreError::Timeout(_)             => ApiError::timeout(msg),
             StoreError::VersionMismatch(_)     => ApiError::conflict(msg),
-            // 409, but NOT blindly retryable — the ambiguity is conveyed by the
-            // message body, not a distinct status (see `CommitUnknown` doc).
-            StoreError::CommitUnknown(_)       => ApiError::conflict(msg),
             StoreError::ResourceExhausted(_)   => ApiError::service_unavailable(msg),
             StoreError::Internal(_)            => ApiError::internal(msg),
         }
@@ -228,30 +219,42 @@ impl Table {
         Self { name: name.to_string(), columns: vec![], indices: vec![], access_patterns: vec![], encryption: EncryptionMode::None }
     }
 
-    /// Declare a non-unique index over one or more columns. Index names
-    /// must be globally unique across the API's database.
-    /// `Table::new("posts").text("author").integer("created_at").index("idx_posts_author_created", &["author", "created_at"])`.
-    pub fn index(mut self, name: &str, columns: &[&str]) -> Self {
+    fn push_index(mut self, name: &str, columns: &[&str], unique: bool, covering: bool) -> Self {
         self.indices.push(Index {
             name: name.to_string(),
             columns: columns.iter().map(|s| s.to_string()).collect(),
-            unique: false,
-            covering: false,
+            unique,
+            covering,
         });
         self
+    }
+
+    /// Declare a non-unique index over one or more columns. Schema resolution
+    /// assigns the index its canonical name — you never write one.
+    /// `Table::new("posts").text("author").integer("created_at").index_on(&["author", "created_at"])`.
+    pub fn index_on(self, columns: &[&str]) -> Self {
+        self.push_index("", columns, false, false)
+    }
+
+    /// Declare a non-unique index, passing a name. **The name is ignored**:
+    /// schema resolution assigns every index its canonical name, and a declared
+    /// name that differs is reported as drift at `init_tables` time. Prefer
+    /// [`Table::index_on`].
+    pub fn index(self, name: &str, columns: &[&str]) -> Self {
+        self.push_index(name, columns, false, false)
     }
 
     /// Declare a non-unique **covering** index: its entry stores a copy of the
     /// row, so reads ordered by this index skip the per-row fetch. Faster reads
     /// at the cost of write throughput + storage — use on hot read paths.
-    pub fn covering_index(mut self, name: &str, columns: &[&str]) -> Self {
-        self.indices.push(Index {
-            name: name.to_string(),
-            columns: columns.iter().map(|s| s.to_string()).collect(),
-            unique: false,
-            covering: true,
-        });
-        self
+    pub fn covering_index_on(self, columns: &[&str]) -> Self {
+        self.push_index("", columns, false, true)
+    }
+
+    /// Covering index, passing a name. **The name is ignored** — prefer
+    /// [`Table::covering_index_on`]. See [`Table::index`].
+    pub fn covering_index(self, name: &str, columns: &[&str]) -> Self {
+        self.push_index(name, columns, false, true)
     }
 
     /// Declare: "rows where `filter == v`, ordered by `order`, paginated."
@@ -285,15 +288,15 @@ impl Table {
 
     /// Declare a unique index over one or more columns. Useful for
     /// compound uniqueness (e.g. `(user_id, email)`) that a column-level
-    /// `.unique()` can't express.
-    pub fn unique_index(mut self, name: &str, columns: &[&str]) -> Self {
-        self.indices.push(Index {
-            name: name.to_string(),
-            columns: columns.iter().map(|s| s.to_string()).collect(),
-            unique: true,
-            covering: false,
-        });
-        self
+    /// `.unique()` can't express. Schema resolution names it.
+    pub fn unique_index_on(self, columns: &[&str]) -> Self {
+        self.push_index("", columns, true, false)
+    }
+
+    /// Unique index, passing a name. **The name is ignored** — prefer
+    /// [`Table::unique_index_on`]. See [`Table::index`].
+    pub fn unique_index(self, name: &str, columns: &[&str]) -> Self {
+        self.push_index(name, columns, true, false)
     }
 
     /// Declare the conventional owner column ([`crate::DEFAULT_OWNER_COL`])
@@ -307,30 +310,31 @@ impl Table {
     /// a bare `.text(DEFAULT_OWNER_COL)`) emits the owner index by default so the
     /// ownership-filtered path is index-backed.
     ///
-    /// The index is named `idx_<table>_owner`. Equivalent to:
-    /// `t.text(DEFAULT_OWNER_COL).index("idx_<table>_owner", &[DEFAULT_OWNER_COL])`.
-    /// Idempotent at create time (guarded by `list_indexes`), so adding it to an
-    /// existing API is backward-compatible — the index is created on next
-    /// `init_tables` run and never duplicated.
+    /// Equivalent to `t.text(DEFAULT_OWNER_COL).index_on(&[DEFAULT_OWNER_COL])`;
+    /// the index name is assigned by schema resolution — see
+    /// [`Table::owner_index_name`]. Idempotent at create time (guarded by
+    /// `list_indexes`), so adding it to an existing API is backward-compatible —
+    /// the index is created on next `init_tables` run and never duplicated.
     pub fn owned(self) -> Self {
         let col = crate::DEFAULT_OWNER_COL;
-        let idx = Self::owner_index_name(&self.name);
-        self.text(col).index(&idx, &[col])
+        self.text(col).index_on(&[col])
     }
 
     /// Declare a custom owner column AND its index (for tables that don't use the
-    /// conventional [`crate::DEFAULT_OWNER_COL`] name). Index name is
-    /// `idx_<table>_<owner_col>`.
+    /// conventional [`crate::DEFAULT_OWNER_COL`] name). Schema resolution names
+    /// the index.
     pub fn owned_by(self, owner_col: &str) -> Self {
-        let idx = format!("idx_{}_{}", self.name, owner_col);
-        self.text(owner_col).index(&idx, &[owner_col])
+        self.text(owner_col).index_on(&[owner_col])
     }
 
-    /// The conventional owner-index name for a table (`idx_<table>_owner`).
-    /// Exposed so a migration can `create_index` the same index on a
-    /// pre-existing table that predates [`Table::owned`].
+    /// The name the store gives the owner index declared by [`Table::owned`].
+    ///
+    /// This is the *resolved* name, i.e. exactly what `list_indexes` reports —
+    /// so a migration adding the index to a pre-existing table that predates
+    /// [`Table::owned`] creates the same index rather than a duplicate under a
+    /// second name.
     pub fn owner_index_name(table: &str) -> String {
-        format!("idx_{table}_owner")
+        crate::schema_resolve::index_name(table, &[crate::DEFAULT_OWNER_COL.to_string()])
     }
 
     /// Mark this table for platform-managed encryption at rest (create-time only).
@@ -722,7 +726,6 @@ mod tests {
             (StoreError::Unsupported("x".into()), 501),
             (StoreError::Timeout("x".into()), 504),
             (StoreError::VersionMismatch("x".into()), 409),
-            (StoreError::CommitUnknown("x".into()), 409),
             (StoreError::ResourceExhausted("x".into()), 503),
             (StoreError::Internal("x".into()), 500),
         ];
@@ -740,26 +743,31 @@ mod tests {
             t.columns.iter().any(|c| c.name == crate::DEFAULT_OWNER_COL),
             "owned() must add the DEFAULT_OWNER_COL column",
         );
-        // ...and an index over exactly that column, with the conventional name.
-        let idx = t
-            .indices
+        // ...and an index over exactly that column, declared without a name
+        // (resolution assigns it) so nothing can drift from the real one.
+        let (resolved, diags) = t.resolved_indices();
+        assert!(diags.is_empty(), "owned() must not warn about its own index name: {diags:?}");
+        let idx = resolved
             .iter()
-            .find(|i| i.name == "idx_notes_owner")
-            .expect("owned() must declare idx_<table>_owner");
-        assert_eq!(idx.columns, vec![crate::DEFAULT_OWNER_COL.to_string()]);
+            .find(|i| i.columns == vec![crate::DEFAULT_OWNER_COL.to_string()])
+            .expect("owned() must declare an owner index");
         assert!(!idx.unique, "owner index is non-unique (many rows per owner)");
-        assert_eq!(Table::owner_index_name("notes"), "idx_notes_owner");
+        // The advertised helper name is the name the store actually creates —
+        // a migration following it adds the same index, not a duplicate.
+        assert_eq!(Table::owner_index_name("notes"), idx.name);
+        assert_eq!(idx.name, "ix_notes_owner_principal");
     }
 
     #[test]
     fn owned_by_uses_custom_owner_column_and_index_name() {
         let t = Table::new("posts").text("body").owned_by("author_id");
         assert!(t.columns.iter().any(|c| c.name == "author_id"));
-        let idx = t
-            .indices
+        let (resolved, diags) = t.resolved_indices();
+        assert!(diags.is_empty(), "owned_by() must not warn about its own index name: {diags:?}");
+        let idx = resolved
             .iter()
-            .find(|i| i.name == "idx_posts_author_id")
-            .expect("owned_by() must declare idx_<table>_<col>");
+            .find(|i| i.name == "ix_posts_author_id")
+            .expect("owned_by() must declare an index on the custom owner column");
         assert_eq!(idx.columns, vec!["author_id".to_string()]);
     }
 
@@ -804,9 +812,21 @@ mod table_verbs_tests {
     fn explicit_and_pattern_indexes_coexist() {
         let t = Table::new("posts").integer("created_at")
             .ranked_by(newest("created_at"))
-            .index("hand_idx", &["created_at"]); // explicit on same tuple → merged covering
-        let (idx, _) = t.resolved_indices();
+            .index_on(&["created_at"]); // explicit on same tuple → merged covering
+        let (idx, diags) = t.resolved_indices();
         assert_eq!(idx.len(), 1);
         assert!(idx[0].covering);
+        assert!(diags.is_empty(), "nameless explicit index must not warn: {diags:?}");
+    }
+
+    // The drift warning is for names the AUTHOR typed: `.index(name, …)` with a
+    // name that can never be the resolved one still reports, so a migration or
+    // cursor hint keyed on it is caught rather than silently wrong.
+    #[test]
+    fn named_explicit_index_still_warns() {
+        let t = Table::new("posts").integer("created_at").index("hand_idx", &["created_at"]);
+        let (_, diags) = t.resolved_indices();
+        assert_eq!(diags.len(), 1, "expected the drift warning: {diags:?}");
+        assert!(diags[0].message().contains("hand_idx"));
     }
 }
