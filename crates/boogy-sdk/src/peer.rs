@@ -7,6 +7,12 @@
 //! call sites look like:
 //!
 //! ```ignore
+//! use boogy_sdk::peer::PeerRequest;
+//!
+//! // The callee's wire shape, as your crate models it.
+//! #[derive(Deserialize)]
+//! struct Note { id: u64, title: String }
+//!
 //! let resp = peer_fetch(
 //!     "boogy://daniel/services/notes-api",
 //!     &PeerRequest::get("/api/notes"),

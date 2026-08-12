@@ -1,0 +1,5 @@
+error: #[pk] takes no arguments — write a bare `#[pk]`.
+ --> tests/ui/marker_pk_argument.rs:7:5
+  |
+7 |     #[pk(auto)]
+  |     ^^^^^^^^^^^

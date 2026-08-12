@@ -1,0 +1,5 @@
+error: `ranked_by` names column `hits`, which this model does not declare (did you mean the stored name `hit_count`?). An index would be built over a column that does not exist.
+  --> tests/ui/counter_renamed_ranked.rs:13:12
+   |
+13 | pub struct T {
+   |            ^

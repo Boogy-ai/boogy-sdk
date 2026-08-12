@@ -5,6 +5,7 @@ edition = "2021"
 description = "Format-level auth primitives shared by the Boogy SDK and platform: API-key format/generation/hashing/verification and the common auth error type."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Boogy-ai/boogy-sdk"
+homepage = "https://boogy.ai"
 
 [dependencies]
 # All wasm32-wasip2-clean. Versions match the pins boogy-auth used for

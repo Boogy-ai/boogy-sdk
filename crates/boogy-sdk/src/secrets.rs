@@ -22,13 +22,19 @@
 //! ```ignore
 //! // Inside a webhook handler, after reconstructing the signed payload
 //! // exactly as the provider signed it:
-//! let ok = secrets_verify_hmac_sha256(
-//!     "stripe_webhook_secret",
-//!     &signed_message,
-//!     &expected_hex,
-//! )?;
-//! if !ok {
-//!     return Err(ApiError::unauthorized("bad signature"));
+//! fn verify(signed_message: &[u8], expected_hex: &str) -> Result<(), ApiError> {
+//!     // `VerifyError` does not convert into `ApiError` — map it.
+//!     let ok = secrets_verify_hmac_sha256(
+//!         "stripe_webhook_secret",
+//!         signed_message,
+//!         expected_hex,
+//!     )
+//!     .map_err(|e| ApiError::internal(e.to_string()))?;
+//!     if !ok {
+//!         // 401 is `unauthenticated()` — there is no `ApiError::unauthorized`.
+//!         return Err(ApiError::unauthenticated());
+//!     }
+//!     Ok(())
 //! }
 //! ```
 //!

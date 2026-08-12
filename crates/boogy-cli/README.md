@@ -47,6 +47,19 @@ Login flows live in the host's `/_agents/*` surface; the CLI doesn't currently b
 
 Every deployed service has a `boogy.toml` next to its wasm crate. The manifest schema covers routing, capabilities, ingress modes (including delegation), outbound HTTP (`[outbound]` + `[secrets]`), and resource limits — see the Boogy documentation for the authoritative field reference.
 
+## Frontends
+
+A deployment can ship a **web frontend** alongside (or instead of) its wasm. When the manifest has a `[frontend]` section, `boogy deploy` / `boogy publish` tarball the `[frontend].root` source directory and upload it with the publish — you ship the **source** (`.ts`/`.js`/`.html`/`.css`/assets), and the platform transpiles TypeScript to JavaScript at deploy time, so **no JS build step runs in the CLI**.
+
+```toml
+[frontend]
+root       = "web"          # source dir to tarball + upload
+api_prefix = "/api"         # requests under it → wasm (omit → static frontend only)
+build      = "ts"           # "ts" (platform transpiles) | "none" (pre-built JS)
+```
+
+A manifest with a `[frontend]` section and no `service.wasm` is a static (frontend-only) deployment; with both, it's full-stack. A manifest with neither a wasm nor a `[frontend]` is rejected — there is nothing to deploy.
+
 ## Codegen
 
 Spec → wasm scaffolding lives in the Boogy codegen service, not this CLI. The CLI invokes that service for `boogy scaffold` (when configured); pure local builds use `cargo build --target wasm32-wasip2`.

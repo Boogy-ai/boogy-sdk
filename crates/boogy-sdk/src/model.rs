@@ -16,6 +16,13 @@ pub trait Field: Sized {
     /// The stored column's type.
     fn col_type() -> ColType;
     /// Whether the column is nullable. Only `Option<T>` overrides this.
+    ///
+    /// `false` means the store rejects an **explicitly supplied** null for the
+    /// column. It does not mean every row carries a value: a write that omits
+    /// the column is still accepted, and reads resolve it to the column's
+    /// default, or null if it has none. See [`ColumnSpec::not_null`].
+    ///
+    /// [`ColumnSpec::not_null`]: crate::store::ColumnSpec::not_null
     fn nullable() -> bool {
         false
     }
@@ -163,13 +170,20 @@ pub trait Model: Sized {
 // Helper so the derive can build a ColDef without knowing the field's
 // concrete type at macro time — it calls this with the type's Field impl.
 #[doc(hidden)]
-pub fn col_def_for<T: Field>(name: &str, unique: bool) -> ColDef {
+pub fn col_def_for<T: Field>(
+    name: &str,
+    unique: bool,
+    counter: bool,
+    default: Option<Val>,
+) -> ColDef {
     ColDef {
         name: name.to_string(),
         col_type: T::col_type(),
         nullable: T::nullable(),
         unique,
         references: None,
+        counter,
+        default,
     }
 }
 

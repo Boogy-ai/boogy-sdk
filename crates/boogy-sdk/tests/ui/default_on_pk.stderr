@@ -1,0 +1,5 @@
+error: #[default] cannot be applied to the #[pk] field — the primary key is assigned by the store, so a default for it would never be used
+ --> tests/ui/default_on_pk.rs:9:9
+  |
+9 |     pub id: Id<T>,
+  |         ^^

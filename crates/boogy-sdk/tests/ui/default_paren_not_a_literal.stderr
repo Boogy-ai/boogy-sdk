@@ -1,0 +1,5 @@
+error: #[default] needs a LITERAL value — expressions, consts and function calls are not evaluated by the derive and there are no expression defaults in the store. Supported literals: string (`= "pending"`), integer (`= 0`), float (`= 1.5`), boolean (`= true`), byte string (`= b"\x00"`). A NEGATIVE number must use the parenthesized form — `#[default(-1)]` — because rustc rejects a non-literal on the right of `=` in any attribute.
+ --> tests/ui/default_paren_not_a_literal.rs:9:15
+  |
+9 |     #[default(value = "pending")]
+  |               ^^^^^^^^^^^^^^^^^

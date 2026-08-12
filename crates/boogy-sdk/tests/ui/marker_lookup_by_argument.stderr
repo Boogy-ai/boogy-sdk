@@ -1,0 +1,5 @@
+error: #[lookup_by] takes no arguments — write a bare `#[lookup_by]`. It is always a UNIQUE single-column point lookup; there is nothing to configure.
+ --> tests/ui/marker_lookup_by_argument.rs:9:5
+  |
+9 |     #[lookup_by(unique = false)]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

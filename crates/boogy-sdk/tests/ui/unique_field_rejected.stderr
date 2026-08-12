@@ -1,0 +1,7 @@
+error: #[unique] is not supported: it enforces nothing. The derive set a column flag the store never reads, so duplicate values were accepted silently by a model that declared they could not be. A uniqueness constraint is enforced by an INDEX, so declare one:
+         - single column: replace #[unique] with #[lookup_by] on this field (a UNIQUE single-column index, and the point lookup that goes with it)
+         - composite: drop #[unique] and declare #[model(unique_index(name = "...", cols = ["a", "b"]))] on the struct
+  --> tests/ui/unique_field_rejected.rs:20:5
+   |
+20 |     #[unique]
+   |     ^^^^^^^^^

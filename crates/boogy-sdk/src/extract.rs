@@ -141,7 +141,14 @@ impl<T: DeserializeOwned + schemars::JsonSchema> FromRequest for Query<T> {
 /// This means `Json<T>` plays both roles — extractor AND response wrapper —
 /// the same type, no import conflict:
 /// ```ignore
-/// fn create(Json(body): Json<CreateReq>) -> Result<Json<CreateResp>, ApiError> { … }
+/// #[derive(Deserialize, schemars::JsonSchema)]
+/// struct CreateReq { title: String }
+/// #[derive(Serialize, schemars::JsonSchema)]
+/// struct CreateResp { id: u64 }
+///
+/// fn create(Json(body): Json<CreateReq>) -> Result<Json<CreateResp>, ApiError> {
+///     Ok(Json(CreateResp { id: 1 }))
+/// }
 /// ```
 ///
 /// Implements [`FromRequest::describe`] to capture the request-body schema

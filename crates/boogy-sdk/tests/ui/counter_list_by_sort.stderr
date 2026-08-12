@@ -1,0 +1,5 @@
+error: #[counter] column `hits` is used by `list_by sort column`, which is backed by an index, and a counter column cannot back one. Scope the ranking to a bounded sub-range and sort in memory, or materialize it into a plain column refreshed by a background job.
+  --> tests/ui/counter_list_by_sort.rs:12:9
+   |
+12 |     pub hits: i64,
+   |         ^^^^

@@ -1,0 +1,5 @@
+error: #[counter] column `hits` is used by index `by_hits`: a counter column cannot back an index, because an atomic add never reads the previous value and the old entry could never be removed.
+  --> tests/ui/counter_struct_index.rs:10:9
+   |
+10 |     pub hits: i64,
+   |         ^^^^

@@ -50,6 +50,7 @@
 //!             column: "_id".into(),
 //!             op: store::FilterOp::Gt,
 //!             val: store::Value::Text(c.last_id),
+//!             in_values: None,
 //!         });
 //!     }
 //!
@@ -62,13 +63,16 @@
 //!             dir: store::SortDir::Asc,
 //!         }],
 //!         page: Some(store::Page { limit: (q.limit + 1) as u32, offset: 0 }),
+//!         or_groups: vec![],
+//!         allow_full_scan: false,
+//!         skip_total: true,
 //!     })
 //!     .map_err(ApiError::internal)?;
 //!
 //!     let rows: Vec<json::Value> = result.rows.iter()
 //!         .map(|r| to_sdk_row(r).to_json(&["title"])).collect();
 //!     let page = CursorPage::from_overfetched(rows, q.limit, |row| {
-//!         Cursor::id_only(row.get("id").and_then(|v| v.as_str()).unwrap_or("").into())
+//!         Cursor::id_only(row.get("id").and_then(|v| v.as_str()).unwrap_or(""))
 //!     });
 //!     Ok(Json(page))
 //! }

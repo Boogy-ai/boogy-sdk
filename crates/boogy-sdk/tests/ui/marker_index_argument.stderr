@@ -1,0 +1,5 @@
+error: #[index] takes no arguments — write a bare `#[index]`. A multi-column index is declared on the STRUCT, as #[model(index(cols = ["a", "b"]))] — prefer an access-pattern verb (list_by / ranked_by / lookup_by), which derives it for you.
+  --> tests/ui/marker_index_argument.rs:12:5
+   |
+12 |     #[index(cols = ["room", "at"])]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -2,33 +2,13 @@ package boogy:platform@0.1.0;
 
 /// Outbound HTTP from a wasm API to an arbitrary URL.
 ///
-/// Every call is mediated by the host. The policy chain, in order:
-///
-/// 1. **Capability gate** — `[capabilities] outbound_http = true`.
-/// 2. **Secret resolution** — `secret-headers` refs are checked
-///    against the manifest's `[secrets]` block and resolved to
-///    values the component never sees.
-/// 3. **Egress rate cap** — one token per call (`[outbound.rate_limit]`,
-///    or the platform default when the manifest declares none).
-/// 4. **Method / header / body validation** and request-size cap.
-/// 5. **Per-hop URL policy** — scheme check, plaintext gate, host
-///    allowlist, DNS resolution, SSRF/IP firewall (RFC1918, loopback,
-///    link-local, CGNAT, multicast, `::1`, `fc00::/7`, … default-deny),
-///    then **DNS pinning**: the firewall-approved addresses are pinned
-///    for the connect, so nothing can be re-resolved onto a different
-///    IP between check-time and connect-time (DNS rebinding).
-/// 6. **Send**, following up to 5 redirects. Every hop re-runs step 5
-///    in full — a `Location` never escapes the allowlist or the
-///    firewall. Cross-origin hops drop `Authorization`, `Cookie`,
-///    `Proxy-Authorization`, and every injected secret header.
-/// 7. **Response read** with a hard body cap.
-///
-/// Secret header injection happens at the wire edge, after all of the
-/// above: values are resolved from the deployment's bound secrets and
-/// written as the highest-precedence header layer. The wasm component
-/// only ever names a secret; it never receives the value.
-///
-/// Every call — success or failure — emits one usage/telemetry event.
+/// Every call is mediated by the host: capability gate, egress
+/// allowlist, SSRF firewall (RFC1918 / loopback / link-local
+/// default-deny), body-size + timeout caps, secret injection
+/// (`secret-headers` are resolved and injected host-side via credops —
+/// the wasm never sees the plaintext), telemetry. See
+/// [`docs/outbound-http-design.md`](../../../docs/outbound-http-design.md)
+/// and [`docs/data-protection.md`](../../../docs/data-protection.md).
 ///
 /// Distinct from `peer` so each capability surface can grow its own
 /// shape without coupling. Conceptually: peer is "fetch but to a
@@ -37,7 +17,8 @@ package boogy:platform@0.1.0;
 interface outbound-http {
     record outbound-request {
         /// HTTP method. Validated against RFC 7230 token rules at
-        /// the host edge; invalid characters return `internal`.
+        /// the host edge; invalid characters return
+        /// `internal("invalid method")`.
         method: string,
         /// Full URL including scheme. Only `http` and `https` are
         /// accepted; other schemes return `invalid-url`. URL length
@@ -47,44 +28,28 @@ interface outbound-http {
         /// cookie, x-boogy-caller, x-boogy-workload,
         /// x-boogy-request-id, host) are stripped. Header names
         /// and values are validated against HTTP token / value rules;
-        /// CRLF in either is rejected with `internal`.
-        ///
-        /// The host fills `user-agent`, `x-boogy-workload`, and
-        /// `x-boogy-request-id` only when the component left the slot
-        /// empty. `authorization` is set through `secret-headers`,
-        /// never here.
+        /// CRLF in either is rejected.
         headers: list<tuple<string, string>>,
-        /// Optional request body. Body plus serialised headers are
-        /// capped at the manifest's `max_request_bytes`; over-cap
-        /// returns `request-too-large`.
-        ///
-        /// On a redirect the body is preserved for 307/308, and
-        /// dropped (with the method rewritten to GET) for 303 and for
-        /// 301/302 after an unsafe method.
+        /// Optional request body. Capped at the manifest's
+        /// `max_request_bytes`; over-cap returns
+        /// `request-too-large`.
         body: option<list<u8>>,
         /// Per-call timeout in milliseconds. Capped by the manifest's
         /// `max_timeout_ms`; values larger than that ceiling are
         /// silently clamped to the ceiling. None → use manifest
-        /// `default_timeout_ms`. The effective timeout is further
-        /// bounded by the request's own remaining time budget, so an
-        /// outbound call can never outlive the request that made it.
+        /// `default_timeout_ms`.
         timeout-ms: option<u32>,
         /// Manifest-declared secret references to inject as headers
-        /// just before the request goes on the wire. Each tuple is
-        /// `(header-name, secret-ref)` where `secret-ref` is a name
-        /// declared in the manifest's `[secrets]` block.
+        /// just before the request goes on the wire. The wasm
+        /// component never sees the secret value. Each tuple is
+        /// `(header-name, secret-ref)` where `secret-ref` is the
+        /// name declared in the manifest's `[secrets]` block.
         ///
-        /// The host validates the ref against that declaration and
-        /// its permitted usage, resolves the value, and injects it at
-        /// the wire edge as the highest-precedence header layer —
-        /// overwriting anything the component or the host put in the
-        /// same slot. The component never sees the value. Undeclared,
-        /// unbound, or unresolvable refs fail closed as
+        /// The host validates the ref against the manifest's
+        /// `[secrets]` declaration + usage, resolves the value, and
+        /// injects it at the wire edge — the component never sees it.
+        /// Undeclared, unbound, or unresolvable refs fail closed as
         /// `unknown-secret(<ref>)`.
-        ///
-        /// Injected secret headers are stripped before any
-        /// cross-origin redirect hop, so a secret bound for one
-        /// destination cannot be replayed to another.
         secret-headers: list<tuple<string, string>>,
     }
 
@@ -100,27 +65,18 @@ interface outbound-http {
     /// `Ok(outbound-response { status: 4xx, .. })`. This variant
     /// covers transport-level outcomes only.
     variant fetch-error {
-        /// The call is not permitted at all: the caller's manifest
-        /// does not grant the `outbound_http` capability, or the call
-        /// was made inside an open transaction (an outbound call is
-        /// not rollback-able, so it is refused there), or the
-        /// request already used up its outbound-call budget.
+        /// Caller's manifest does not grant the `outbound_http`
+        /// capability.
         capability-denied,
         /// URL didn't parse as an absolute http(s) URL, or exceeded
         /// the 8 KiB hard length cap.
         invalid-url(string),
-        /// Manifest egress allowlist (`[outbound] allowed_hosts`) did
-        /// not admit the host. Re-checked on every redirect hop.
+        /// Manifest egress allowlist did not admit the host.
         host-not-allowed(string),
-        /// A resolved IP fell into a blocked range (RFC1918,
-        /// loopback, link-local, CGNAT, multicast, ::1, fc00::/7,
-        /// etc.), or the host resolved to no addresses at all. Strict:
-        /// one blocked address denies the whole call. Re-checked on
-        /// every redirect hop.
-        ///
-        /// `[outbound.allow_loopback] enabled = true` relaxes this for
-        /// loopback only (127.0.0.0/8 and ::1) — every other blocked
-        /// range stays blocked.
+        /// Resolved IP fell into a blocked range (RFC1918, loopback,
+        /// link-local, multicast, ::1, fc00::/7, etc.) and the
+        /// manifest did not opt out of the SSRF firewall via
+        /// `[outbound.allow_loopback] enabled = true`.
         blocked-address(string),
         /// HTTPS-only enforcement: scheme was http:// without
         /// `[outbound] allow_plaintext = true`.
@@ -134,27 +90,19 @@ interface outbound-http {
         /// Response body exceeded `[outbound] max_response_bytes`
         /// before the stream completed.
         response-too-large(string),
-        /// Per-service egress rate cap exceeded. The effective cap is
-        /// the manifest's `[outbound.rate_limit]` when declared, and
-        /// otherwise a platform default. One token per call,
-        /// regardless of how many redirect hops it takes.
+        /// Per-API rate cap exceeded (manifest
+        /// `[outbound.rate_limit]`).
         rate-limited,
         /// Request body, header set, or URL exceeded the manifest's
         /// `max_request_bytes` / hard URL length / hard header
         /// total. The string identifies which limit was hit.
         request-too-large(string),
-        /// Caller referenced a secret name that is not declared in
-        /// the manifest's `[secrets]` block, is not permitted for
-        /// outbound-header use, or has no value bound for this
-        /// deployment. Backend-side resolution failures collapse into
-        /// this variant too — the distinction is deliberately not
-        /// exposed to the component, and lives in host telemetry.
+        /// Caller referenced a secret name not declared in the
+        /// manifest's `[secrets]` block, or the named secret has no
+        /// value bound for this deployment.
         unknown-secret(string),
-        /// Internal host error. Also covers input the host rejects
-        /// without a dedicated variant: an invalid method, an invalid
-        /// header name or value, a redirect chain longer than 5 hops,
-        /// and non-standard 3xx statuses (which are not followed).
-        /// String for human consumption only.
+        /// Internal host error (TLS error not covered above, panic,
+        /// pool exhausted, etc.). String for human consumption only.
         internal(string),
     }
 

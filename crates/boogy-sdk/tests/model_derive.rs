@@ -123,81 +123,64 @@ fn mixed_verbs_all_survive_and_resolve() {
     );
 }
 
-// --- Index-name drift: the warning must be a real signal ---------------------
-//
-// The resolver canonicalizes every index name to `ix_<table>_<cols>` and WARNS
-// when a *declared* name differs. That warning only carries information if the
-// derive itself never declares a name — otherwise every `#[index]` field trips
-// it and the signal is 100% false positives.
+// ---------------------------------------------------------------------------
+// #[default = ...] — the declaration surface for a column default
+// ---------------------------------------------------------------------------
 
-/// A model that declares indexes only through the derive: field-level
-/// `#[index]` / `#[covering_index]`, a nameless struct-level composite, and the
-/// access-pattern verbs. The author typed no index name anywhere, so resolution
-/// must be silent.
 #[derive(ModelDerive)]
-#[model(
-    table = "quiet",
-    index(cols = ["room_id", "created_at"]),
-    covering_index(cols = ["owner_principal", "created_at"]),
-    ranked_by(highest = "score")
-)]
-struct Quiet {
+#[model(table = "orders")]
+struct Order {
     #[pk]
-    id: Id<Quiet>,
-    #[lookup_by]
-    slug: String,
-    #[index]
-    room_id: String,
-    #[covering_index]
-    owner_principal: String,
-    score: i64,
-    created_at: i64,
+    id: Id<Order>,
+    #[default = "pending"]
+    status: String,
+    #[default = 0]
+    retries: i64,
+    #[default(-1)]
+    offset: i64,
+    #[default = 1.5]
+    weight: f64,
+    #[default = true]
+    active: bool,
+    // No default — the negative control lives on the same model, so a derive
+    // that attached one to every column cannot pass the asserts below.
+    note: String,
 }
 
-/// The same shape, but with a hand-typed index name that can never match the
-/// canonical form. THIS is what the warning exists to catch.
-#[derive(ModelDerive)]
-#[model(table = "noisy", index(name = "by_room", cols = ["room_id", "created_at"]))]
-struct Noisy {
-    #[pk]
-    id: Id<Noisy>,
-    room_id: String,
-    created_at: i64,
-}
-
+/// The derive must put the declared literal on the `ColDef`, with the right
+/// `Val` arm for each literal kind.
+///
+/// One case per kind because the mapping is per-kind: a derive that emitted
+/// `Val::Text` for everything would satisfy a test that only checked `status`.
 #[test]
-fn derive_only_model_emits_no_diagnostics() {
-    let (indexes, diags) = Quiet::schema().resolved_indices();
-    assert!(
-        diags.is_empty(),
-        "a model whose index names are all derive-assigned must resolve silently, got: {diags:?}"
-    );
-    // ...and the physical index set is unchanged by dropping the fictional names.
-    let mut names: Vec<&str> = indexes.iter().map(|i| i.name.as_str()).collect();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        vec![
-            "ix_quiet_owner_principal",
-            "ix_quiet_owner_principal_created_at",
-            "ix_quiet_room_id",
-            "ix_quiet_room_id_created_at",
-            "ix_quiet_score",
-            "ix_quiet_slug",
-        ]
-    );
+fn the_default_attribute_lands_on_the_col_def() {
+    use boogy_sdk::store::Val;
+
+    let schema = Order::schema();
+    let get = |name: &str| {
+        schema
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("column {name} missing from the derived schema"))
+            .default
+            .clone()
+    };
+
+    assert_eq!(get("status"), Some(Val::Text("pending".into())));
+    assert_eq!(get("retries"), Some(Val::Integer(0)));
+    assert_eq!(get("offset"), Some(Val::Integer(-1)), "the parenthesized negative form");
+    assert_eq!(get("weight"), Some(Val::Real(1.5)));
+    assert_eq!(get("active"), Some(Val::Boolean(true)));
 }
 
+/// Negative control: a field with no `#[default]` must carry none.
+///
+/// Without this, a derive that defaulted every column (to the type's zero value,
+/// say) would satisfy every assertion above.
 #[test]
-fn hand_declared_non_canonical_name_still_warns() {
-    let (indexes, diags) = Noisy::schema().resolved_indices();
-    assert_eq!(diags.len(), 1, "expected exactly one drift warning, got {diags:?}");
-    let m = diags[0].message();
-    assert!(m.contains("by_room"), "warning names the declared name: {m}");
-    assert!(
-        m.contains("ix_noisy_room_id_created_at"),
-        "warning names the canonical name: {m}"
-    );
-    // The index itself is created either way, under the canonical name.
-    assert!(indexes.iter().any(|i| i.name == "ix_noisy_room_id_created_at"));
+fn a_field_without_the_attribute_carries_no_default() {
+    let schema = Order::schema();
+    let note = schema.columns.iter().find(|c| c.name == "note").expect("note column");
+    assert_eq!(note.default, None, "an undeclared column must have no default");
 }

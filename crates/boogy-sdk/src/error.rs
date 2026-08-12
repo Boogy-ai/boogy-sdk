@@ -32,19 +32,37 @@
 //!
 //! From a `garde::Report`:
 //! ```ignore
-//! match input.validate() {
-//!     Ok(()) => {}
-//!     Err(report) => return ApiError::validation(report).into(),
+//! use garde::Validate as _;   // brings `.validate()` into scope
+//!
+//! #[derive(Deserialize, garde::Validate)]
+//! struct CreateNote { #[garde(length(min = 1, max = 200))] title: String }
+//!
+//! fn create_note(req: &mut Req<'_>) -> response::HttpResponse {
+//!     let input: CreateNote = match parse_body(req.body()) {
+//!         Ok(v) => v,
+//!         Err(e) => return e.into(),
+//!     };
+//!     match input.validate() {
+//!         Ok(()) => {}
+//!         Err(report) => return ApiError::validation(report).into(),
+//!     }
+//!     response::no_content()
 //! }
 //! ```
 //!
 //! Or use the [`validate_body`] helper which combines JSON parsing +
 //! validation in one call:
 //! ```ignore
-//! let input: CreateNote = match validate_body(req.body()) {
-//!     Ok(v) => v,
-//!     Err(e) => return e.into(),
-//! };
+//! #[derive(Deserialize, garde::Validate)]
+//! struct CreateNote { #[garde(length(min = 1, max = 200))] title: String }
+//!
+//! fn create_note(req: &mut Req<'_>) -> response::HttpResponse {
+//!     let input: CreateNote = match validate_body(req.body()) {
+//!         Ok(v) => v,
+//!         Err(e) => return e.into(),
+//!     };
+//!     response::no_content()
+//! }
 //! ```
 
 use std::collections::BTreeMap;
@@ -221,7 +239,12 @@ impl ApiError {
         }
     }
 
-    /// 409 Conflict — a foreign-key / check / not-null constraint was violated.
+    /// 409 Conflict — a constraint was violated: a unique index, a foreign key,
+    /// a check, a not-null, or an "already exists" schema change.
+    ///
+    /// Distinct from [`ApiError::conflict`] despite the shared status. This one
+    /// is deterministic — the same request fails the same way every time — so a
+    /// caller must change the request (pick a different value), not repeat it.
     pub fn constraint_violation(msg: impl Into<String>) -> Self {
         Self {
             kind: "/errors/constraint_violation".to_string(),
@@ -256,9 +279,13 @@ impl ApiError {
 
     /// 503 Service Unavailable — a transient host concurrency cap was hit
     /// (e.g. too many open cross-service transactions). The caller should
-    /// retry shortly; the message carries a `Retry-After`-style hint so it
-    /// survives the trip to the client even though `ApiError` carries no
-    /// header bag of its own.
+    /// retry shortly.
+    ///
+    /// NOTE: the `(Retry-After: 1)` suffix appended to `detail` below is
+    /// **body text, not an HTTP header** — `ApiError` carries no header bag, so
+    /// there is nowhere to put a real one. A client parsing headers will not
+    /// find `Retry-After` on this response. Do not document this as sending the
+    /// header; it is a human-readable hint inside the problem+json `detail`.
     pub fn service_unavailable(msg: impl Into<String>) -> Self {
         Self {
             kind: "/errors/service_unavailable".to_string(),
@@ -442,10 +469,16 @@ impl From<serde_json::Error> for ApiError {
 /// Pair with `?` and `Into<HttpResponse>`/`Into<RpcError>`:
 ///
 /// ```ignore
-/// let input: CreateNote = match validate_body(req.body()) {
-///     Ok(v) => v,
-///     Err(e) => return e.into(),
-/// };
+/// #[derive(Deserialize, garde::Validate)]
+/// struct CreateNote { #[garde(length(min = 1, max = 200))] title: String }
+///
+/// fn create_note(req: &mut Req<'_>) -> response::HttpResponse {
+///     let input: CreateNote = match validate_body(req.body()) {
+///         Ok(v) => v,
+///         Err(e) => return e.into(),
+///     };
+///     response::no_content()
+/// }
 /// ```
 pub fn validate_body<T>(body: Option<&[u8]>) -> Result<T, ApiError>
 where
@@ -468,10 +501,16 @@ where
 /// - Otherwise → `Ok(parsed)`
 ///
 /// ```ignore
-/// let input: CreateLink = match parse_body(req.body()) {
-///     Ok(v) => v,
-///     Err(e) => return e.into(),
-/// };
+/// #[derive(Deserialize)]
+/// struct CreateLink { target: String }
+///
+/// fn create_link(req: &mut Req<'_>) -> response::HttpResponse {
+///     let input: CreateLink = match parse_body(req.body()) {
+///         Ok(v) => v,
+///         Err(e) => return e.into(),
+///     };
+///     response::no_content()
+/// }
 /// ```
 pub fn parse_body<T>(body: Option<&[u8]>) -> Result<T, ApiError>
 where

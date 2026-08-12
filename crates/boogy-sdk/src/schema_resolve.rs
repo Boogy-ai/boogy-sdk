@@ -33,9 +33,8 @@ struct Req {
 }
 
 /// Stable, deterministic index name from the table + column tuple:
-/// `ix_<table>_<col1>_<col2>...`. This is the ONLY source of index names —
-/// declarations never carry one that survives resolution.
-pub(crate) fn index_name(table: &str, columns: &[String]) -> String {
+/// `ix_<table>_<col1>_<col2>...`.
+fn index_name(table: &str, columns: &[String]) -> String {
     let mut s = format!("ix_{table}");
     for c in columns { s.push('_'); s.push_str(c); }
     s

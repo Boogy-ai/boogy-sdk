@@ -8,8 +8,9 @@
 //!     .get("/api/todos/{id}", get_todo)
 //!     .delete("/api/todos/{id}", delete_todo)
 //!     .get("/files/{*path}", serve_file)         // catch-all path param
-//!     .route(&["GET", "POST"], "/api/sync", sync_handler)  // multi-method
-//!     .handle(&req)
+//!     // multi-method: `route` takes ONE method; `route_many` takes a list.
+//!     .route_many(&["GET", "POST"], "/api/sync", sync_handler)
+//!     .handle(req.request)
 //! ```
 //!
 //! Dispatch behaviour:
@@ -166,9 +167,12 @@ impl<'a> Req<'a> {
     /// }
     /// fn default_limit() -> u32 { 20 }
     ///
+    /// #[derive(Serialize, schemars::JsonSchema)]
+    /// struct Page { items: Vec<json::Value>, next: Option<String> }
+    ///
     /// fn list(req: &mut Req<'_>) -> Result<Json<Page>, ApiError> {
     ///     let q: ListQuery = req.parse_query()?;
-    ///     // ...
+    ///     Ok(Json(Page { items: vec![], next: q.cursor }))
     /// }
     /// ```
     pub fn parse_query<T>(&self) -> Result<T, crate::error::ApiError>
@@ -192,9 +196,12 @@ impl<'a> Req<'a> {
     /// #[derive(Deserialize)]
     /// struct Cursor { cursor: Option<String> }
     ///
+    /// #[derive(Serialize, schemars::JsonSchema)]
+    /// struct Page { items: Vec<json::Value>, next: Option<String> }
+    ///
     /// fn list(req: &mut Req<'_>) -> Result<Json<Page>, ApiError> {
     ///     let q: Cursor = req.parse_query_raw()?;
-    ///     // ...
+    ///     Ok(Json(Page { items: vec![], next: q.cursor }))
     /// }
     /// ```
     pub fn parse_query_raw<T>(&self) -> Result<T, crate::error::ApiError>
@@ -823,6 +830,10 @@ impl Router {
     /// produces routes under `/a/b`.
     ///
     /// ```ignore
+    /// fn v1_routes() -> Router { Router::new().get("/todos", list_todos) }
+    /// fn v2_routes() -> Router { Router::new().get("/todos", list_todos) }
+    /// fn admin_routes() -> Router { Router::new().get("/dashboard", dashboard) }
+    ///
     /// fn build_router() -> Router {
     ///     Router::new()
     ///         .nest("/api/v1", v1_routes())
@@ -904,10 +915,11 @@ impl Router {
     ///
     /// ```ignore
     /// Router::new()
-    ///     .group([require_scope("admin")], |g| g
+    ///     // `require_scope` lives on the macro-emitted `auth` module.
+    ///     .group([auth::require_scope("admin")], |g| g
     ///         .get("/_admin/dashboard", dashboard)
     ///         .post("/_admin/posts/{id}/hide", hide_post))
-    ///     .get("/health", health)  // public — no guards
+    ///     .get("/health", health);  // public — no guards
     /// ```
     ///
     /// **Heterogeneous-typed guards.** An array literal requires all guards
@@ -916,8 +928,11 @@ impl Router {
     /// [`guards!`](crate::guards) macro:
     ///
     /// ```ignore
-    /// .group(guards![api_key_routes::guard, auth::owns_resource("links", "owner_id", "id")],
-    ///        |g| g.get("/links/{id}", get_link))
+    /// use boogy_sdk::guards;
+    ///
+    /// Router::new()
+    ///     .group(guards![api_key_routes::guard, auth::owns_resource("links", "owner_id", "id")],
+    ///            |g| g.get("/links/{id}", get_link));
     /// ```
     pub fn group<G, F>(mut self, guards: impl IntoIterator<Item = G>, build: F) -> Self
     where
@@ -1142,10 +1157,12 @@ impl Router {
     /// `…/openrpc.json`.
     ///
     /// ```ignore
+    /// use boogy_sdk::rpc::Dispatcher;
+    ///
     /// Router::new()
     ///     .rpc("/rpc", || Dispatcher::new()
     ///         .method("search_notes", search_notes)
-    ///         .method("share_note", share_note))
+    ///         .method("share_note", share_note));
     /// ```
     pub fn rpc<F>(mut self, path: &str, build: F) -> Self
     where
@@ -1170,16 +1187,28 @@ impl Router {
     /// `group_guards`, same as [`Router::rpc`].
     ///
     /// ```ignore
+    /// use boogy_sdk::mcp::{tool, McpServer};
+    ///
     /// Router::new()
     ///     .mcp("/mcp", |req| {
     ///         McpServer::new("my-service", "1.0")
-    ///             .tool_typed(tool("do_thing").description("…"), do_thing)
+    ///             .tool_typed(tool("do_thing").description("Do the thing"), do_thing_handler)
     ///             .handle(req.request)
-    ///     })
+    ///     });
     /// ```
-    pub fn mcp<H, Args>(mut self, path: &str, handler: H) -> Self
+    ///
+    /// Unlike the verb mounts this takes the raw-request handler shape
+    /// directly rather than `IntoHandler<Args>`: MCP dispatch always needs
+    /// the whole request (it ends in `McpServer::handle(req.request)`), so
+    /// the extractor forms are unusable here and their open `Args` marker
+    /// only cost inference — with them the closure parameter could not be
+    /// inferred and every call site had to spell `|req: &mut Req<'_>|`.
+    /// The return-type menu is unchanged (anything `IntoResponse`, so
+    /// `Result<_, ApiError>` and `?` still flow through).
+    pub fn mcp<F, R>(mut self, path: &str, handler: F) -> Self
     where
-        H: IntoHandler<Args> + 'static,
+        F: Fn(&mut Req<'_>) -> R + 'static,
+        R: IntoResponse,
     {
         let guarded = !self.group_guards.is_empty();
         if !self.undocumented {

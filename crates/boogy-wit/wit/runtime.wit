@@ -19,4 +19,15 @@ interface runtime {
         service-id: string,
     }
     self-identity: func() -> service-identity;
+
+    /// True iff the CALLER's owner account equals THIS service's owner — i.e.
+    /// the call is from the provisioner themselves (their agent token, resolved
+    /// host-side via the agents registry) or one of their own workloads
+    /// (`boogy://<owner>/...`). False for anonymous callers, a different owner,
+    /// or when the caller's account can't be resolved (FAIL-CLOSED). Host-
+    /// attested from the inbound identity — never guest-supplied — so it is safe
+    /// to authorize on (e.g. an owner-only `/admin` surface in a provisionable
+    /// module, which can't hardcode an owner identity in its manifest). Ungated,
+    /// like `self-identity`.
+    caller-is-service-owner: func() -> bool;
 }

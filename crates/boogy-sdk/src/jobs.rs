@@ -7,13 +7,21 @@
 //! the user's crate level — call sites look like:
 //!
 //! ```ignore
-//! let job_id = jobs_enqueue(JobSpec {
-//!     handler: "send_welcome_email".into(),
-//!     payload: serde_json::to_vec(&payload)?.to_vec(),
-//!     idempotency_key: Some(format!("welcome:{user_id}")),
-//!     ..Default::default()
-//! })?;
-//! log::info!("enqueued job {job_id}");
+//! use boogy_sdk::jobs::JobSpec;
+//!
+//! fn welcome(user_id: u64) -> Result<String, ApiError> {
+//!     let payload = json::json!({ "user_id": user_id });
+//!     // `EnqueueError` does not convert into `ApiError` — map it.
+//!     let job_id = jobs_enqueue(JobSpec {
+//!         handler: "send_welcome_email".into(),
+//!         payload: json::to_vec(&payload)?,
+//!         idempotency_key: Some(format!("welcome:{user_id}")),
+//!         ..Default::default()
+//!     })
+//!     .map_err(|e| ApiError::internal(e.to_string()))?;
+//!     boogy_sdk::log::info!("enqueued job {job_id}");
+//!     Ok(job_id)
+//! }
 //! ```
 //!
 //! Capability gate: the caller's manifest must set

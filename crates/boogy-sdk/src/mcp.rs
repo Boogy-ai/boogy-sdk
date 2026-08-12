@@ -24,8 +24,9 @@
 //! struct CreateNoteArgs { title: String, body: String }
 //!
 //! // R must also derive JsonSchema — outputSchema is auto-derived from it.
+//! // `store::insert` returns the auto-PK as a `u64`, not a String.
 //! #[derive(Serialize, JsonSchema)]
-//! struct NoteOut { id: String, title: String }
+//! struct NoteOut { id: u64, title: String }
 //!
 //! // Mount via Router::mcp so the endpoint appears in openapi.json.
 //! // Router::new().mcp("/mcp", mcp_handler)
@@ -40,7 +41,11 @@
 //!
 //! fn create_note_tool(args: CreateNoteArgs) -> Result<NoteOut, ApiError> {
 //!     let principal = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
-//!     // ... persist + return ...
+//!     let id = store::insert("notes", &[
+//!         store::Column { name: "title".into(), val: store::Value::Text(args.title.clone()) },
+//!         store::Column { name: DEFAULT_OWNER_COL.into(), val: store::Value::Text(principal) },
+//!     ]).map_err(ApiError::internal)?;
+//!     Ok(NoteOut { id, title: args.title })
 //! }
 //! ```
 //!
@@ -557,11 +562,22 @@ impl McpServer {
     /// hides behind `ToolResult::json(&result)`.
     ///
     /// ```ignore
+    /// use boogy_sdk::json::{self, Value};
+    /// use boogy_sdk::mcp::{tool, Content, McpServer, ToolResult};
+    /// use boogy_sdk::rpc::RpcError;
+    ///
     /// // Escape hatch: hand-rolled multi-content-block response.
-    /// .tool(tool("rich").input_schema(json::json!({ "type": "object" })),
-    ///       |args: Value| -> Result<ToolResult, RpcError> {
-    ///     Ok(ToolResult { content: vec![/* multi-block */], is_error: false })
-    /// })
+    /// McpServer::new("my-service", "1.0")
+    ///     .tool(tool("rich").input_schema(json::json!({ "type": "object" })),
+    ///           |args: Value| -> Result<ToolResult, RpcError> {
+    ///         Ok(ToolResult {
+    ///             content: vec![
+    ///                 Content::Text { text: "first".into() },
+    ///                 Content::Text { text: "second".into() },
+    ///             ],
+    ///             is_error: false,
+    ///         })
+    ///     });
     /// ```
     pub fn tool<F>(mut self, descriptor: Tool, handler: F) -> Self
     where
@@ -592,16 +608,26 @@ impl McpServer {
     ///   slots into both REST and MCP surfaces unchanged.
     ///
     /// ```ignore
+    /// use boogy_sdk::mcp::{tool, McpServer};
+    /// use schemars::JsonSchema;
+    ///
     /// #[derive(Deserialize, JsonSchema)]
     /// struct CreateNoteArgs { title: String, body: String }
     ///
-    /// #[derive(Serialize)]
-    /// struct NoteOut { id: String, title: String }
+    /// // `R` needs `JsonSchema` too — the derived `outputSchema` comes from it.
+    /// // `store::insert` hands back the auto-PK as a `u64`, not a String.
+    /// #[derive(Serialize, JsonSchema)]
+    /// struct NoteOut { id: u64, title: String }
     ///
+    /// McpServer::new("my-service", "1.0")
     /// .tool_typed(
     ///     tool("create_note").description("Create a note for the agent."),
     ///     |args: CreateNoteArgs| -> Result<NoteOut, ApiError> {
-    ///         // ... build columns, insert, ApiError-on-failure ...
+    ///         let id = store::insert("notes", &[store::Column {
+    ///             name: "title".into(),
+    ///             val: store::Value::Text(args.title.clone()),
+    ///         }]).map_err(ApiError::internal)?;
+    ///         Ok(NoteOut { id, title: args.title })
     ///     },
     /// )
     /// ```
@@ -1050,7 +1076,14 @@ impl CompiledTemplate {
 /// handlers to recover the var the client supplied.
 ///
 /// ```ignore
-/// let id = extract_template_var("notes://{id}", uri, "id")?;
+/// use boogy_sdk::mcp::{extract_template_var, ResourceContent};
+/// use boogy_sdk::rpc::RpcError;
+///
+/// fn note_resource(uri: &str) -> Result<Vec<ResourceContent>, RpcError> {
+///     let id = extract_template_var("notes://{id}", uri, "id")
+///         .ok_or_else(|| RpcError::invalid_params("bad note uri"))?;
+///     Ok(vec![ResourceContent::text(uri, format!("note {id}"))])
+/// }
 /// ```
 pub fn extract_template_var(template: &str, uri: &str, var_name: &str) -> Option<String> {
     // Walk the template tracking variable positions; when we hit the

@@ -22,7 +22,7 @@
 //!     .with_api_key_routes()          // POST/GET /_keys, DELETE + rotate /_keys/{id}
 //!     // ... your routes, gated by the key/PASETO guard:
 //!     .group([api_key_routes::guard], |g| g
-//!         .get("/api/things", list).post("/api/things", create))
+//!         .get("/api/things", list_things).post("/api/things", create_thing));
 //! // custom paths: .with_api_key_routes_at("/admin/keys"), or wire
 //! // api_key_routes::{create,list,revoke,rotate} by hand.
 //! ```

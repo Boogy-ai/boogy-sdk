@@ -101,7 +101,14 @@ fn derive_resolves_same_index_set_as_builder() {
     assert_eq!(key(&d_idx), key(&b_idx), "derive must match builder index set");
 }
 
-// A struct with a pk, a renamed column, an optional FK, and a unique field.
+// A struct with a pk, a renamed column, an optional FK, and a uniquely-looked-up
+// field.
+//
+// `slug` was `#[unique]`. That attribute is now rejected by the derive because
+// it enforced nothing: it set `ColDef.unique`, a flag no write path reads, and
+// emitted no index — so duplicate slugs were accepted silently. `#[lookup_by]`
+// is the working single-column form; it resolves to a real UNIQUE index, which
+// the store's insert/update probe actually consults.
 #[derive(ModelDerive)]
 #[model(table = "widgets", index(name = "idx_widgets_owner", cols = ["owner", "created_at"]))]
 struct Widget {
@@ -110,7 +117,7 @@ struct Widget {
     #[model(column = "owner")]
     owner_principal: String,
     parent: Option<Id<Widget>>,
-    #[unique]
+    #[lookup_by]
     slug: String,
     created_at: Timestamp,
 }
@@ -189,8 +196,27 @@ fn schema_has_columns_indexes_nullable_unique() {
     let parent = t.columns.iter().find(|c| c.name == "parent").unwrap();
     assert!(parent.nullable);
     assert_eq!(parent.col_type as u8, ColType::Integer as u8);
-    // slug is #[unique].
-    assert!(t.columns.iter().find(|c| c.name == "slug").unwrap().unique);
+
+    // `slug`'s uniqueness lives in an INDEX, which is the only place the store
+    // enforces one. This assertion previously read
+    // `columns.find("slug").unwrap().unique` against a `#[unique] slug`, which
+    // pinned the bug in place: it verified the derive SET the column flag and
+    // never that anything enforced it — and nothing did, on any write path.
+    let (idx, _diags) = t.resolved_indices();
+    let slug_idx = idx
+        .iter()
+        .find(|i| i.columns == vec!["slug".to_string()])
+        .expect("the uniquely-looked-up column must resolve to an index");
+    assert!(slug_idx.unique, "and that index must be UNIQUE: {slug_idx:?}");
+
+    // No derived column carries the inert `ColDef.unique` flag any more. The
+    // derive has no marker that sets it, because it is read by nothing.
+    assert!(
+        t.columns.iter().all(|c| !c.unique),
+        "ColDef.unique is unenforced and must not be set by the derive: {:?}",
+        t.columns.iter().filter(|c| c.unique).map(|c| &c.name).collect::<Vec<_>>()
+    );
+
     // owner string column, not nullable.
     let owner = t.columns.iter().find(|c| c.name == "owner").unwrap();
     assert!(!owner.nullable);

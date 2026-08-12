@@ -13,6 +13,8 @@
 //! `IdCodec` provides a deterministic, reversible mapping:
 //!
 //! ```ignore
+//! use boogy_sdk::ids::IdCodec;
+//!
 //! let codec = IdCodec::new(*b"my-app-secret-16");
 //! let public = codec.encode(42);          // "wzMx8...mY" (22 chars)
 //! let back = codec.decode(&public);       // Some(42)

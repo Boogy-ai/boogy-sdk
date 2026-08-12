@@ -1,0 +1,5 @@
+error: #[counter] takes no arguments — write a bare `#[counter]`. In particular there is no `index` option: a counter column cannot back an index at all, because an atomic add never reads the previous value and the stale entry could never be removed. To rank or filter on this value, scope the ranking to a bounded sub-range and sort in memory, or materialize it into a separate plain column refreshed by a background job.
+  --> tests/ui/counter_with_argument.rs:13:5
+   |
+13 |     #[counter(index = true)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^

@@ -41,9 +41,9 @@ Package version: `boogy:platform@0.1.0`. Pre-1.0 — every change is a breaking 
 
 | Interface | Host impl | SDK wrapper |
 |---|---|---|
-| `auth` | Host capability (auth.rs) | `boogy_sdk::auth::*` |
-| `http-handler` | Host linker (calls into wasm via `Api::handle`) | `wit_glue!` macro |
-| `outbound-http` | Host capability (outbound) | `boogy_sdk::http::*` |
+| `auth` | Host capability (auth.rs) | `auth::*`, emitted by `wit_glue!` |
+| `http-handler` | Host linker (calls the wasm export, which dispatches through `Api::build_router`) | `wit_glue!` macro |
+| `outbound-http` | Host capability (outbound) | `outbound_http::*`, emitted by `wit_glue!` |
 | `peer` | Host capability (peer.rs) | `boogy_sdk::peer::*` |
 | `runtime` | Host capability (runtime.rs) | (used directly by SDK macros) |
 | `store` | Host capability (store.rs) | `boogy_sdk` table builder + `tx()` |

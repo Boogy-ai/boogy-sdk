@@ -23,8 +23,20 @@ interface store {
         unsupported(string),
         timeout(string),
         version-mismatch(string),
+        /// Ambiguous commit (`commit_unknown_result`): the write MAY or MAY NOT
+        /// have been applied. Do NOT blindly retry (could double-apply) —
+        /// reconcile state first. → HTTP 409 (ambiguous-commit; distinct from a
+        /// clean retryable conflict). The message body carries the distinction.
+        commit-unknown(string),
         /// Transient: too many concurrent transactions; retry later. → HTTP 503.
         resource-exhausted(string),
+        /// The transaction was rolled back because a participant failed. NOT a
+        /// serialization conflict and NOT retryable — re-running would re-execute
+        /// the participant that failed. → HTTP 409.
+        poisoned(string),
+        /// The transaction exhausted its retry attempts against a contended
+        /// row. Transient: the caller should retry the request. → HTTP 503.
+        too-contended(string),
         internal(string),
     }
 
@@ -89,8 +101,12 @@ interface store {
         /// behavior — fully backward compatible.
         or-groups: list<list<filter>>,
         /// Explicit opt-in to permit a full table scan for this query,
-        /// suppressing the strict-mode full-scan guardrail. Defaults to
-        /// `false`. No behavioral effect yet — a later task consumes it.
+        /// suppressing the strict-mode full-scan guardrail: past the row
+        /// threshold the scan warns instead of failing. Defaults to `false`.
+        /// It is an audited escape hatch for a genuinely intentional scan of a
+        /// small or single-owner table, not a fix for a missing index — the
+        /// scan still costs O(table). It has no effect on a read inside a
+        /// transaction, where the guardrail does not run.
         allow-full-scan: bool,
         /// Skip computing `total-count` (the host returns 0). Set by callers
         /// that discard the total — keyset/`fetch-page`, `fetch-all`,
@@ -133,10 +149,77 @@ interface store {
     record column-def {
         name: string,
         col-type: column-type,
+        // False = the column must always hold a value, and this is ENFORCED on
+        // every write path, not merely recorded:
+        //
+        // - A write that CREATES a row (`insert`, `insert-many`, and the
+        //   row-creating arm of `upsert` / `upsert-increment`) must supply the
+        //   column. Both an explicitly supplied `value.null` and a plain
+        //   omission are refused with `constraint-violation`.
+        // - A write that AMENDS a row (`update`, `update-many`, `update-where`,
+        //   and the update arm of either upsert) is a change set: an absent
+        //   column means "leave it alone", so only an explicit null is refused.
+        //
+        // Omission is refused because it is not the same as a zero and not the
+        // same as absence either — it is both at once. A row stored without a
+        // value for a column reads that column back as the type's zero value,
+        // but no index entry was written for it, so the same row is invisible to
+        // any indexed query over that column. Present to a lookup, absent to a
+        // seek, with nothing saying so.
+        //
+        // Consequence at the call site, and it is a real cost: `upsert-increment`
+        // and `upsert` must have `key ∪ columns.always ∪ columns.on-insert`
+        // (plus the counter) cover every non-nullable column that has no
+        // default, because the first call for a key is the one that creates
+        // the row. If a column has a sensible STATIC starting value, give it a
+        // `default` — that is the cheap fix, and unlike either column list it
+        // does not overwrite the column on every later call. If the value is
+        // COMPUTED at call time (a timestamp, a derived id), `on-insert` is
+        // the fix instead: written only by the row-creating call, never
+        // rewritten after. Reach for `always` only when the value must
+        // genuinely change on every call.
+        //
+        // Two exemptions, each because the column cannot end up value-less: a
+        // column with a `default` (the engine materializes it into the row when
+        // the write omits it) and a `counter` column (its value lives in its own
+        // cell, and the row slot is left empty on purpose).
         nullable: bool,
         unique: bool,
         references: option<foreign-key>,
+        // Column default: the value a read resolves this column to when the row
+        // has no value for it.
+        //
+        // Honoured by BOTH `create-table` and `add-column`. On `add-column` it
+        // may also UPDATE the default of a column that already exists, provided
+        // the name, column type and nullability all match; on any other
+        // difference `add-column` still fails with "column already exists",
+        // because that is a type/nullability conflict rather than a default.
+        //
+        // Setting or changing a default NEVER rewrites stored rows. A write that
+        // omits the column records the default in force at that moment, so that
+        // row keeps the old value if the default later changes. A row that
+        // predates the column entirely has no value recorded and is resolved
+        // against the current default on every read, so it does observe the
+        // change. A row that SUPPLIED a value is unaffected either way.
+        //
+        // A column carrying a default is exempt from the not-null check even
+        // when `nullable` is false — it cannot end up value-less — which makes
+        // this the way to declare a required column. An explicitly supplied
+        // null is a caller error, distinct from omitting the column.
+        //
+        // Literal values only; there are no expression defaults. A `counter`
+        // column may not carry one: its value is read from its own cell, so a
+        // default could never be observed (`constraint-violation`).
         default: option<value>,
+        // Conflict-free counter column. Stored in its own cell rather than
+        // inside the packed row, and mutated by an atomic add that registers no
+        // read-conflict range — which is what lets concurrent increments
+        // compose instead of conflicting at commit.
+        //
+        // A counter column cannot back an index: index maintenance needs the
+        // previous value to remove the stale entry, and an atomic add never
+        // reads one. The SDK's `Model` derive rejects that at compile time.
+        counter: bool,
     }
 
     record column-info {
@@ -195,6 +278,17 @@ interface store {
     drop-index: func(table: string, name: string) -> result<_, store-error>;
     list-indexes: func(table: string) -> result<list<index-def>, store-error>;
 
+    /// Add a column, or set/update the `default` of one that already exists.
+    ///
+    /// On an existing column the call succeeds only when the name, column type
+    /// and nullability all match; then the default is replaced (later write
+    /// wins) and NOTHING IS BACKFILLED — see `column-def.default` for exactly
+    /// which rows observe the change. Any other difference is a type or
+    /// nullability conflict and still fails with `constraint-violation`
+    /// ("column already exists").
+    ///
+    /// Re-adding an identically-shaped column is therefore idempotent, which is
+    /// what lets a migration be re-run.
     add-column: func(table: string, column: column-def) -> result<_, store-error>;
     rename-column: func(table: string, old: string, new: string) -> result<_, store-error>;
     drop-column: func(table: string, name: string) -> result<_, store-error>;
@@ -226,26 +320,67 @@ interface store {
     update-many: func(table: string, updates: list<row-update>) -> result<u64, store-error>;
     delete-many: func(table: string, ids: list<u64>) -> result<u64, store-error>;
 
+    /// The two column sets an upsert writes, distinguished by which arm runs.
+    record upsert-columns {
+        /// Written on BOTH arms — the row-creating one and every update after
+        /// it. A non-empty `always` makes the update arm rewrite the whole row,
+        /// so concurrent upserts of one row contend.
+        always: list<column>,
+        /// Written ONLY by the arm that creates the row. Counts toward the
+        /// non-nullable coverage requirement and is never rewritten afterwards.
+        /// Use it for a value the row needs at creation that must not be
+        /// re-derived later — a computed `default`, where `default` itself can
+        /// only be a static literal.
+        on-insert: list<column>,
+    }
+
     // Atomic keyed counter: `counter += delta` (delta must be integer or
     // real), upserting the row identified by the composite `key`. On first
-    // call the row is inserted with `counter = delta` and the `set` columns;
-    // on subsequent calls the counter is incremented and the `set` columns
-    // are overwritten. Requires a unique index on the `key` columns
-    // (the upsert conflict target). Returns the row id.
-    upsert-increment: func(table: string, key: list<column>, counter: string, delta: value, set: list<column>) -> result<u64, store-error>;
+    // call the row is inserted with `counter = delta` and the `columns.always`
+    // + `columns.on-insert` columns; on subsequent calls the counter is
+    // incremented and only `columns.always` is overwritten. Requires a unique
+    // index on the `key` columns (the upsert conflict target). Returns the
+    // row id.
+    //
+    // Because the first call INSERTS, `key ∪ always ∪ on-insert ∪ {counter}`
+    // must cover every non-nullable column of the table that has no default,
+    // or that call is refused with `constraint-violation` naming the missing
+    // column. Later calls take the update arm and carry no such requirement.
+    // A column listed in both `always` and `on-insert` is refused with
+    // `constraint-violation` naming it.
+    //
+    // Prefer a `default` for a static value — that is the cheap fix, and
+    // unlike either column list it does not get written through a row update
+    // at all. Prefer `on-insert` for a computed value that must exist at
+    // creation but should never be re-derived later. Reach for `always` only
+    // for a value that must genuinely change on every call; a non-empty
+    // `always` rewrites the whole row on every update, so seeding a second
+    // counter with a literal zero there resets it each time instead of only
+    // on creation.
+    //
+    // Never name a SECOND counter column in `always` or `on-insert`: the
+    // insert arm merges `key`, `always` and `on-insert` before pushing this
+    // call's own `(counter, delta)`, and the counter-cell write is
+    // first-wins, so a literal for another counter placed there silently
+    // wins over that counter's own first increment.
+    upsert-increment: func(table: string, key: list<column>, counter: string, delta: value, columns: upsert-columns) -> result<u64, store-error>;
 
     /// Atomic insert-or-update keyed on a unique index. If a row exists
     /// whose `key` columns match (under a unique index that covers those
-    /// columns; column order in the index doesn't matter), update `set`
-    /// columns on it (key columns untouched unless `set` also lists them,
-    /// in which case `set` wins via field-merge). Otherwise insert a new
-    /// row with `key + set`. Returns the row id (existing or newly-
-    /// inserted).
+    /// columns; column order in the index doesn't matter), update
+    /// `columns.always` on it (key columns untouched unless `always` also
+    /// lists them, in which case `always` wins via field-merge). Otherwise
+    /// insert a new row with `key + columns.always + columns.on-insert`.
+    /// Returns the row id (existing or newly-inserted).
     ///
     /// PRECONDITION: the `key` columns must correspond to an existing
     /// unique index on the table. Otherwise the host errors with a
     /// SchemaMismatch identifying the missing index.
-    upsert: func(table: string, key: list<column>, set: list<column>) -> result<u64, store-error>;
+    ///
+    /// A column listed in both `always` and `on-insert` is refused with
+    /// `constraint-violation` naming it, the same refusal `upsert-increment`
+    /// enforces on the identical collision.
+    upsert: func(table: string, key: list<column>, columns: upsert-columns) -> result<u64, store-error>;
 
     delete: func(table: string, id: u64) -> result<bool, store-error>;
     delete-where: func(table: string, filters: list<filter>) -> result<u64, store-error>;

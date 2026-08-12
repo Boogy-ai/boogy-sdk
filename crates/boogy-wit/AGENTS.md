@@ -13,7 +13,7 @@ Every Boogy service imports the `boogy:platform` package and targets a world (en
 
 Standard invocation in the wasm crate's `lib.rs` or `main.rs`:
 
-```rust
+```rust ignore-snippet: a crate-level wit_bindgen::generate! invocation, which needs the consumer's own wit/ tree; the gate crate already makes one and two cannot coexist.
 mod bindings {
     wit_bindgen::generate!({ world: "service", path: "../../boogy-wit/wit" });
 }
@@ -21,7 +21,7 @@ mod bindings {
 
 For job-handler components:
 
-```rust
+```rust ignore-snippet: as above, and the service-with-jobs world additionally requires a job-handler export the gate crate does not implement.
 mod bindings {
     wit_bindgen::generate!({ world: "service-with-jobs", path: "../../boogy-wit/wit" });
 }
@@ -98,26 +98,8 @@ Outbound HTTP to arbitrary URLs. Request and response shapes are identical to `p
 |---|---|---|
 | `fetch(request)` | `result<outbound-response, fetch-error>` | Full URL (scheme + host + path) required. HTTP/HTTPS only. |
 
-**SDK wrapper**: `http::fetch(method, url, headers, body)` + builder pattern. See [`crates/boogy-sdk/AGENTS.md`](../boogy-sdk/AGENTS.md).
-
-### vector
-
-**Gated by**: `[capabilities] vector = true` (default: false).
-
-Vector similarity search over embedded rows. Supports collection creation (specify dimension count and distance metric), insertion/update/deletion of vectors, and search (k-nearest neighbors with optional filtering). Metrics: cosine, Euclidean, dot-product. HNSW index under the hood.
-
-| Function | Signature | Notes |
-|---|---|---|
-| `create-collection(table, name, options)` | `result<_, string>` | Specify dimensions, metric, and optional HNSW params (m, ef_construction). |
-| `drop-collection(table, name)` | `result<_, string>` | |
-| `insert(table, collection, rowid, vector)` | `result<_, string>` | Associate a vector with a row. |
-| `insert-batch(table, collection, entries)` | `result<_, string>` | Batch insert (more efficient). |
-| `update(table, collection, rowid, vector)` | `result<_, string>` | Replace an existing vector. |
-| `delete(table, collection, rowid)` | `result<_, string>` | Remove a vector. |
-| `search(table, collection, query, options)` | `result<list<vector-result>, string>` | k-NN search. Options: k, ef_search (HNSW param), optional `store::filter` for post-filtering. Returns rowid + distance. |
-| `unlock-collection(table, name, key)` | `result<_, string>` | (Advanced) Unlock a read-locked collection. Used internally by the SDK. |
-
-**SDK wrapper**: `vector::Collection`, `vector::search()`. See [`crates/boogy-sdk/AGENTS.md`](../boogy-sdk/AGENTS.md).
+**SDK wrapper**: `outbound_http::fetch(&request)`, where `request` is an
+`outbound_http::OutboundRequest`. See [`crates/boogy-sdk/AGENTS.md`](../boogy-sdk/AGENTS.md).
 
 ### background-jobs (caller)
 
@@ -143,7 +125,9 @@ Wasm components that process background jobs export this interface. The worker (
 |---|---|---|
 | `handle-job(ctx, payload)` | `result<list<u8>, handler-error>` | `ctx` includes job ID (stable across retries, for idempotency), handler name, attempt count, not-before. Return success with optional response bytes, or `retry` / `terminal` error variant. Wasm traps are treated as retryable with error kind `handler_trap`. |
 
-**SDK wrapper**: `Job::init()` to register a handler; the worker calls your exported `handle-job` automatically. See [`crates/boogy-sdk/AGENTS.md`](../boogy-sdk/AGENTS.md).
+**SDK wrapper**: annotate a handler fn with `#[job]` and return it from your
+`Api::build_job_router` implementation; `wit_glue!` provides the `handle-job`
+export, and the worker calls it. See [`crates/boogy-sdk/AGENTS.md`](../boogy-sdk/AGENTS.md).
 
 ## http-handler (export only)
 

@@ -14,12 +14,14 @@
 //! ## Typical handler
 //!
 //! ```ignore
-//! use boogy_sdk::relations::load_has_many;
-//!
+//! // `load_has_many` is emitted into YOUR crate's root by `wit_glue!` — it is
+//! // not `boogy_sdk::relations::load_has_many`. In a submodule, reach it as
+//! // `use crate::load_has_many;`.
 //! fn list_notes_with_comments(_req: &mut Req<'_>) -> Result<Json<json::Value>, ApiError> {
 //!     // 1) parents
 //!     let notes = auth::find_owned("notes", DEFAULT_OWNER_COL)?;
-//!     let note_ids: Vec<String> = notes.iter().map(|n| n.id()).collect();
+//!     // `Row::id()` is a u64 — the key type `load_has_many` groups on.
+//!     let note_ids: Vec<u64> = notes.iter().map(|n| n.id()).collect();
 //!
 //!     // 2) children, batched
 //!     let comments_by_note = load_has_many("comments", "note_id", &note_ids)?;

@@ -18,6 +18,8 @@
 //!   entropy source into an [`Rng`]. This is what handler code calls:
 //!
 //! ```ignore
+//! let candidates = ["ana", "bo", "cy"];
+//!
 //! let die = random_int(1, 6);                       // inclusive both ends
 //! let slug = random_string(6, &Alphabet::HEX);      // "9f3a1c"
 //! let public_id = random_id();                      // 22 url-safe chars

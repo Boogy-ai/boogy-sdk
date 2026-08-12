@@ -3,7 +3,7 @@
 //! See [README](https://github.com/Boogy-ai/boogy-sdk/tree/main/crates/boogy-sdk)
 //! for the full authoring guide. The short version:
 //!
-//! ```ignore
+//! ```ignore, ignore_snippet: the crate-level glue macros. wit_glue! emits crate-scoped trait impls, so any harness holding two invocations is a duplicate-impl error by construction.
 //! mod bindings {
 //!     wit_bindgen::generate!({ world: "service", path: "../../boogy-wit/wit" });
 //! }
@@ -69,9 +69,9 @@ pub mod router;
 pub mod rpc;
 pub mod schema_resolve;
 pub mod secrets;
+pub mod signing;
 pub mod spec;
 pub mod store;
-pub mod vector;
 pub mod websockets;
 
 pub use boogy_sdk_macros::job;
@@ -93,7 +93,7 @@ pub use store::{Row, StoreError, Table};
 // `Json` is intentionally omitted here — it's already exported above from
 // `response` and the same type implements `FromRequest` via `extract`.
 pub use extract::{FromRequest, Path, Query, Principal};
-pub use job_router::{JobRegistration, JobRouter};
+pub use job_router::{JobContext, JobError, JobRegistration, JobRouter};
 
 /// Boogy SDK convention: the column name Boogy-authored APIs
 /// use to record the owning principal of a row. The platform's
@@ -133,6 +133,8 @@ pub fn wit_path() -> &'static str {
 /// # Example
 ///
 /// ```ignore
+/// struct MyApi;
+///
 /// impl boogy_sdk::Api for MyApi {
 ///     fn init_tables() {
 ///         create_table_from(&Table::new("users").text("email"));

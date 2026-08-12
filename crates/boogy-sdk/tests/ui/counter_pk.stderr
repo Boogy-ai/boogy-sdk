@@ -1,0 +1,5 @@
+error: #[counter] cannot be applied to the #[pk] field — the primary key identifies the row and cannot be an atomically-added value
+ --> tests/ui/counter_pk.rs:9:9
+  |
+9 |     pub id: Id<T>,
+  |         ^^

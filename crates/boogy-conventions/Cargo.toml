@@ -1,0 +1,10 @@
+[package]
+name = "boogy-conventions"
+version = "0.1.0"
+edition = "2021"
+description = "Heuristic conventions lint for Boogy service crates (shared by the CLI and the builder MCP server)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[dev-dependencies]

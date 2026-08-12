@@ -20,7 +20,7 @@
 /// Emit the WIT↔SDK glue for a Boogy API.
 ///
 /// Usage:
-/// ```ignore
+/// ```ignore, ignore_snippet: the crate-level glue macro itself. Its trait impls are crate-scoped, so a harness holding two invocations is a duplicate-impl error by construction.
 /// mod bindings {
 ///     wit_bindgen::generate!({ world: "service", path: "../../boogy-wit/wit" });
 /// }
@@ -61,10 +61,26 @@
 ///   `db_update::<M>(id, &M)`, `db_delete::<M>(id)`. These serialize via
 ///   the model's `Field` impls, so model code never hand-builds columns.
 ///
-/// And these `use` statements are emitted so handlers don't need to repeat them:
-/// `Deserialize`, `Serialize`, `json`, `response`, `Params`, `Req`, `Router`,
-/// `Ctx`, `Row`, `Table`, `Val`, `DEFAULT_OWNER_COL`, `Alphabet`, `store`
-/// (the WIT bindings module).
+/// And these `use` statements are emitted so handlers don't need to repeat
+/// them. The list is exhaustive — anything not named here you import yourself:
+///
+/// - Routing / request: `Router`, `Req`, `Params`, `Ctx`, `FromRequest`,
+///   `Path`, `Principal`, `QueryExtractor` (that is
+///   [`boogy_sdk::extract::Query`](crate::extract::Query), renamed to leave the
+///   name `Query` free for the typed-query DSL struct this macro also emits).
+/// - Responses / errors: `response` (the module), `Json`, `Created`,
+///   `NoContent`, `Redirect`, `IntoResponse`, `ApiError`, `StoreError`.
+/// - Bodies: `json` (the module), `Deserialize`, `Serialize`, `parse_body`,
+///   `validate_body`.
+/// - Store: `store` (the WIT bindings module), `Row`, `Table`,
+///   `DEFAULT_OWNER_COL`.
+/// - Other bindings modules: `peer_bindings`, `secrets_bindings`,
+///   `signing_bindings`, `jobs_bindings`, `ws_bindings`.
+/// - Random: `Alphabet`.
+///
+/// `Val` is **not** among them — see the note below on why it is deliberately
+/// excluded. Reach it as [`boogy_sdk::store::Val`](crate::store::Val) when a
+/// signature names it.
 ///
 /// Two write paths exist. (1) **Raw**: `store::insert(table, &[store::Column {
 /// name, val: store::Value::* }])` and `store::update` / `store::delete` — used
@@ -97,7 +113,10 @@ macro_rules! wit_glue {
                     store::StoreError::Unsupported(m)         => S::Unsupported(m),
                     store::StoreError::Timeout(m)             => S::Timeout(m),
                     store::StoreError::VersionMismatch(m)     => S::VersionMismatch(m),
+                    store::StoreError::CommitUnknown(m)       => S::CommitUnknown(m),
                     store::StoreError::ResourceExhausted(m)   => S::ResourceExhausted(m),
+                    store::StoreError::Poisoned(m)            => S::Poisoned(m),
+                    store::StoreError::TooContended(m)        => S::TooContended(m),
                     store::StoreError::Internal(m)            => S::Internal(m),
                 }
             }
@@ -128,9 +147,9 @@ macro_rules! wit_glue {
         #[allow(unused_imports)]
         use $bindings::boogy::platform::secrets as secrets_bindings;
         #[allow(unused_imports)]
-        use $bindings::boogy::platform::background_jobs as jobs_bindings;
+        use $bindings::boogy::platform::signing as signing_bindings;
         #[allow(unused_imports)]
-        use $bindings::boogy::platform::vector as vector_bindings;
+        use $bindings::boogy::platform::background_jobs as jobs_bindings;
         #[allow(unused_imports)]
         use $bindings::boogy::platform::websockets as ws_bindings;
         #[allow(unused_imports)]
@@ -248,7 +267,8 @@ macro_rules! wit_glue {
                                 on_update: __boogy_cascade(fk.on_update),
                             }
                         }),
-                        default: None,
+                        default: c.default.as_ref().map(|v| __boogy_val_to_wit(v)),
+                        counter: c.counter,
                     }
                 }).collect();
             // create_table: guarded by list_tables. Skip if table already exists;
@@ -374,6 +394,10 @@ macro_rules! wit_glue {
                 unique: spec.unique,
                 references: None,
                 default: spec.default.as_ref().map(|v| __boogy_val_to_wit(v)),
+                // A migration-added column is never a counter: converting an
+                // existing column to one is the backfill path, which has to move
+                // the value out of already-written rows.
+                counter: false,
             };
             $bindings::boogy::platform::store::add_column(table, &cd)
                 .map_err(::std::string::String::from)
@@ -707,23 +731,67 @@ macro_rules! wit_glue {
             create_table_from(&schema);
         }
 
-        /// Atomic keyed counter: `counter += delta`, upserting the row
-        /// identified by the composite `key`. First call inserts
-        /// (`counter = delta` + the `set` columns); later calls
-        /// increment the counter and overwrite the `set` columns. The
-        /// host runs this in the engine's ACID mode so concurrent
-        /// increments compose. `delta` must be an integer or real value
-        /// (the host rejects others). Requires a `unique` index on the
+        /// The two column sets an upsert writes.
+        ///
+        /// `always` is written on both arms; `on_insert` only by the call that
+        /// creates the row. Prefer `on_insert` for a creation stamp: an
+        /// `always` column is rewritten on every later call, which rewrites the
+        /// whole row and makes concurrent upserts of one row contend.
+        pub struct UpsertColumns<'a> {
+            pub always: &'a [$bindings::boogy::platform::store::Column],
+            pub on_insert: &'a [$bindings::boogy::platform::store::Column],
+        }
+
+        impl<'a> UpsertColumns<'a> {
+            /// Neither arm writes anything but the key and the counter.
+            pub fn none() -> Self {
+                Self { always: &[], on_insert: &[] }
+            }
+            /// Written on both arms.
+            pub fn always(v: &'a [$bindings::boogy::platform::store::Column]) -> Self {
+                Self { always: v, on_insert: &[] }
+            }
+            /// Written only by the arm that creates the row.
+            pub fn on_insert_only(v: &'a [$bindings::boogy::platform::store::Column]) -> Self {
+                Self { always: &[], on_insert: v }
+            }
+        }
+
+        /// Keyed counter: `counter += delta`, upserting the row identified by
+        /// the composite `key`. First call inserts (`counter = delta` + the
+        /// `always` + `on_insert` columns); later calls increment the counter
+        /// and overwrite only `always`. `delta` must be an integer or real
+        /// value (the host rejects others). Requires a `unique` index on the
         /// `key` columns. Returns the row id.
+        ///
+        /// **Whether concurrent increments compose depends on the column.** When
+        /// `counter` names a `#[counter]` column the store performs a native
+        /// atomic add on that column's own cell, taking no read-conflict range,
+        /// and any number of concurrent increments commit. Any other column is
+        /// read-modify-written: the row is read, the sum computed, and the whole
+        /// row written back, so concurrent increments conflict — absorbed by the
+        /// retry loop on the autocommit path, surfaced as contention inside a
+        /// transaction.
+        ///
+        /// A non-empty `always` is written through that same row update either
+        /// way, so passing one reintroduces the conflict even for a `#[counter]`
+        /// column. `on_insert` avoids that — it is written only by the arm that
+        /// creates the row — but it does not buy conflict-freedom on the
+        /// read-modify-write arm: there, the counter itself is written through
+        /// the ordinary row update regardless of `on_insert`.
         fn upsert_increment(
             table: &str,
             key: &[$bindings::boogy::platform::store::Column],
             counter: &str,
             delta: $bindings::boogy::platform::store::Value,
-            set: &[$bindings::boogy::platform::store::Column],
+            cols: UpsertColumns<'_>,
         ) -> ::core::result::Result<u64, $crate::store::StoreError> {
+            let columns = $bindings::boogy::platform::store::UpsertColumns {
+                always: cols.always.to_vec(),
+                on_insert: cols.on_insert.to_vec(),
+            };
             match $bindings::boogy::platform::store::upsert_increment(
-                table, key, counter, &delta, set,
+                table, key, counter, &delta, &columns,
             ) {
                 Ok(id) => Ok(id),
                 Err(e) => Err($crate::store::StoreError::from_wit(e)),
@@ -731,26 +799,42 @@ macro_rules! wit_glue {
         }
 
         /// Atomic insert-or-update keyed on a unique index. If a row
-        /// with matching `key` columns exists, update `set` columns
+        /// with matching `key` columns exists, update `cols.always`
         /// on it (key columns untouched). Otherwise insert a new row
-        /// with `key + set`. Returns the row id (existing or new).
+        /// with `key + cols.always + cols.on_insert`. Returns the row
+        /// id (existing or new).
         ///
         /// PRECONDITION: the `key` columns must correspond to an
         /// existing unique index on the table.
         ///
         /// ```ignore
-        /// upsert(
-        ///     "user_affinity_edges",
-        ///     &[col("user_a", a.clone()), col("user_b", b.clone())],
-        ///     &[col("weight", weight), col("updated_at", now)],
-        /// )?;
+        /// // `key` and the `UpsertColumns` fields are WIT `store::Column`s — name + value.
+        /// fn text(name: &str, v: &str) -> store::Column {
+        ///     store::Column { name: name.into(), val: store::Value::Text(v.into()) }
+        /// }
+        /// fn int(name: &str, v: i64) -> store::Column {
+        ///     store::Column { name: name.into(), val: store::Value::Integer(v) }
+        /// }
+        ///
+        /// fn touch_edge(a: &str, b: &str, weight: i64) -> Result<u64, ApiError> {
+        ///     let id = upsert(
+        ///         "user_affinity_edges",
+        ///         &[text("user_a", a), text("user_b", b)],
+        ///         UpsertColumns::always(&[int("weight", weight), int("updated_at", now_millis() as i64)]),
+        ///     )?;
+        ///     Ok(id)
+        /// }
         /// ```
         fn upsert(
             table: &str,
             key: &[$bindings::boogy::platform::store::Column],
-            set: &[$bindings::boogy::platform::store::Column],
+            cols: UpsertColumns<'_>,
         ) -> ::core::result::Result<u64, $crate::store::StoreError> {
-            match $bindings::boogy::platform::store::upsert(table, key, set) {
+            let columns = $bindings::boogy::platform::store::UpsertColumns {
+                always: cols.always.to_vec(),
+                on_insert: cols.on_insert.to_vec(),
+            };
+            match $bindings::boogy::platform::store::upsert(table, key, &columns) {
                 Ok(id) => Ok(id),
                 Err(e) => Err($crate::store::StoreError::from_wit(e)),
             }
@@ -1248,6 +1332,20 @@ macro_rules! wit_glue {
             rng().uuid_v7(unix_millis)
         }
 
+        #[allow(dead_code)]
+        /// True iff the CALLER is this service's owner — the provisioner's own
+        /// agent (their human/dashboard token, resolved host-side) or one of
+        /// their own workloads. False for anonymous, a different owner, or an
+        /// unresolvable caller (fail-closed). Host-attested — safe to authorize
+        /// on. Lets a provisionable module gate an owner-only surface (e.g.
+        /// `/admin`) WITHOUT hardcoding an identity in its manifest:
+        /// ```ignore
+        /// if !crate::caller_is_service_owner() { return Err(ApiError::forbidden("operator only")); }
+        /// ```
+        fn caller_is_service_owner() -> bool {
+            $bindings::boogy::platform::runtime::caller_is_service_owner()
+        }
+
         /// Build an ascending `SortBy` for `column`. Pairs with
         /// [`sort_desc`]; pass a `Vec` of these to `find_rows` for
         /// composite sort (e.g. `vec![sort_desc("score"), sort_asc("_id")]`).
@@ -1279,21 +1377,32 @@ macro_rules! wit_glue {
         /// group (its own AND), and the groups are ORed together. Empty
         /// `or_groups` is exactly [`find_rows`].
         ///
+        /// The two trailing `bool`s are the ones [`find_rows`] hard-codes to
+        /// `false`: `allow_full_scan` is the audited scan opt-out, and
+        /// `skip_total` returns `0` for the count instead of computing it —
+        /// pass `true` whenever you discard the total.
+        ///
         /// The canonical use is composite keyset pagination — AND-only
         /// filters can't express `(score < c) OR (score = c AND id < cursor)`:
         ///
         /// ```ignore
-        /// let (page_rows, _total) = find_rows_grouped(
-        ///     "posts",
-        ///     vec![filter_eq("deleted_at", store::Value::Text(String::new()))], // AND-prefix
-        ///     vec![
-        ///         vec![filter_lt("score", store::Value::Integer(c))],
-        ///         vec![filter_eq("score", store::Value::Integer(c)),
-        ///              filter_lt("_id", store::Value::Integer(cursor))],
-        ///     ],
-        ///     vec![sort_desc("score"), sort_desc("_id")],
-        ///     Some(page(20, 0)),
-        /// )?;
+        /// /// `c` / `cursor` are the (score, _id) of the previous page's last row.
+        /// fn page_after(c: i64, cursor: i64) -> Result<Vec<Row>, ApiError> {
+        ///     let (page_rows, _total) = find_rows_grouped(
+        ///         "posts",
+        ///         vec![filter_eq("deleted_at", store::Value::Text(String::new()))], // AND-prefix
+        ///         vec![
+        ///             vec![filter_lt("score", store::Value::Integer(c))],
+        ///             vec![filter_eq("score", store::Value::Integer(c)),
+        ///                  filter_lt("_id", store::Value::Integer(cursor))],
+        ///         ],
+        ///         vec![sort_desc("score"), sort_desc("_id")],
+        ///         Some(page(20, 0)),
+        ///         false, // allow_full_scan
+        ///         true,  // skip_total — the total is discarded here
+        ///     )?;
+        ///     Ok(page_rows)
+        /// }
         /// ```
         fn find_rows_grouped(
             table: &str,
@@ -1365,9 +1474,12 @@ macro_rules! wit_glue {
         /// for many-row joins, backer-list lookups, etc.
         ///
         /// ```ignore
-        /// let backers = find_rows_by(
-        ///     "investments", "post_id", store::Value::Integer(post_id as i64),
-        /// )?;
+        /// fn backers_of(post_id: u64) -> Result<Vec<Row>, ApiError> {
+        ///     let backers = find_rows_by(
+        ///         "investments", "post_id", store::Value::Integer(post_id as i64),
+        ///     )?;
+        ///     Ok(backers)
+        /// }
         /// ```
         fn find_rows_by(
             table: &str,
@@ -1477,22 +1589,41 @@ macro_rules! wit_glue {
         /// # Example
         ///
         /// ```ignore
-        /// let cursor = q.cursor.as_deref().and_then(decode);
-        /// let page = keyset_paginate::<PostView, _>(
-        ///     "posts",
-        ///     vec![filter_eq("deleted_at", store::Value::Text(String::new()))],
-        ///     vec![],
-        ///     "created_at",
-        ///     SortDir::Desc,
-        ///     cursor,
-        ///     q.limit as usize,
-        ///     |row| {
-        ///         let view = PostView { /* map fields */ };
-        ///         let last_id    = row.id().to_string();
-        ///         let last_value = serde_json::json!(row.int("created_at"));
-        ///         (view, Cursor::keyset(last_id, last_value))
-        ///     },
-        /// )?;
+        /// use boogy_sdk::pagination::{Cursor, CursorPage};
+        /// use boogy_sdk::store::{Filter, FilterOp, SortDir, Val};
+        ///
+        /// #[derive(Serialize)]
+        /// struct PostView { id: u64, title: String }
+        ///
+        /// fn list_posts(cursor: Option<Cursor>, limit: usize)
+        ///     -> Result<CursorPage<PostView>, ApiError>
+        /// {
+        ///     // Note the filter type: `keyset_paginate` takes SDK-side
+        ///     // `store::Filter`s (over `Val`), NOT the WIT `store::Filter`s the
+        ///     // `filter_eq` / `filter_lt` builders return.
+        ///     let page = keyset_paginate::<PostView, _>(
+        ///         "posts",
+        ///         vec![Filter {
+        ///             column: "deleted_at".into(),
+        ///             op: FilterOp::Eq,
+        ///             val: Val::Text(String::new()),
+        ///             in_values: None,
+        ///         }],
+        ///         vec![],
+        ///         "created_at",
+        ///         SortDir::Desc,
+        ///         cursor,
+        ///         limit,
+        ///         false, // allow_full_scan
+        ///         |row| {
+        ///             let view = PostView { id: row.id(), title: row.text("title") };
+        ///             let last_id    = row.id().to_string();
+        ///             let last_value = json::json!(row.int("created_at"));
+        ///             (view, Cursor::keyset(last_id, last_value))
+        ///         },
+        ///     )?;
+        ///     Ok(page)
+        /// }
         /// ```
         fn keyset_paginate<T, F>(
             table: &str,
@@ -1597,11 +1728,20 @@ macro_rules! wit_glue {
         /// the query against the WIT store.
         ///
         /// ```ignore
-        /// let page = Query::on("posts")
-        ///     .where_eq("parent_post_id", 0)
-        ///     .where_eq("deleted_at", "")
-        ///     .keyset_by("created_at", SortDir::Desc).limit(20).cursor(c)
-        ///     .fetch_page(|row| PostView::from_row(row))?;
+        /// use boogy_sdk::pagination::{Cursor, CursorPage};
+        /// use boogy_sdk::store::SortDir;
+        ///
+        /// #[derive(Serialize)]
+        /// struct PostView { id: u64, title: String }
+        ///
+        /// fn list_replies(c: Option<Cursor>) -> Result<CursorPage<PostView>, ApiError> {
+        ///     let page = Query::on("posts")
+        ///         .where_eq("parent_post_id", 0)
+        ///         .where_eq("deleted_at", "")
+        ///         .keyset_by("created_at", SortDir::Desc).limit(20).cursor(c)
+        ///         .fetch_page(|row| PostView { id: row.id(), title: row.text("title") })?;
+        ///     Ok(page)
+        /// }
         /// ```
         pub struct Query(pub $crate::query::QueryArgs);
 
@@ -1975,6 +2115,30 @@ macro_rules! wit_glue {
                     .map_err(::std::string::String::from)
             }
 
+            /// Drop a table entirely — irreversibly removes ALL of its rows, every
+            /// index, the row-id counter, and its catalog entry. Idempotent: a
+            /// no-op if the table does not exist (re-run safe). DESTRUCTIVE — the
+            /// data cannot be recovered.
+            ///
+            /// Use to reset a table whose schema changed incompatibly. The table is
+            /// only removed here; recreate it explicitly (drop-then-recreate within
+            /// the migration) — `create_model`/`create_table` rebuild only a
+            /// *missing* table, so a fresh create after the drop yields the new
+            /// schema.
+            pub fn drop_table(
+                &self,
+                table: &str,
+            ) -> ::core::result::Result<(), ::std::string::String> {
+                if !$bindings::boogy::platform::store::list_tables()?
+                    .iter()
+                    .any(|t| t.name == table)
+                {
+                    return Ok(()); // already dropped
+                }
+                $bindings::boogy::platform::store::drop_table(table)
+                    .map_err(::std::string::String::from)
+            }
+
             // -- Data ops for backfills --
 
             /// Find rows matching `filters` in `table`. Returns
@@ -2141,6 +2305,10 @@ macro_rules! wit_glue {
         /// requests: on the no-op path it costs one read on a small table.
         ///
         /// ```ignore
+        /// // `col` / `ColType` / `Val` are not re-exported by `wit_glue!`
+        /// // (the unqualified `store` is the WIT bindings module).
+        /// use boogy_sdk::store::{col, ColType, Val};
+        ///
         /// fn init_tables() {
         ///     create_table_from(&Table::new("notes").text("title").text(DEFAULT_OWNER_COL));
         ///     migrations(&[
@@ -2153,6 +2321,7 @@ macro_rules! wit_glue {
         ///                 name: "idx_notes_priority".into(),
         ///                 columns: vec!["priority".into()],
         ///                 unique: false,
+        ///                 covering: false,
         ///             })?;
         ///             Ok(())
         ///         }),
@@ -2242,6 +2411,27 @@ macro_rules! wit_glue {
             Ok(())
         }
 
+        /// Total attempts `tx` makes before giving up on a store serialization
+        /// conflict, from the `BOOGY_TX_MAX_ATTEMPTS` environment variable the
+        /// platform sets for every service (default 3 = the original attempt
+        /// plus two retries; `1` disables retry). Read once per instance and
+        /// cached; a value that isn't a positive integer falls back to the
+        /// default. Clamped to at least 1 so a `0` can never mean "never run
+        /// the body", and to `MAX_TX_MAX_ATTEMPTS` at the top so a mistyped
+        /// value can't spin a request for its whole time budget. The platform
+        /// applies both clamps too, so the two cannot disagree.
+        fn __boogy_tx_max_attempts() -> u32 {
+            use ::std::sync::OnceLock;
+            static MAX: OnceLock<u32> = OnceLock::new();
+            *MAX.get_or_init(|| {
+                ::std::env::var("BOOGY_TX_MAX_ATTEMPTS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .unwrap_or($crate::store::DEFAULT_TX_MAX_ATTEMPTS)
+                    .clamp(1, $crate::store::MAX_TX_MAX_ATTEMPTS)
+            })
+        }
+
         /// Run a closure inside a database transaction. All `store::*` calls made while
         /// the closure runs — locally AND across any `peer::fetch` — join one atomic
         /// store transaction. On `Ok` the transaction commits; on `Err` it rolls back.
@@ -2269,53 +2459,192 @@ macro_rules! wit_glue {
         /// survives; variant flattens).
         ///
         /// `begin`/`commit` errors are mapped through `E::from(store_error)` as well, so
-        /// a commit `Conflict` (store serialization abort) or an `Unsupported`
-        /// reaches the client as 409 / 501 when `E = ApiError`. A handler returning
-        /// `Result<_, ApiError>` writes `tx(|| ...)?` and the existing
+        /// a commit `Unsupported` reaches the client as 501 when `E = ApiError`. A
+        /// handler returning `Result<_, ApiError>` writes `tx(|| ...)?` and the existing
         /// `From<store::StoreError> for ApiError` maps the variant to the correct status
-        /// (Conflict → 409, Unsupported → 501, …). When `E` can't be inferred, name it
+        /// (Unsupported → 501, …). When `E` can't be inferred, name it
         /// with a turbofish: `tx::<_, _, ApiError>(|| ...)`.
         ///
-        /// ```ignore
-        /// // Store-only closure — error type inferred from the surrounding `?`.
-        /// tx(|| {
-        ///     let user_id = store::insert("users", &user_cols)?;
-        ///     store::insert("profiles", &profile_cols)?;
-        ///     Ok(user_id)
-        /// })?;
+        /// # Automatic retry
         ///
-        /// // Structured errors + mixed store/find_row_by — name the error type.
-        /// let (created, balance): (Created<View>, f64) =
-        ///     tx::<_, _, ApiError>(|| {
-        ///         let bal_row = find_row_by("balances",
-        ///             "principal", store::Value::Text(me.clone()))?;
-        ///         let bal = bal_row
-        ///             .map(|r| r.text("balance").parse::<f64>().unwrap_or(0.0))
-        ///             .unwrap_or(default);
-        ///         if bal < amount {
-        ///             // Raises a structured 409 from inside the tx.
-        ///             return Err(ApiError::conflict("insufficient balance"));
-        ///         }
-        ///         // ... writes ...
-        ///         Ok((Created(view), bal - amount))
+        /// A **serialization conflict** — the store aborting the attempt at commit,
+        /// with nothing from it applied — is retried automatically. Two distinct
+        /// causes produce it, and both are safe to re-run:
+        ///
+        /// - **contention**: another transaction committed a write that overlaps
+        ///   this one's read/write set, so the store aborts the loser;
+        /// - **a stale snapshot**: the transaction's read snapshot aged out of the
+        ///   store's version window before it committed — a *duration* failure, not
+        ///   a contention one. A transaction body that reads, computes for several
+        ///   seconds, then writes hits this with no competing writer at all.
+        ///
+        /// Nothing from an aborted attempt landed, so re-running is safe either way,
+        /// and the retry re-runs **only the closure**: everything before it
+        /// (parsing, auth, guards, expensive computation) runs exactly once. That is
+        /// why the guidance is to keep the closure small and store-only, and to do
+        /// costly work before opening the transaction — that guidance answers *both*
+        /// causes, since a small store-only closure neither contends widely nor
+        /// outlives the version window.
+        ///
+        /// The closure is therefore `Fn`, not `FnOnce`: it may run more than once.
+        /// A closure that must consume a value should clone it inside, or compute
+        /// the value before the transaction and borrow it. It is not `FnMut`
+        /// either — which would be the *less* restrictive choice — because a body
+        /// that mutates state across attempts is always a bug under retry: attempt
+        /// 2 would start from attempt 1's leftovers even though the store discarded
+        /// attempt 1's writes, so the closure and the database would disagree.
+        ///
+        /// Total attempts come from `BOOGY_TX_MAX_ATTEMPTS` (default 3); `1`
+        /// disables retry entirely, and then a conflict surfaces unchanged as
+        /// `Conflict` → 409, exactly as it did before auto-retry existed. When
+        /// retry is enabled and the attempts
+        /// are exhausted the error is `TooContended` → **HTTP 503 with a retry
+        /// hint**, not 409: retry exhaustion is congestion on a hot row, not a
+        /// malformed request. 409 keeps its narrow meaning — *your write genuinely
+        /// conflicts* — which is what a `ConstraintViolation` (e.g. a unique-index
+        /// violation) or an `ApiError::conflict(...)` raised by your own code means.
+        /// Persistent `TooContended` is a signal about the transaction body, and
+        /// which signal depends on the cause above: contention on one row is a
+        /// data-model problem (split the key, or use a counter column), a search
+        /// inside the closure that the planner cannot serve from an index puts
+        /// the whole table in the read set so every concurrent writer conflicts
+        /// with you (narrow the read, or move it out of the closure), while a
+        /// body that keeps outliving the version window is a *duration* problem
+        /// (move the slow work out of the closure).
+        ///
+        /// Retry applies to serialization conflicts **only**. These are never
+        /// retried:
+        ///
+        /// - an error returned by the closure itself (it is deterministic — the
+        ///   transaction rolls back and the error propagates unchanged);
+        /// - `ConstraintViolation` — deterministic, so a retry could never succeed;
+        /// - `Poisoned` — a participant service failed inside the transaction;
+        ///   re-running would re-execute that failure once per attempt, and across
+        ///   a call tree that multiplies into repeated callee executions;
+        /// - `CommitUnknown` — the outcome is genuinely unknown, so a blind retry
+        ///   could double-apply.
+        ///
+        /// There is no delay between attempts: a conflict resolves because some
+        /// other writer won and committed, so the retry immediately re-reads a
+        /// settled value. The request's overall time budget bounds pathological
+        /// cases.
+        ///
+        /// # The closure is `Fn`, and that constrains what you may write in it
+        ///
+        /// Retrying means calling the closure again, so it cannot be `FnOnce` —
+        /// and `FnMut` would still not let a captured value be moved out. The
+        /// bound is therefore `Fn`, and **the closure may not consume anything it
+        /// captures**. Two shapes that look natural and do not compile:
+        ///
+        /// ```ignore, ignore_snippet: shows the two shapes the compiler REJECTS (E0507) — compiling it would assert the opposite of what it teaches.
+        /// // E0507 — struct-update moves the captured `row`.
+        /// tx::<_, _, ApiError>(|| { db_update(id, &Row { name, ..row })?; Ok(()) })
+        ///
+        /// // E0507 — matching by value moves the captured `Option`.
+        /// tx::<_, _, ApiError>(|| { match existing { Some(r) => …, None => … } })
+        /// ```
+        ///
+        /// Build the owned value **before** the closure and borrow it inside
+        /// (`&updated`), or match on a reference (`match &existing`). Constructing
+        /// values inside the closure is always fine — the restriction is only on
+        /// consuming captures.
+        ///
+        /// ```ignore
+        /// #[derive(Serialize)]
+        /// struct View { id: u64 }
+        ///
+        /// fn signup(user_cols: &[store::Column], profile_cols: &[store::Column])
+        ///     -> Result<u64, ApiError>
+        /// {
+        ///     // Store-only closure. `E` is NOT inferable from the surrounding
+        ///     // `?` (several error types convert from a store error), so name it.
+        ///     let user_id = tx::<_, _, store::StoreError>(|| {
+        ///         let user_id = store::insert("users", user_cols)?;
+        ///         store::insert("profiles", profile_cols)?;
+        ///         Ok(user_id)
         ///     })?;
+        ///     Ok(user_id)
+        /// }
+        ///
+        /// fn debit(me: &str, amount: f64, default: f64) -> Result<(Created<View>, f64), ApiError> {
+        ///     // Structured errors + mixed store/find_row_by — name the error type.
+        ///     let (created, balance): (Created<View>, f64) =
+        ///         tx::<_, _, ApiError>(|| {
+        ///             let bal_row = find_row_by("balances",
+        ///                 "principal", store::Value::Text(me.to_string()))?;
+        ///             let bal = bal_row
+        ///                 .map(|r| r.text("balance").parse::<f64>().unwrap_or(0.0))
+        ///                 .unwrap_or(default);
+        ///             if bal < amount {
+        ///                 // Raises a structured 409 from inside the tx.
+        ///                 return Err(ApiError::conflict("insufficient balance"));
+        ///             }
+        ///             let id = store::insert("ledger", &[store::Column {
+        ///                 name: "delta".into(),
+        ///                 val: store::Value::Text(format!("{:.6}", -amount)),
+        ///             }])?;
+        ///             Ok((Created(View { id }), bal - amount))
+        ///         })?;
+        ///     Ok((created, balance))
+        /// }
         /// ```
         fn tx<F, R, E>(f: F) -> ::core::result::Result<R, E>
         where
-            F: ::core::ops::FnOnce() -> ::core::result::Result<R, E>,
+            F: ::core::ops::Fn() -> ::core::result::Result<R, E>,
             E: ::core::convert::From<store::StoreError>,
         {
-            if let Err(e) = $bindings::boogy::platform::store::begin_transaction() {
-                return Err(E::from(e));
-            }
-            match f() {
-                Ok(r) => match $bindings::boogy::platform::store::commit_transaction() {
-                    Ok(()) => Ok(r),
-                    Err(e) => Err(E::from(e)),
-                },
-                Err(e) => {
-                    let _ = $bindings::boogy::platform::store::rollback_transaction();
-                    Err(e)
+            let max_attempts = __boogy_tx_max_attempts();
+            let mut attempt: u32 = 1;
+            loop {
+                if let Err(e) = $bindings::boogy::platform::store::begin_transaction() {
+                    return Err(E::from(e));
+                }
+                match f() {
+                    Ok(r) => match $bindings::boogy::platform::store::commit_transaction() {
+                        Ok(()) => return Ok(r),
+                        // A serialization conflict means the store aborted this
+                        // attempt and nothing landed — the one store error that is
+                        // safe to re-run. It is produced only by the commit path;
+                        // deterministic 409s (unique-index violations, "already
+                        // exists") are `ConstraintViolation` and fall through to the
+                        // catch-all below, as do `Poisoned` and `CommitUnknown`.
+                        Err(store::StoreError::Conflict(_)) if attempt < max_attempts => {
+                            attempt += 1;
+                            // The refused commit already discarded the transaction,
+                            // so the next iteration opens a fresh one. No delay: the
+                            // conflict resolved because another writer committed, so
+                            // re-reading now sees a settled value.
+                            continue;
+                        }
+                        Err(store::StoreError::Conflict(m)) => {
+                            if max_attempts <= 1 {
+                                // Retry is switched off, so nothing was retried and
+                                // there is no exhaustion to report: the conflict
+                                // surfaces exactly as it did before auto-retry
+                                // existed. This is what makes `1` a true kill
+                                // switch rather than a one-attempt variant of the
+                                // new behaviour.
+                                return Err(E::from(store::StoreError::Conflict(m)));
+                            }
+                            // Out of attempts. This is congestion on a contended
+                            // row, not a client mistake — 503 with a retry hint, so
+                            // 409 keeps meaning "your write genuinely conflicts".
+                            return Err(E::from(store::StoreError::TooContended(
+                                ::std::format!(
+                                    "transaction conflicted on all {max_attempts} attempts; \
+                                     the rows it touches are contended, or the closure runs \
+                                     longer than the store's transaction window"
+                                ),
+                            )));
+                        }
+                        Err(e) => return Err(E::from(e)),
+                    },
+                    Err(e) => {
+                        // A closure error is deterministic — re-running it would
+                        // fail the same way. Roll back and propagate unchanged.
+                        let _ = $bindings::boogy::platform::store::rollback_transaction();
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -2487,6 +2816,14 @@ macro_rules! wit_glue {
                 // sk_* fallback: scopes stashed by api_key_routes::guard, so
                 // scope checks unify across PASETO and API-key callers.
                 $crate::request_state::_fallback_scopes().unwrap_or_default()
+            }
+
+            /// The caller's platform handle, when they consented to share
+            /// it with this service. `None` for anonymous callers, API-key
+            /// callers, and callers who haven't shared a handle.
+            pub fn current_handle() -> ::core::option::Option<::std::string::String> {
+                super::$bindings::boogy::platform::auth::current_identity()
+                    .and_then(|i| i.handle)
             }
 
             /// True iff the caller has the named scope. Returns
@@ -2676,7 +3013,7 @@ macro_rules! wit_glue {
                     .text("headers_json")
                     .text("body_b64")
                     .integer("created_at")
-                    .unique_index_on(&["scope_key"]),
+                    .unique_index(&::std::format!("idx_{}_scope", $crate::idempotency::TABLE), &["scope_key"]),
             );
         }
 
@@ -2777,13 +3114,13 @@ macro_rules! wit_glue {
                         .map(__sdk_base64_encode)
                         .unwrap_or_default();
                     let now = $bindings::boogy::platform::runtime::now_millis() as i64 / 1000;
-                    let _ = $bindings::boogy::platform::store::upsert(
+                    let _ = upsert(
                         $crate::idempotency::TABLE,
                         &[$bindings::boogy::platform::store::Column {
                             name: "scope_key".into(),
                             val: $bindings::boogy::platform::store::Value::Text(scope),
                         }],
-                        &[
+                        UpsertColumns::always(&[
                             $bindings::boogy::platform::store::Column {
                                 name: "body_fingerprint".into(),
                                 val: $bindings::boogy::platform::store::Value::Text(fp),
@@ -2806,7 +3143,7 @@ macro_rules! wit_glue {
                                 name: "created_at".into(),
                                 val: $bindings::boogy::platform::store::Value::Integer(now),
                             },
-                        ],
+                        ]),
                     );
                 }
                 resp
@@ -2994,6 +3331,141 @@ macro_rules! wit_glue {
             }
         }
 
+        // -- Host-mediated signing bridge --
+        //
+        // Translates the SDK `signing` types to/from their WIT-generated
+        // equivalents. The host generates + holds the private key and signs
+        // entirely host-side — the component only ever receives the public
+        // key, a produced signature, or a typed error; the private key never
+        // crosses back into wasm and there is no read/export op. The gate is
+        // the `[capabilities] signing = true` manifest grant; without it the
+        // bindings call returns `SignError::CapabilityDenied` — the same
+        // variant a signing write attempted inside a transaction produces.
+
+        fn __signing_alg_to_wit(
+            alg: $crate::signing::SigAlg,
+        ) -> signing_bindings::SigAlg {
+            match alg {
+                $crate::signing::SigAlg::Ed25519 => signing_bindings::SigAlg::Ed25519,
+                $crate::signing::SigAlg::EcdsaSecp256k1 => {
+                    signing_bindings::SigAlg::EcdsaSecp256k1
+                }
+                $crate::signing::SigAlg::EcdsaP256 => signing_bindings::SigAlg::EcdsaP256,
+            }
+        }
+
+        fn __signing_alg_to_sdk(
+            alg: signing_bindings::SigAlg,
+        ) -> $crate::signing::SigAlg {
+            match alg {
+                signing_bindings::SigAlg::Ed25519 => $crate::signing::SigAlg::Ed25519,
+                signing_bindings::SigAlg::EcdsaSecp256k1 => {
+                    $crate::signing::SigAlg::EcdsaSecp256k1
+                }
+                signing_bindings::SigAlg::EcdsaP256 => $crate::signing::SigAlg::EcdsaP256,
+            }
+        }
+
+        fn __signing_signature_to_sdk(
+            sig: signing_bindings::Signature,
+        ) -> $crate::signing::Signature {
+            $crate::signing::Signature {
+                bytes: sig.bytes,
+                recovery_id: sig.recovery_id,
+            }
+        }
+
+        fn __signing_error_to_sdk(
+            e: signing_bindings::SignError,
+        ) -> $crate::signing::SignError {
+            match e {
+                signing_bindings::SignError::CapabilityDenied(s) => {
+                    $crate::signing::SignError::CapabilityDenied(s)
+                }
+                signing_bindings::SignError::UnknownKey(s) => {
+                    $crate::signing::SignError::UnknownKey(s)
+                }
+                signing_bindings::SignError::BadInput(s) => {
+                    $crate::signing::SignError::BadInput(s)
+                }
+                signing_bindings::SignError::Internal(s) => {
+                    $crate::signing::SignError::Internal(s)
+                }
+            }
+        }
+
+        /// Generate a new signing key under `label`. Returns the public key.
+        /// The private key stays host-side and is never returned.
+        #[allow(dead_code)]
+        fn signing_create_key(
+            label: &str,
+            alg: $crate::signing::SigAlg,
+        ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::signing::SignError> {
+            match signing_bindings::create_key(&label.to_string(), __signing_alg_to_wit(alg)) {
+                Ok(pk) => Ok(pk),
+                Err(e) => Err(__signing_error_to_sdk(e)),
+            }
+        }
+
+        /// Sign a prehashed 32-byte digest (the ECDSA path). Non-32-byte
+        /// input is rejected `BadInput`; an Ed25519 key rejects here.
+        #[allow(dead_code)]
+        fn signing_sign_digest(
+            label: &str,
+            digest: &[u8],
+            alg: $crate::signing::SigAlg,
+        ) -> ::core::result::Result<$crate::signing::Signature, $crate::signing::SignError> {
+            match signing_bindings::sign_digest(
+                &label.to_string(),
+                &digest.to_vec(),
+                __signing_alg_to_wit(alg),
+            ) {
+                Ok(sig) => Ok(__signing_signature_to_sdk(sig)),
+                Err(e) => Err(__signing_error_to_sdk(e)),
+            }
+        }
+
+        /// Sign a full message (the Ed25519 path). An ECDSA key rejects here.
+        #[allow(dead_code)]
+        fn signing_sign_message(
+            label: &str,
+            message: &[u8],
+            alg: $crate::signing::SigAlg,
+        ) -> ::core::result::Result<$crate::signing::Signature, $crate::signing::SignError> {
+            match signing_bindings::sign_message(
+                &label.to_string(),
+                &message.to_vec(),
+                __signing_alg_to_wit(alg),
+            ) {
+                Ok(sig) => Ok(__signing_signature_to_sdk(sig)),
+                Err(e) => Err(__signing_error_to_sdk(e)),
+            }
+        }
+
+        /// List this service's signing keys (label + alg + public key only).
+        #[allow(dead_code)]
+        fn signing_list_keys() -> ::std::vec::Vec<$crate::signing::KeyInfo> {
+            signing_bindings::list_keys()
+                .into_iter()
+                .map(|k| $crate::signing::KeyInfo {
+                    label: k.label,
+                    alg: __signing_alg_to_sdk(k.alg),
+                    public_key: k.public_key,
+                })
+                .collect()
+        }
+
+        /// Remove a signing key. Idempotent.
+        #[allow(dead_code)]
+        fn signing_remove_key(
+            label: &str,
+        ) -> ::core::result::Result<(), $crate::signing::SignError> {
+            match signing_bindings::remove_key(&label.to_string()) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(__signing_error_to_sdk(e)),
+            }
+        }
+
         // -- Background-jobs bridging --
         //
         // Same shape as peer_fetch: clean SDK types in, WIT types out
@@ -3130,6 +3602,51 @@ macro_rules! wit_glue {
             }
         }
 
+        fn ws_publish_to_principal(
+            channel: &str,
+            principal: &str,
+            payload: &str,
+        ) -> ::core::result::Result<(), $crate::websockets::PublishError> {
+            match ws_bindings::publish_to_principal(
+                &channel.to_string(),
+                &principal.to_string(),
+                &payload.to_string(),
+            ) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(__ws_publish_error_to_sdk(e)),
+            }
+        }
+
+        fn ws_mint_principal_subscribe_grant(
+            channel: &str,
+            principal: &str,
+            ttl_seconds: u32,
+        ) -> ::core::result::Result<String, $crate::websockets::GrantError> {
+            match ws_bindings::mint_principal_subscribe_grant(
+                &channel.to_string(),
+                &principal.to_string(),
+                ttl_seconds,
+            ) {
+                Ok(g) => Ok(g),
+                Err(e) => Err(__ws_grant_error_to_sdk(e)),
+            }
+        }
+
+        /// Build a typed envelope and publish it to a principal's room. The
+        /// preferred publish entrypoint for per-principal channels — always
+        /// send an envelope, never a bare payload. `ts` is filled from the
+        /// host clock (milliseconds since Unix epoch).
+        fn ws_publish_event(
+            channel: &str,
+            principal: &str,
+            type_: &str,
+            v: u32,
+            data: ::serde_json::Value,
+        ) -> ::core::result::Result<(), $crate::websockets::PublishError> {
+            let env = $crate::websockets::Envelope::new(type_, v, now_millis(), data);
+            ws_publish_to_principal(channel, principal, &env.to_json())
+        }
+
         fn __ws_publish_error_to_sdk(
             e: ws_bindings::PublishError,
         ) -> $crate::websockets::PublishError {
@@ -3148,6 +3665,9 @@ macro_rules! wit_glue {
                 }
                 ws_bindings::PublishError::BackendUnavailable => {
                     $crate::websockets::PublishError::BackendUnavailable
+                }
+                ws_bindings::PublishError::WrongClass => {
+                    $crate::websockets::PublishError::WrongClass
                 }
             }
         }
@@ -3171,141 +3691,10 @@ macro_rules! wit_glue {
                 ws_bindings::GrantError::RateLimited => {
                     $crate::websockets::GrantError::RateLimited
                 }
+                ws_bindings::GrantError::WrongClass => {
+                    $crate::websockets::GrantError::WrongClass
+                }
             }
-        }
-
-        // -- Vector search bridging --
-        //
-        // Same pattern as peer_fetch / jobs: SDK types in, WIT types
-        // out via `vector_bindings::*`. Capability gate is host-side;
-        // if `[capabilities] vector = false`, the bindings calls will
-        // return an error string.
-
-        #[allow(dead_code)]
-        fn create_vector_collection(
-            table: &str,
-            name: &str,
-            dims: u32,
-            metric: $crate::vector::DistanceMetric,
-        ) -> Result<(), String> {
-            let wit_metric = match metric {
-                $crate::vector::DistanceMetric::Cosine => vector_bindings::DistanceMetric::Cosine,
-                $crate::vector::DistanceMetric::Euclidean => vector_bindings::DistanceMetric::Euclidean,
-                $crate::vector::DistanceMetric::DotProduct => vector_bindings::DistanceMetric::DotProduct,
-            };
-            vector_bindings::create_collection(table, name, vector_bindings::VectorCollectionOptions {
-                dimensions: dims,
-                metric: wit_metric,
-                m: None,
-                ef_construction: None,
-            })
-        }
-
-        #[allow(dead_code)]
-        fn create_vector_collection_with_options(
-            table: &str,
-            name: &str,
-            opts: &$crate::vector::VectorCollectionOptions,
-        ) -> Result<(), String> {
-            let wit_metric = match opts.metric {
-                $crate::vector::DistanceMetric::Cosine => vector_bindings::DistanceMetric::Cosine,
-                $crate::vector::DistanceMetric::Euclidean => vector_bindings::DistanceMetric::Euclidean,
-                $crate::vector::DistanceMetric::DotProduct => vector_bindings::DistanceMetric::DotProduct,
-            };
-            vector_bindings::create_collection(table, name, vector_bindings::VectorCollectionOptions {
-                dimensions: opts.dimensions,
-                metric: wit_metric,
-                m: opts.m,
-                ef_construction: opts.ef_construction,
-            })
-        }
-
-        #[allow(dead_code)]
-        fn drop_vector_collection(table: &str, name: &str) -> Result<(), String> {
-            vector_bindings::drop_collection(table, name)
-        }
-
-        #[allow(dead_code)]
-        fn unlock_vector_collection(table: &str, name: &str, key: &[u8]) -> Result<(), String> {
-            vector_bindings::unlock_collection(table, name, key)
-        }
-
-        #[allow(dead_code)]
-        fn vector_insert(table: &str, collection: &str, rowid: u64, vector: &[f32]) -> Result<(), String> {
-            vector_bindings::insert(table, collection, rowid, vector)
-        }
-
-        #[allow(dead_code)]
-        fn vector_insert_batch(table: &str, collection: &str, entries: &[(u64, Vec<f32>)]) -> Result<(), String> {
-            let wit_entries: Vec<(u64, Vec<f32>)> = entries.to_vec();
-            vector_bindings::insert_batch(table, collection, &wit_entries)
-        }
-
-        #[allow(dead_code)]
-        fn vector_update(table: &str, collection: &str, rowid: u64, vector: &[f32]) -> Result<(), String> {
-            vector_bindings::update(table, collection, rowid, vector)
-        }
-
-        #[allow(dead_code)]
-        fn vector_delete(table: &str, collection: &str, rowid: u64) -> Result<(), String> {
-            vector_bindings::delete(table, collection, rowid)
-        }
-
-        #[allow(dead_code)]
-        fn vector_search(
-            table: &str,
-            collection: &str,
-            query: &[f32],
-            k: u32,
-        ) -> Result<Vec<$crate::vector::VectorResult>, String> {
-            let results = vector_bindings::search(table, collection, query, &vector_bindings::VectorSearchOptions {
-                k,
-                ef_search: None,
-                filter: None,
-            })?;
-            Ok(results.into_iter().map(|r| $crate::vector::VectorResult {
-                rowid: r.rowid,
-                distance: r.distance,
-            }).collect())
-        }
-
-        #[allow(dead_code)]
-        fn vector_search_with_options(
-            table: &str,
-            collection: &str,
-            query: &[f32],
-            k: u32,
-            ef_search: Option<u32>,
-            filter: Option<store::Filter>,
-        ) -> Result<Vec<$crate::vector::VectorResult>, String> {
-            let results = vector_bindings::search(table, collection, query, &vector_bindings::VectorSearchOptions {
-                k,
-                ef_search,
-                filter,
-            })?;
-            Ok(results.into_iter().map(|r| $crate::vector::VectorResult {
-                rowid: r.rowid,
-                distance: r.distance,
-            }).collect())
-        }
-
-        #[allow(dead_code)]
-        fn vector_search_filtered(
-            table: &str,
-            collection: &str,
-            query: &[f32],
-            k: u32,
-            filter: store::Filter,
-        ) -> Result<Vec<$crate::vector::VectorResult>, String> {
-            let results = vector_bindings::search(table, collection, query, &vector_bindings::VectorSearchOptions {
-                k,
-                ef_search: None,
-                filter: Some(filter),
-            })?;
-            Ok(results.into_iter().map(|r| $crate::vector::VectorResult {
-                rowid: r.rowid,
-                distance: r.distance,
-            }).collect())
         }
 
         // -- The Guest impl that wires everything together --
@@ -3394,9 +3783,20 @@ macro_rules! wit_glue {
                         .map(|i| i.principal),
                 );
 
-                match <$api_struct as $crate::Api>::build_job_router().dispatch(&ctx.handler, &payload) {
+                // Build the SDK-side JobContext mirror from the WIT context so
+                // handlers can read `ctx.attempts` (the terminal-attempt signal).
+                let sdk_ctx = $crate::JobContext {
+                    job_id: ctx.job_id.clone(),
+                    handler: ctx.handler.clone(),
+                    attempts: ctx.attempts,
+                    not_before_unix_s: ctx.not_before_unix_s,
+                };
+                match <$api_struct as $crate::Api>::build_job_router().dispatch(&sdk_ctx, &payload) {
                     ::core::result::Result::Ok(bytes) => ::core::result::Result::Ok(bytes),
-                    ::core::result::Result::Err(msg)  => ::core::result::Result::Err(
+                    ::core::result::Result::Err($crate::JobError::Retry(msg)) => ::core::result::Result::Err(
+                        $bindings::exports::boogy::platform::job_handler::HandlerError::Retry(msg),
+                    ),
+                    ::core::result::Result::Err($crate::JobError::Terminal(msg)) => ::core::result::Result::Err(
                         $bindings::exports::boogy::platform::job_handler::HandlerError::Terminal(msg),
                     ),
                 }

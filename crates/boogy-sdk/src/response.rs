@@ -18,9 +18,21 @@
 //! Result-typed handlers compose through `IntoResponse`:
 //!
 //! ```ignore
+//! #[derive(Deserialize, garde::Validate)]
+//! struct CreateNote {
+//!     #[garde(length(min = 1, max = 200))] title: String,
+//!     #[garde(skip)] body: String,
+//! }
+//!
+//! #[derive(Serialize, schemars::JsonSchema)]
+//! struct NoteOut { id: u64, title: String, body: String }
+//!
 //! fn create_note(req: &mut Req<'_>) -> Result<Created<NoteOut>, ApiError> {
 //!     let input: CreateNote = validate_body(req.body())?;
-//!     let id = store::insert("notes", &columns_for(&input))?;
+//!     let id = store::insert("notes", &[
+//!         store::Column { name: "title".into(), val: store::Value::Text(input.title.clone()) },
+//!         store::Column { name: "body".into(),  val: store::Value::Text(input.body.clone()) },
+//!     ])?;
 //!     Ok(Created(NoteOut { id, title: input.title, body: input.body }))
 //! }
 //! ```
@@ -227,9 +239,12 @@ where
 /// 200 OK with the wrapped value serialized as JSON.
 ///
 /// ```ignore
+/// #[derive(Serialize, schemars::JsonSchema)]
+/// struct ListResp { items: Vec<String> }
+///
 /// fn list(_req: &mut Req<'_>) -> Result<Json<ListResp>, ApiError> {
-///     Ok(Json(ListResp { items: ... }))
-///  }
+///     Ok(Json(ListResp { items: vec![] }))
+/// }
 /// ```
 /// Newtype wrapper for a JSON-serializable value. The `T: Serialize` bound
 /// is on the `IntoResponse` impl (not the struct itself) so that `Json<T>`

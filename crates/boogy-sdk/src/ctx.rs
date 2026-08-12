@@ -12,15 +12,19 @@
 //! a "source" note and a "target" note.
 //!
 //! ```ignore
-//! // Single-resource case (default slot):
-//! ctx.insert::<store::Row>(row);
-//! let row = ctx.require::<store::Row>();
+//! fn handler(req: &mut Req<'_>, row: Row, source_row: Row, target_row: Row) {
+//!     let ctx = &mut req.ctx;
 //!
-//! // Multi-resource case (named slots):
-//! ctx.insert_at::<store::Row>("source", source_row);
-//! ctx.insert_at::<store::Row>("target", target_row);
-//! let source = ctx.require_at::<store::Row>("source");
-//! let target = ctx.require_at::<store::Row>("target");
+//!     // Single-resource case (default slot):
+//!     ctx.insert::<Row>(row);
+//!     let row = ctx.require::<Row>();
+//!
+//!     // Multi-resource case (named slots):
+//!     ctx.insert_at::<Row>("source", source_row);
+//!     ctx.insert_at::<Row>("target", target_row);
+//!     let source = ctx.require_at::<Row>("source");
+//!     let target = ctx.require_at::<Row>("target");
+//! }
 //! ```
 //!
 //! Wasm components run single-threaded per request, so `Ctx` doesn't

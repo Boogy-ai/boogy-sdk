@@ -1,0 +1,5 @@
+error: #[counter] cannot be combined with #[index]: a counter column cannot back an index. An atomic add never reads the previous value, so the old index entry could never be removed. To rank or filter on this value, either scope the ranking to a bounded sub-range and sort in memory, or materialize it into a separate plain column refreshed by a background job.
+  --> tests/ui/counter_index.rs:11:9
+   |
+11 |     pub hits: i64,
+   |         ^^^^
