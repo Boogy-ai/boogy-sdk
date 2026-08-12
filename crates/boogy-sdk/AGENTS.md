@@ -155,7 +155,7 @@ directly.
 |---|---|
 | `auth::current_principal()` → `Option<String>` | Caller's principal id. `None` for anonymous requests. |
 | `auth::required()` → `Guard` | 401 guard for routes that require any authenticated caller (no specific resource). Pair with `auth::find_owned` or business logic that reads identity. |
-| `auth::owns_resource(table, owner_col, id_param)` → `OwnsResource` (impl `IntoGuard`) | Builder for a `Router::guard(...)`. Loads the row identified by `req.params[id_param]`, denies-by-existence-mask (404) if the row is missing **or** isn't owned by `current_principal()`, and stashes the loaded row in `req.ctx`. Add `.slot("name")` for multi-resource routes. |
+| `auth::owns_resource(table, owner_col, id_param)` → `OwnsResource` (impl `IntoGuard`) | Builder for a `Router::guard(...)`. Loads the row identified by `req.params[id_param]`, denies-by-existence-mask (404) if the row is missing **or** isn't owned by `current_principal()`, and stashes the loaded row in `req.ctx` at a slot keyed by `table` — read it back with `req.ctx.require_at::<Row>(table)`. Two guards over *different* tables on one route therefore can't collide even without `.slot()`; only override `.slot("name")` when two guards load the *same* table on one route (they'd otherwise target the same auto-derived slot, which fails loudly — see `Ctx::insert_at`). |
 | `auth::find_owned(table, owner_col)` → `Result<Vec<Row>, RpcError>` | Principal-scoped row list for index endpoints. Returns 401-coded `RpcError` when anonymous. |
 | `auth::load_owned(table, owner_col, id)` → `Result<Option<Row>, RpcError>` | Single-row load with ownership check. `Ok(None)` for both "missing" and "not yours". Use in MCP / JSON-RPC handlers (where the resource id arrives in a body, not a path param). |
 | `DEFAULT_OWNER_COL: &str` | Convention column name (`"owner_principal"`). Use this constant in tables and auth helper calls. Do not invent alternatives like `"owner_id"` / `"created_by"`. |
@@ -164,15 +164,40 @@ directly.
 
 **Two auth patterns you'll write most often:**
 
-REST resource access — guard does the work, handler just reads:
+REST resource access — guard does the work, handler just reads. Read back
+with `req.ctx.require_at::<Row>(table)`, using the same table name passed to
+`owns_resource`:
 ```rust
 Router::new()
     .group([auth::owns_resource("notes", DEFAULT_OWNER_COL, "id")], |g| g
         .get("/api/notes/{id}", get_note));
 
 fn get_note(req: &mut Req<'_>) -> Json<json::Value> {
-    let row = req.ctx.require::<Row>();
+    let row = req.ctx.require_at::<Row>("notes");
     Json(row.to_json(&["title", "body"]))
+}
+```
+
+Multi-resource route — stack an `owns_resource` guard per table (no
+`.slot()` needed; each auto-keys to its own table-named slot) and read each
+back the same way:
+```rust
+Router::new()
+    .group(
+        [
+            auth::owns_resource("rooms", DEFAULT_OWNER_COL, "room_id"),
+            auth::owns_resource("posts", DEFAULT_OWNER_COL, "post_id"),
+        ],
+        |g| g.get("/api/rooms/{room_id}/posts/{post_id}", get_room_post),
+    );
+
+fn get_room_post(req: &mut Req<'_>) -> Json<json::Value> {
+    let room = req.ctx.require_at::<Row>("rooms");
+    let post = req.ctx.require_at::<Row>("posts");
+    Json(json::json!({
+        "room": room.to_json(&["name"]),
+        "post": post.to_json(&["title", "body"]),
+    }))
 }
 ```
 
@@ -677,7 +702,7 @@ does, which is exactly the bug the separate variants exist to prevent.
 |---|---|
 | `Result<_, StoreError>` (the typed helpers: `get_row`, `find_all_rows`, `find_row_by`, `find_rows`, `find_rows_by`) | Use bare `?` — the `From<StoreError> for ApiError` conversion preserves the semantic class (404 / 409 / 500). |
 | `Result<_, store::StoreError>` (raw WIT calls: `store::insert`, `store::update`, `store::delete`, plus everything on the `Transaction` resource) | The host carries a typed `store-error` variant; bare `?` into an `ApiError`-returning handler preserves the semantic class (quota → 507, conflict → 409, …) via the macro-emitted `From<store::StoreError> for ApiError`. `.map_err(ApiError::internal)` still works (flattens to 500) if you want that. Inside a tx closure the error type is `String`; bare `?` lifts WIT errors to it lossily. |
-| `Result<_, PeerError>` (`peer_fetch`) | Bare `?` — `From<PeerError> for ApiError` lifts a dependency failure (`TargetNotFound`/`Denied`/`Timeout`/`DepthExceeded`/`Internal`) to **502 `/errors/upstream`**, and a *this-service* misconfig (`CapabilityDenied`/`InvalidTarget`) to **500**. Match the variant before `?` if you want a different status (e.g. treat the callee's 404 as your own resource's 404). The wire `detail` carries only the failure class; the full error (target URI, policy text) is logged request-correlated to your service's log stream — debug there. |
+| `Result<_, PeerError>` (`peer_fetch`) | Bare `?` — `From<PeerError> for ApiError` lifts a dependency failure (`TargetNotFound`/`Denied`/`Timeout`/`DepthExceeded`/`Internal`/**`Rejected`** — the callee responded with a non-2xx status, which `peer_fetch` treats as failure by default) to **502 `/errors/upstream`**, and a *this-service* misconfig (`CapabilityDenied`/`InvalidTarget`) to **500**. Match the variant before `?` if you want a different status (e.g. treat the callee's 404 as your own resource's 404), or use `peer_fetch_raw` if you need the raw status itself (a relay/proxy route). The wire `detail` carries only the failure class; the full error (target URI, policy text) is logged request-correlated to your service's log stream — debug there. |
 | `Result<_, serde_json::Error>` (`PeerRequest::body_json`, `resp.json()`, `serde_json::to_*` on bodies you construct) | Bare `?` — `From<serde_json::Error> for ApiError` lifts to **500** (framing failure: a body the service itself built/parsed). Client-supplied bodies should go through `parse_body`/`validate_body` instead, which map malformed input to 400/422. |
 
 Use `match` on `StoreError` variants when you need to react — e.g. retrying
@@ -857,8 +882,13 @@ transaction** — the callee's `store::*` ops auto-join, and the callee does
 *not* call `tx` itself (calling `tx` from a handler already
 enrolled as a peer participant fails at commit). Only the **originating
 request (the owner)** commits. Any participant failure **poisons** the
-transaction so commit refuses — rollback only. The whole call tree shares
-one 5s / 10MB store transaction envelope.
+transaction so commit refuses — rollback only, including a callee's plain
+business-logic rejection (a non-2xx `ApiError` from its handler), not only a
+`StoreError`. `peer_fetch`'s checked default (`Err` on a non-2xx response)
+already stops the closure at the `?` before the tx would even reach commit;
+the poisoning above is the platform's own backstop for a closure that
+bypasses that default (`peer_fetch_raw`) without checking the status itself.
+The whole call tree shares one 5s / 10MB store transaction envelope.
 
 **Denied inside a tx:** `outbound_http`, every `signing` **write**
 (`signing_create_key` / `signing_sign_digest` / `signing_sign_message` /
@@ -1347,6 +1377,17 @@ non-default status. Requires `peer = true` in the manifest's `[capabilities]`. M
 `[ingress.delegation]` controls on-behalf-of (OBO) flow when one service
 calls another carrying an end-user identity.
 
+**`peer_fetch` fails on a non-success status by default.** Any response with
+`status >= 400` comes back as `Err(PeerError::Rejected(resp))`, not
+`Ok(resp)` — the `?` above already stops on a callee's explicit rejection,
+so there is no separate `resp.is_success()` check to remember, including
+inside a `tx(|| ...)` closure (where letting a rejection fall through would
+otherwise let the transaction commit past it). Reach for `peer_fetch_raw`
+(same signature) only when you genuinely need the raw status yourself — a
+generic relay/proxy route, or a caller that wants to map the callee's status
+to its own domain error instead of the generic 502. **Probing a peer's
+status from inside a transaction requires this explicit opt-in.**
+
 ## Websockets (real-time channels)
 
 A service can broadcast real-time messages to subscribers over declared
@@ -1513,7 +1554,7 @@ use crate::bindings;  // if you need to reach into raw WIT bindings
 | Schema | `create_table_from`, `migration`, `migrations` |
 | Row reads | `to_sdk_row`, `get_row`, `find_all_rows`, `find_row_by`, `find_rows_by`, `find_rows`, `find_rows_grouped`, `upsert_increment`, `for_each_batch` |
 | Transactions | `tx` (no-arg closure, generic over error type; call the same `store::*`/`db_*`/`find_row_by` fns inside) |
-| Helpers | `filter_eq` (+ `filter_neq`/`filter_gt`/`filter_gte`/`filter_lt`/`filter_lte`/`filter_like`/`filter_not_like`/`filter_is_null`/`filter_is_not_null`/`filter_in`), `sort_asc`/`sort_desc`, `page`, `now_millis`, `peer_fetch` |
+| Helpers | `filter_eq` (+ `filter_neq`/`filter_gt`/`filter_gte`/`filter_lt`/`filter_lte`/`filter_like`/`filter_not_like`/`filter_is_null`/`filter_is_not_null`/`filter_in`), `sort_asc`/`sort_desc`, `page`, `now_millis`, `peer_fetch` (checked default — `Err` on non-2xx), `peer_fetch_raw` (opt-in — always `Ok` on any status) |
 
 If `api_keys_glue!` is also invoked, add: the `api_key_routes` module
 with `create` / `list` / `revoke` / `rotate` / `guard` / `resolve_caller`

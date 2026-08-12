@@ -13,13 +13,14 @@
 //! #[derive(Deserialize)]
 //! struct Note { id: u64, title: String }
 //!
+//! // `peer_fetch` fails (`Err(PeerError::Rejected)`) on a non-success HTTP
+//! // status, so a bare `?` already refuses to proceed past a callee's
+//! // explicit rejection — no separate `resp.is_success()` check needed.
 //! let resp = peer_fetch(
 //!     "boogy://daniel/services/notes-api",
 //!     &PeerRequest::get("/api/notes"),
 //! )?;
-//! if resp.is_success() {
-//!     let notes: Vec<Note> = resp.json()?;
-//! }
+//! let notes: Vec<Note> = resp.json()?;
 //! ```
 //!
 //! Capability gate: the caller's manifest must set
@@ -29,6 +30,27 @@
 //! `Principal::Workload { uri: "boogy://<owner>/<api>" }` in
 //! their `auth` capability — no agent identity is propagated unless
 //! OBO delegation is in play (lands separately).
+//!
+//! ## Default vs raw: who sees a non-success status
+//!
+//! `peer_fetch` (emitted by [`wit_glue!`](crate::wit_glue)) treats any
+//! response with `status >= 400` as failure: it returns
+//! `Err(PeerError::Rejected(resp))` instead of `Ok(resp)`. This makes the
+//! idiomatic `peer_fetch(...)?` shape correct by default — including inside
+//! a `tx(|| ...)` closure, where a callee's explicit rejection must stop the
+//! closure rather than let it fall through to a commit the callee never
+//! agreed to. The host enforces the transactional case independently too
+//! (a non-2xx participant response poisons an open ambient transaction), so
+//! this is defense in depth, not the only guard.
+//!
+//! Reach for `peer_fetch_raw` (same signature, also emitted by
+//! [`wit_glue!`](crate::wit_glue)) only when you genuinely need the raw
+//! status yourself — a generic relay/proxy endpoint that forwards whatever
+//! the callee said, or a caller that wants to map the callee's status to its
+//! own domain-specific error instead of the generic 502 upstream `?` would
+//! produce. **Probing a peer's status from inside a transaction now requires
+//! this explicit opt-in** — the default fails fast specifically so that
+//! shape can't silently commit past a rejection.
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -125,9 +147,10 @@ impl PeerResponse {
     }
 }
 
-/// Mirror of the WIT `fetch-error` variant. Programmatic
-/// discrimination should match on the variant; the inner `String`
-/// fields are for human consumption.
+/// Mirror of the WIT `fetch-error` variant, plus one SDK-level addition
+/// ([`PeerError::Rejected`]) that never crosses the WIT boundary — see its
+/// doc. Programmatic discrimination should match on the variant; the inner
+/// `String` fields are for human consumption.
 #[derive(Debug, Clone)]
 pub enum PeerError {
     InvalidTarget(String),
@@ -137,6 +160,17 @@ pub enum PeerError {
     DepthExceeded,
     CapabilityDenied,
     Internal(String),
+    /// The peer responded, but with a non-success HTTP status (`>= 400`).
+    /// This is an SDK-level classification, not a WIT `fetch-error` variant —
+    /// the host's `peer::fetch` still returns `Ok` for any status; the
+    /// default `peer_fetch` wrapper (emitted by [`wit_glue!`](crate::wit_glue))
+    /// turns a non-success [`PeerResponse`] into this `Err` so the idiomatic
+    /// `?` propagates a callee's explicit rejection instead of silently
+    /// continuing past it. Call [`wit_glue!`](crate::wit_glue)'s emitted
+    /// `peer_fetch_raw` instead if you need to inspect a non-success status
+    /// yourself (a generic relay/proxy, or a caller that wants to map the
+    /// callee's status to its own domain error).
+    Rejected(PeerResponse),
 }
 
 impl std::fmt::Display for PeerError {
@@ -149,6 +183,9 @@ impl std::fmt::Display for PeerError {
             PeerError::DepthExceeded => write!(f, "recursion depth exceeded"),
             PeerError::CapabilityDenied => write!(f, "peer capability not granted"),
             PeerError::Internal(s) => write!(f, "internal error: {s}"),
+            PeerError::Rejected(resp) => {
+                write!(f, "peer responded with non-success status {}", resp.status)
+            }
         }
     }
 }

@@ -27,6 +27,14 @@
 //! }
 //! ```
 //!
+//! `auth::owns_resource(table, ...)` picks its slot automatically — the
+//! table name — so two `owns_resource` guards loading different tables on
+//! one route never collide, with no `.slot()` call required from the
+//! route author. Two guards over the *same* table still need an explicit
+//! `.slot("name")` on at least one of them, since they'd otherwise land on
+//! the same auto-derived slot and the second guard's insert would panic
+//! (see [`Ctx::insert_at`]) rather than silently overwrite the first.
+//!
 //! Wasm components run single-threaded per request, so `Ctx` doesn't
 //! impose `Send`/`Sync` bounds on stored values.
 
@@ -58,22 +66,31 @@ impl Ctx {
 
     /// Insert a value at the default slot for its type.
     ///
-    /// In debug builds, panics if a value of the same type is already
-    /// present at the default slot — almost always indicates two guards
-    /// stashing the same shape without disambiguation. In release builds
-    /// the second insert silently overwrites.
+    /// Panics if a value of the same type is already present at the
+    /// default slot — see [`Ctx::insert_at`].
     pub fn insert<T: 'static>(&mut self, val: T) {
         self.insert_at(DEFAULT_SLOT, val);
     }
 
     /// Insert a value at a named slot. Use this when more than one
     /// value of the same type must coexist in the bag.
+    ///
+    /// Panics — in every build, not just debug — if a value of the same
+    /// type is already present at this exact slot. Two callers stashing
+    /// the same shape at the same slot without disambiguation is an
+    /// authoring bug: whichever insert lost would otherwise be silently
+    /// unreadable, with nothing at the read site able to tell. That
+    /// silent-overwrite failure mode must surface the same way in every
+    /// build a service ships in, so this is a full `assert!`, not a
+    /// `debug_assert!`.
     pub fn insert_at<T: 'static>(&mut self, slot: &'static str, val: T) {
         let key = (TypeId::of::<T>(), slot);
-        debug_assert!(
+        assert!(
             !self.bag.contains_key(&key),
             "Ctx::insert_at: slot ({:?}, {:?}) already populated — \
-             two guards stashing the same type without distinct slot names",
+             two callers stashed the same type at the same slot without \
+             disambiguation (e.g. two `owns_resource` guards over the \
+             same table on one route — give one an explicit `.slot(\"name\")`)",
             std::any::type_name::<T>(),
             slot,
         );
@@ -164,9 +181,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "already populated")]
-    fn double_insert_same_slot_debug_asserts() {
+    fn double_insert_same_slot_panics() {
+        // Unconditional — no `#[cfg(debug_assertions)]` — because the
+        // whole point is that this fails the same way in a release build,
+        // which is how every wasm fixture in this repo is compiled.
         let mut ctx = Ctx::new();
         ctx.insert(Note("first".into()));
         ctx.insert(Note("second".into()));

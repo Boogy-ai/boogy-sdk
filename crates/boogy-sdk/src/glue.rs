@@ -2445,7 +2445,20 @@ macro_rules! wit_glue {
         /// typed `unsupported` store error (→ HTTP 501 once it lifts into `ApiError`).
         /// Must run as the transaction owner: calling `tx` from a
         /// handler already enrolled as a peer participant of a caller's transaction
-        /// fails at commit (only the originating request commits).
+        /// fails at commit (only the originating request commits) — the closure still
+        /// runs and its `store::*` calls still join the caller's ambient transaction
+        /// (committing or rolling back with it), but THIS `tx()` call reports `Err`
+        /// (the same `unsupported` → 501 store error noted above) to its own handler
+        /// rather than the `Ok` a transparent no-op would imply. A callee should not
+        /// call `tx` at all — this is what happens if it does anyway.
+        ///
+        /// Inside the closure, `peer_fetch` already fails (`Err`) on a callee's
+        /// non-success HTTP status by default, so the ordinary `peer_fetch(...)?`
+        /// shape stops the closure — and therefore the commit — on an explicit
+        /// rejection from a peer. The host enforces the same rule independently
+        /// (a non-2xx participant response poisons the open ambient transaction), so
+        /// this holds even for a closure that bypasses the SDK default via
+        /// `peer_fetch_raw` and doesn't check the status itself.
         ///
         /// The closure may return any error type `E` that implements
         /// `From<store::StoreError>`, so handlers raise **structured** errors (e.g.
@@ -2695,9 +2708,13 @@ macro_rules! wit_glue {
             }
 
             impl OwnsResource {
-                /// Stash the loaded row at a named slot in `req.ctx`. Use
-                /// when more than one row of the same shape is loaded by
-                /// distinct guards on the same route.
+                /// Override the `req.ctx` slot the loaded row is stashed
+                /// at. The default slot is already the table name (see
+                /// [`owns_resource`]), so this is only needed when two
+                /// guards on the same route load the *same* table — they'd
+                /// otherwise land on the same auto-derived slot and the
+                /// second guard's stash would fail loudly at runtime
+                /// instead of silently overwriting the first.
                 pub fn slot(mut self, slot: &'static str) -> Self {
                     self.slot = slot;
                     self
@@ -2712,8 +2729,15 @@ macro_rules! wit_glue {
             /// - `id_param` — the path-param name carrying the resource id
             ///   (typically `"id"`).
             ///
-            /// Default slot is the empty string. Use `.slot("name")` to
-            /// disambiguate when more than one resource is loaded.
+            /// The loaded row is stashed in `req.ctx` at a slot keyed by
+            /// `table`, so stacking guards over *different* tables on one
+            /// route — the natural shape for a route that owns two
+            /// resources — can never collide: read each back with
+            /// `req.ctx.require_at::<Row>(table)`, using the same table
+            /// name the guard was built with. Use `.slot("name")` only to
+            /// override that default (e.g. two guards over the *same*
+            /// table need distinct names, since they'd otherwise both
+            /// target that one auto-derived slot).
             pub fn owns_resource(
                 table: &'static str,
                 owner_col: &'static str,
@@ -2758,11 +2782,19 @@ macro_rules! wit_glue {
                         if !$crate::request_state::_principal_owns(&principal, &row.text(self.owner_col)) {
                             return Err($crate::response::not_found());
                         }
-                        if self.slot.is_empty() {
-                            req.ctx.insert(row);
-                        } else {
-                            req.ctx.insert_at(self.slot, row);
-                        }
+                        // Auto-key by table unless the caller overrode it
+                        // via `.slot(...)`. This is what makes stacking two
+                        // `owns_resource` guards over different tables on
+                        // one route correct without any annotation: each
+                        // guard's insert lands at its own table-named slot,
+                        // so neither can overwrite the other's stash. Two
+                        // guards over the SAME table (no override on
+                        // either) still target the same slot on purpose —
+                        // that's a genuine ambiguity, and `Ctx::insert_at`
+                        // now fails loudly on it instead of silently
+                        // overwriting.
+                        let slot = if self.slot.is_empty() { self.table } else { self.slot };
+                        req.ctx.insert_at(slot, row);
                         Ok(())
                     })
                 }
@@ -3234,7 +3266,36 @@ macro_rules! wit_glue {
         // crate. Capability gating happens host-side; if the
         // manifest doesn't grant `peer`, the bindings call returns
         // FetchError::CapabilityDenied.
+        //
+        // `peer_fetch` is the checked default: a non-success response
+        // (`status >= 400`) becomes `Err(PeerError::Rejected(resp))` so the
+        // idiomatic `?` at the call site stops on a callee's explicit
+        // rejection instead of silently continuing past it (audit finding
+        // H-02 — see `crates/boogy-sdk/src/peer.rs` module docs). Reach for
+        // `peer_fetch_raw` when a route genuinely needs the raw status
+        // (a relay/proxy, or a caller mapping the callee's status to its own
+        // domain error) — including any route that wants to inspect a
+        // peer's status from inside a `tx(|| ...)` closure, which is exactly
+        // the opt-in that shape now requires.
         fn peer_fetch(
+            target: &str,
+            request: &$crate::peer::PeerRequest,
+        ) -> ::core::result::Result<$crate::peer::PeerResponse, $crate::peer::PeerError> {
+            let resp = peer_fetch_raw(target, request)?;
+            if resp.status >= 400 {
+                ::core::result::Result::Err($crate::peer::PeerError::Rejected(resp))
+            } else {
+                ::core::result::Result::Ok(resp)
+            }
+        }
+
+        /// Same call shape as [`peer_fetch`], but never classifies a
+        /// non-success HTTP status as failure: returns `Ok` for ANY status
+        /// the peer responds with. Only a genuine dispatch failure (target
+        /// not found, denied by the target's ingress policy, timed out,
+        /// depth exceeded, capability not granted, ...) is `Err` here.
+        #[allow(dead_code)]
+        fn peer_fetch_raw(
             target: &str,
             request: &$crate::peer::PeerRequest,
         ) -> ::core::result::Result<$crate::peer::PeerResponse, $crate::peer::PeerError> {

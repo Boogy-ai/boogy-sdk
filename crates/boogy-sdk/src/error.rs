@@ -426,6 +426,11 @@ impl From<crate::peer::PeerError> for ApiError {
             P::Timeout(_) => "timeout",
             P::DepthExceeded => "depth exceeded",
             P::Internal(_) => "internal",
+            // The peer reached the wire and explicitly rejected the request
+            // (non-2xx) — a dependency failure like the others above, not a
+            // misconfiguration of THIS service, so it gets the same 502
+            // treatment rather than the 500 the misconfig arm below produces.
+            P::Rejected(_) => "rejected",
             P::CapabilityDenied | P::InvalidTarget(_) => {
                 crate::log::error!("peer call misconfigured: {e} -> returned to client as 500");
                 return ApiError::internal("peer call misconfigured");
@@ -536,6 +541,11 @@ mod tests {
             P::Timeout("SECRET-INNER".into()),
             P::DepthExceeded,
             P::Internal("SECRET-INNER".into()),
+            P::Rejected(crate::peer::PeerResponse {
+                status: 422,
+                headers: vec![],
+                body: Some(b"SECRET-INNER".to_vec()),
+            }),
         ] {
             let a: super::ApiError = e.into();
             assert_eq!(a.status, 502);
