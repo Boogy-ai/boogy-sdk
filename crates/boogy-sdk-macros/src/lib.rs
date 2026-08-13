@@ -382,6 +382,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     /// arms is a compile error rather than a shrug.
     fn parse_default_attr(
         attr: &syn::Attribute,
+        ty: &syn::Type,
     ) -> syn::Result<(proc_macro2::TokenStream, &'static str)> {
         const FORMS: &str = "Supported literals: string (`= \"pending\"`), integer \
                              (`= 0`), float (`= 1.5`), boolean (`= true`), byte string \
@@ -438,7 +439,23 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         Ok(match lit {
             syn::Lit::Str(s) if !negated => {
                 let v = s.value();
-                (quote! { ::boogy_sdk::store::Val::Text(#v.to_string()) }, "string")
+                if is_decimal_type(ty) {
+                    // `Decimal` stores as scaled `i64` minor units, so its
+                    // string default is parsed EXACTLY here, at compile
+                    // time — never through a float — and emitted as the
+                    // `Val::Integer` the column actually holds. A malformed
+                    // or over-precise literal is a compile error, same as
+                    // every other `#[default]` mistake this fn catches.
+                    let minor = parse_decimal_default(&v).map_err(|e| {
+                        syn::Error::new_spanned(
+                            s,
+                            format!("#[default]: invalid Decimal literal: {e} (got {v:?})"),
+                        )
+                    })?;
+                    (quote! { ::boogy_sdk::store::Val::Integer(#minor) }, "string")
+                } else {
+                    (quote! { ::boogy_sdk::store::Val::Text(#v.to_string()) }, "string")
+                }
             }
             syn::Lit::Int(i) => {
                 let mut v: i64 = i.base10_parse()?;
@@ -475,6 +492,79 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         })
     }
 
+    /// True for `Decimal` or `Option<Decimal>` — the one field type whose
+    /// `#[default]` string literal is parsed EXACTLY at compile time into
+    /// scaled minor units, rather than stored as `Val::Text` verbatim.
+    /// Mirrors `expected_default_kind`'s `Option` unwrap below.
+    fn is_decimal_type(ty: &syn::Type) -> bool {
+        let path = match ty {
+            syn::Type::Path(p) => &p.path,
+            _ => return false,
+        };
+        let Some(seg) = path.segments.last() else { return false };
+        if seg.ident == "Option" {
+            if let syn::PathArguments::AngleBracketed(a) = &seg.arguments {
+                if let Some(syn::GenericArgument::Type(inner)) = a.args.first() {
+                    return is_decimal_type(inner);
+                }
+            }
+            return false;
+        }
+        seg.ident == "Decimal"
+    }
+
+    /// Compile-time twin of `boogy_sdk::model::Decimal`'s exact string
+    /// parser. This crate cannot depend on `boogy-sdk` — the dependency
+    /// runs the other way — so the algorithm is duplicated here; keep the
+    /// two in lockstep (6 fractional digits, reject rather than round
+    /// anything with more, `i64` minor units).
+    fn parse_decimal_default(s: &str) -> Result<i64, String> {
+        const SCALE: i64 = 1_000_000;
+        const SCALE_DIGITS: usize = 6;
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err("empty".to_string());
+        }
+        let (neg, rest) = match trimmed.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+        };
+        let mut parts = rest.splitn(2, '.');
+        let int_part = parts.next().unwrap_or("");
+        let frac_part = parts.next().unwrap_or("");
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err("no digits".to_string());
+        }
+        if !int_part.chars().all(|c| c.is_ascii_digit()) {
+            return Err("non-digit in integer part".to_string());
+        }
+        if !frac_part.chars().all(|c| c.is_ascii_digit()) {
+            return Err("non-digit in fractional part (or more than one '.')".to_string());
+        }
+        if frac_part.len() > SCALE_DIGITS {
+            return Err(format!(
+                "more than {SCALE_DIGITS} fractional digits — Decimal is exact to \
+                 {SCALE_DIGITS} decimal places; round explicitly before writing the literal"
+            ));
+        }
+        let int_val: i64 = if int_part.is_empty() {
+            0
+        } else {
+            int_part.parse().map_err(|_| "integer part out of range for i64".to_string())?
+        };
+        let mut padded = frac_part.to_string();
+        while padded.len() < SCALE_DIGITS {
+            padded.push('0');
+        }
+        let frac_val: i64 =
+            padded.parse().map_err(|_| "fractional part out of range".to_string())?;
+        let magnitude = int_val
+            .checked_mul(SCALE)
+            .and_then(|m| m.checked_add(frac_val))
+            .ok_or_else(|| "out of range for Decimal".to_string())?;
+        Ok(if neg { -magnitude } else { magnitude })
+    }
+
     /// The literal kind a field type's column can hold, for the types the derive
     /// knows. `None` = a custom `Field` impl the derive cannot reason about, so
     /// no check is applied.
@@ -498,8 +588,10 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             return None;
         }
         match seg.ident.to_string().as_str() {
-            // `Decimal` is stored as fixed-precision TEXT, so its default is a
-            // string like "1.500000" — not a float literal.
+            // `Decimal` ALSO takes a string literal — a plain decimal
+            // string like `"19.99"`, parsed EXACTLY at compile time into
+            // scaled minor units (never through a float; see
+            // `parse_decimal_default` below and `boogy_sdk::model::Decimal`).
             "String" | "Decimal" => Some("string"),
             "i64" | "u64" | "Timestamp" | "Id" => Some("integer"),
             "f64" => Some("float"),
@@ -603,7 +695,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 )?;
                 counter = true;
             } else if attr.path().is_ident("default") {
-                let (val, kind) = parse_default_attr(attr)?;
+                let (val, kind) = parse_default_attr(attr, &f.ty)?;
                 if let Some(expected) = expected_default_kind(&f.ty) {
                     if expected != kind {
                         return Err(syn::Error::new_spanned(

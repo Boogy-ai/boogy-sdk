@@ -2821,13 +2821,15 @@ macro_rules! wit_glue {
             /// PASETO is the primary path: the WIT
             /// `auth::current_identity()` carries the principal the
             /// host attached to the request. When WIT auth is `None`,
-            /// the SDK falls back to a per-request slot set by
-            /// `api_key_routes::guard` — that slot carries the
-            /// principal an `sk_*` bearer resolved to. The result is
-            /// uniform: handlers and resource-level guards
-            /// (`auth::owns_resource`, `auth::find_owned`) work the
-            /// same regardless of credential type. The slot is
-            /// cleared at request exit by the `wit_glue!` RAII guard.
+            /// the SDK falls back to a per-request slot resolved from an
+            /// inbound `sk_*` bearer at request entry — before any route
+            /// guard runs, so this works whether or not the route
+            /// declares `api_key_routes::guard`, and regardless of where
+            /// in the guard array it sits. The result is uniform:
+            /// handlers and resource-level guards (`auth::owns_resource`,
+            /// `auth::find_owned`) work the same regardless of credential
+            /// type. The slot is cleared at request exit by the
+            /// `wit_glue!` RAII guard.
             pub fn current_principal() -> ::core::option::Option<::std::string::String> {
                 // Both the WIT principal (PASETO/session) and the API-key
                 // fallback are now stashed in `request_state` at request
@@ -3758,6 +3760,59 @@ macro_rules! wit_glue {
             }
         }
 
+        // Resolve an inbound `Authorization: Bearer sk_*` credential against
+        // the local `__boogy_api_keys` table, independent of whether the
+        // consumer crate invoked `api_keys_glue!` at all — this fn only
+        // needs the always-available `$crate::api_keys` logic helpers plus
+        // the store glue this same macro already emits (`find_row_by`,
+        // `__boogy_update_row`), so it works even for crates with no
+        // `api_key_routes` module (the store lookup then just finds no
+        // matching table/row and this returns `None`, same as an anonymous
+        // request).
+        //
+        // Called once at request entry (see `Guest::handle` below) — NOT
+        // from a per-route guard — so principal resolution for `sk_*`
+        // callers no longer depends on a guard called `api_key_routes::guard`
+        // having run first. This is what fixes the guard-ordering footgun
+        // (an author writing `[owns_resource, api_key_routes::guard]` used
+        // to 401 every sk_* request; either order works now because the
+        // resolution below has already happened before any guard runs).
+        fn __boogy_resolve_api_key_principal(
+            req: &$crate::Request,
+        ) -> ::core::option::Option<(::std::string::String, ::std::vec::Vec<::std::string::String>)> {
+            let bearer = $crate::api_keys::parse_bearer(req)?;
+            // Validate format up-front (CRC + structure) — saves a store
+            // round-trip on garbage input.
+            $crate::api_keys::parse(bearer).ok()?;
+
+            let prefix = $crate::api_keys::compute_lookup_prefix(bearer);
+            let row = find_row_by(
+                $crate::api_keys::TABLE,
+                "prefix",
+                $bindings::boogy::platform::store::Value::Text(prefix),
+            )
+            .ok()??;
+            let now = $crate::api_keys::__unix_now_for_glue();
+            if !$crate::api_keys::verify_against_row(bearer, &row, now) {
+                return ::core::option::Option::None;
+            }
+            let dto = $crate::api_keys::parse_row(&row).ok()?;
+            let issuer = row.text("created_by");
+            if issuer.is_empty() {
+                return ::core::option::Option::None;
+            }
+
+            // Best-effort last_used_at update. Failures here don't affect
+            // authorization.
+            let _ = __boogy_update_row(
+                $crate::api_keys::TABLE,
+                row.id(),
+                &[("last_used_at".to_string(), $crate::store::Val::Integer(now as i64))],
+            );
+
+            ::core::option::Option::Some((issuer, dto.scopes))
+        }
+
         // -- The Guest impl that wires everything together --
         //
         // Wraps every dispatch in:
@@ -3793,13 +3848,33 @@ macro_rules! wit_glue {
                 // and `auth::current_principal()` resolve it without a WIT call;
                 // the returned guard clears request id + both principal slots on
                 // drop (even on panic).
+                let wit_identity = $bindings::boogy::platform::auth::current_identity();
                 let _state_guard = $crate::request_state::enter(
-                    $bindings::boogy::platform::auth::current_identity()
-                        .map(|i| i.principal),
+                    wit_identity.as_ref().map(|i| i.principal.clone()),
                 );
 
                 <$api_struct as $crate::Api>::init_tables();
                 let sdk_req = __boogy_to_sdk_request(&req);
+
+                // Resolve an `sk_*` bearer up front, before any guard runs
+                // (F-10): PASETO already wins unconditionally regardless of
+                // guard order because it's read straight from the WIT auth
+                // capability above, with no per-route opt-in guard needed to
+                // populate it. This puts `sk_*` on the same footing — resolved
+                // once here, so `auth::current_principal()`, `owns_resource`,
+                // `find_owned`/`load_owned`, and `api_key_routes::guard` all
+                // see the same answer no matter which guard runs first, or
+                // whether `api_key_routes::guard` is in the route's guard
+                // array at all. Skipped when a WIT identity is already
+                // present (PASETO wins; matches `_request_principal`'s
+                // precedence and avoids a needless store round-trip).
+                if wit_identity.is_none() {
+                    if let Some((issuer, scopes)) = __boogy_resolve_api_key_principal(&sdk_req) {
+                        $crate::request_state::_set_fallback_principal(Some(issuer));
+                        $crate::request_state::_set_fallback_scopes(Some(scopes));
+                    }
+                }
+
                 let resp = <$api_struct as $crate::Api>::build_router().handle(&sdk_req);
                 __boogy_to_wit_response(resp)
             }

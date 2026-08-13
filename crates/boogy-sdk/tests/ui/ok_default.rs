@@ -1,4 +1,4 @@
-use boogy_sdk::model::{Id, Timestamp};
+use boogy_sdk::model::{Decimal, Id, Timestamp};
 use boogy_sdk::Model;
 
 #[derive(Model)]
@@ -20,6 +20,11 @@ pub struct T {
     pub created_at: Timestamp,
     #[default = "none"]
     pub note: Option<String>,
+    // `Decimal` still takes a string default, but it is now parsed
+    // EXACTLY at compile time into scaled minor units, never through a
+    // float.
+    #[default = "19.990000"]
+    pub score: Decimal,
 }
 
 fn main() {}

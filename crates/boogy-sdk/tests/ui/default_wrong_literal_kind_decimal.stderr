@@ -1,0 +1,5 @@
+error: #[default] is a float literal, but this field's column stores a value of kind `string`. The default would be written with the wrong storage class and read back as the wrong value, so the derive refuses it rather than emitting it.
+  --> tests/ui/default_wrong_literal_kind_decimal.rs:13:5
+   |
+13 |     #[default = 1.5]
+   |     ^^^^^^^^^^^^^^^^

@@ -29,15 +29,16 @@
 //!   want to read the calling key (e.g. for scope checks).
 //! - `caller_principal(req) -> Option<String>` — lower-level
 //!   "without going through guard, do the work yourself" helper.
-//!   Prefer [`crate::auth::current_principal`] in handlers behind
-//!   `guard` — the unified helper reads the per-request slot the
-//!   guard populates and works across PASETO + sk_* uniformly.
+//!   Prefer [`crate::auth::current_principal`] — an inbound `sk_*`
+//!   bearer is resolved into the same per-request slot at request
+//!   entry regardless of whether this `guard` is on the route at all,
+//!   and the unified helper reads it uniformly across PASETO + sk_*.
 //! - `guard(req: &mut Req<'_>) -> Result<(), HttpResponse>` — passes
 //!   if any credential resolves (PASETO via WIT auth cap **OR**
-//!   `sk_*` via the local store), stashing the resolved sk_*
-//!   principal in the SDK's per-request slot so
-//!   `auth::current_principal()` returns it transparently. Returns
-//!   401 RFC 7807 `application/problem+json` otherwise.
+//!   `sk_*` via the local store — resolved at request entry, before
+//!   any guard runs, so this passes/fails the same regardless of where
+//!   it sits in a route's guard array). Returns 401 RFC 7807
+//!   `application/problem+json` otherwise.
 //!
 //! ## Operational notes
 //!
@@ -308,25 +309,40 @@ macro_rules! api_keys_glue {
             /// either yields an authenticated caller; otherwise returns
             /// 401.
             ///
-            /// Side effect on the `sk_*` path: stash the resolved
-            /// principal in the SDK's per-request fallback slot so
-            /// `auth::current_principal()` returns the same answer as
-            /// `caller_principal(req)`. This is the C2 unification —
-            /// resource-level guards (`auth::owns_resource`) and
-            /// `auth::find_owned` work uniformly across PASETO and
-            /// `sk_*` callers without each handler having to consult
-            /// two different APIs. The slot is cleared on request exit
-            /// by the `wit_glue!` RAII guard.
+            /// An `sk_*` bearer is already resolved into the SDK's
+            /// per-request fallback slot by the time this guard runs (the
+            /// `wit_glue!` request-entry point resolves it before any
+            /// guard executes), so `auth::current_principal()` returns
+            /// the same answer as `caller_principal(req)` whether or not
+            /// this guard appears on the route, and regardless of where
+            /// it sits relative to other guards — resource-level guards
+            /// (`auth::owns_resource`) and `auth::find_owned` work
+            /// uniformly across PASETO and `sk_*` callers without a
+            /// specific guard order. This function itself now mostly
+            /// just turns "no principal resolved" into a 401, with a
+            /// defensive re-resolve if the slot is somehow still empty.
+            /// The slot is cleared on request exit by the `wit_glue!`
+            /// RAII guard.
             pub fn guard(req: &mut Req<'_>) -> Result<(), HttpResponse> {
                 if super::__api_keys_paseto_identity().is_some() {
                     return Ok(());
                 }
-                // Resolve the sk_* bearer ONCE and stash both the issuing
-                // principal AND the key's scopes, so auth::current_principal()
-                // and auth::current_scopes()/has_scope()/require_scope() all
-                // resolve uniformly across PASETO and sk_* callers. (Resolving
-                // here also avoids the extra store round-trip caller_principal
-                // would do.)
+                // F-10: the SDK's request-entry point (`wit_glue!`'s
+                // `Guest::handle`) already resolves an `sk_*` bearer inline
+                // before ANY guard runs, so by the time this guard executes
+                // the fallback slot is normally already populated for a
+                // valid `sk_* ` caller regardless of where this guard sits
+                // in the array — this check is what makes this guard's
+                // pass/fail outcome no longer depend on guard order. Only
+                // the "reject if nothing resolved" job is left to do here;
+                // the resolution itself happened at entry.
+                if $crate::request_state::_fallback_principal().is_some() {
+                    return Ok(());
+                }
+                // Defensive fallback: resolve directly if the slot is
+                // somehow still empty (e.g. this guard invoked outside the
+                // normal HTTP entry point), so `guard` stays correct
+                // standalone too, not just as a side effect of request entry.
                 if let Some(key) = resolve_caller(req.request) {
                     let issuer = super::find_row_by(
                         api_keys::TABLE,
@@ -349,15 +365,16 @@ macro_rules! api_keys_glue {
             /// Resolve the caller's principal from either a PASETO
             /// session OR a presented `sk_*` bearer.
             ///
-            /// **Prefer [`crate::auth::current_principal`].** After
-            /// [`guard`] admits an `sk_*` request it stashes the
-            /// resolved principal in the SDK's per-request slot, and
-            /// `auth::current_principal()` reads it transparently —
+            /// **Prefer [`crate::auth::current_principal`].** An `sk_*`
+            /// bearer is resolved into the SDK's per-request slot at
+            /// request entry — before [`guard`] or any other guard runs
+            /// — and `auth::current_principal()` reads it transparently,
             /// returning the same answer this helper does, with no
-            /// store round-trip on the second call. The unified
+            /// store round-trip on the second call and no dependency on
+            /// `guard` being present on the route at all. The unified
             /// helper is the canonical entry point for stamping
             /// `owner_principal` on a row or scoping reads in any
-            /// handler that sits behind `guard`.
+            /// handler.
             ///
             /// This raw helper is kept for the rare "without going
             /// through guard, do the work yourself" case. Returns

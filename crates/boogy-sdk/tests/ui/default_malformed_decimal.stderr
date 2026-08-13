@@ -1,0 +1,5 @@
+error: #[default]: invalid Decimal literal: more than 6 fractional digits — Decimal is exact to 6 decimal places; round explicitly before writing the literal (got "1.1234567")
+  --> tests/ui/default_malformed_decimal.rs:13:17
+   |
+13 |     #[default = "1.1234567"]
+   |                 ^^^^^^^^^^^

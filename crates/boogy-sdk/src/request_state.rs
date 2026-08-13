@@ -8,14 +8,21 @@
 //!
 //! Today this module owns one slot:
 //!
-//! - **`fallback_principal`** — set by `api_key_routes::guard` after it
-//!   admits an `sk_*` bearer and resolves it to the issuing
-//!   principal. Read by the `wit_glue!`-emitted `auth::current_principal()`
-//!   *after* the WIT auth call returns `None`. The result: handlers
-//!   call `auth::current_principal()` once and get a unified answer
-//!   regardless of whether the credential was a PASETO session or a
-//!   per-service key — the asymmetry that previously forced shortlinks to
-//!   call `api_key_routes::caller_principal(req)` separately is gone.
+//! - **`fallback_principal`** — populated from an inbound `sk_*` bearer,
+//!   resolved against the local `__boogy_api_keys` table. Set at request
+//!   entry by the `wit_glue!`-emitted `Guest::handle`, before any route
+//!   guard runs (also set defensively by `api_key_routes::guard` itself,
+//!   for the rare case a guard runs outside that entry point). Read by
+//!   the `wit_glue!`-emitted `auth::current_principal()` *after* the WIT
+//!   auth call returns `None`. The result: handlers call
+//!   `auth::current_principal()` once and get a unified answer regardless
+//!   of whether the credential was a PASETO session or a per-service key
+//!   — the asymmetry that previously forced shortlinks to call
+//!   `api_key_routes::caller_principal(req)` separately is gone, and
+//!   (since resolution no longer depends on a guard having run first) so
+//!   is the requirement that `api_key_routes::guard` precede
+//!   resource-auth guards like `auth::owns_resource` in a route's guard
+//!   array.
 //!
 //! Cleared on request exit by the RAII guard in the `wit_glue!`
 //! `Guest::handle` impl, so a subsequent request without an `sk_*`

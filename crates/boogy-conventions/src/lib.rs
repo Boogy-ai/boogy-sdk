@@ -247,12 +247,36 @@ fn multi_write_findings(file: &str, src: &str) -> Vec<Finding> {
     out
 }
 
-/// Count `db_insert(` / `db_update(` / `db_delete(` write calls in a body.
+/// Count store-write calls in a handler body.
+///
+/// The vocabulary must cover EVERY way a handler can write, not just the
+/// generated `db_*` helpers. It previously listed only `db_insert`/`db_update`/
+/// `db_delete`, so a handler doing one `db_insert` plus one `upsert_increment`
+/// — the shape the transactions guidance uses as its own worked example for a
+/// dependent counter — counted as ONE write and passed the multi-write check
+/// clean. The raw `store::*` forms were invisible for the same reason.
+///
+/// Reads (`find*`, `get*`, `scan*`, `count*`) must never appear here: counting
+/// a read as a write would demand a transaction around read-only handlers.
 fn count_writes(body: &str) -> usize {
-    ["db_insert(", "db_update(", "db_delete("]
-        .iter()
-        .map(|p| body.matches(p).count())
-        .sum()
+    const WRITES: &[&str] = &[
+        // generated per-model helpers
+        "db_insert(",
+        "db_update(",
+        "db_delete(",
+        // dependent-counter helper — a write, and the one this check missed
+        "upsert_increment(",
+        // raw store API
+        "store::insert(",
+        "store::insert_many(",
+        "store::update(",
+        "store::update_many(",
+        "store::update_where(",
+        "store::delete(",
+        "store::delete_many(",
+        "store::delete_where(",
+    ];
+    WRITES.iter().map(|p| body.matches(p).count()).sum()
 }
 
 /// Extract the function name from a line declaring `fn <name>`, requiring a word
@@ -281,6 +305,40 @@ fn is_ident_char(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn count_writes_sees_upsert_increment_and_raw_store_writes() {
+        // The exact shape the transactions guidance teaches as its worked
+        // example, minus the tx wrapper: an insert plus a dependent counter.
+        // Before this fix it counted as ONE write and passed the gate.
+        let body = r#"
+            db_insert(&Message { .. })?;
+            upsert_increment(Conversation::TABLE, id, Conversation::MSG_COUNT, 1)?;
+        "#;
+        assert_eq!(
+            count_writes(body), 2,
+            "an insert plus a dependent counter is TWO writes; counting it as one is what \
+             let an untransacted multi-write handler pass the gate"
+        );
+
+        let raw = r#"
+            store::insert(t, row)?;
+            store::delete_where(t, pred)?;
+        "#;
+        assert_eq!(count_writes(raw), 2, "raw store::* writes must count too");
+    }
+
+    #[test]
+    fn count_writes_does_not_count_reads() {
+        // Counting a read as a write would demand a transaction around
+        // read-only handlers — a false positive on the noisiest possible surface.
+        let body = r#"
+            store::find_many(t, pred)?;
+            db_find_by(x)?;
+            store::count(t)?;
+        "#;
+        assert_eq!(count_writes(body), 0, "reads must never count as writes");
+    }
     use super::*;
 
     fn checks(findings: &[Finding]) -> Vec<&'static str> {
