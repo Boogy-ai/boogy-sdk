@@ -112,6 +112,69 @@ pub struct ApiError {
     /// non-validation case.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub errors: FieldErrors,
+
+    /// Machine-readable cause code, present when this problem class covers
+    /// more than one underlying condition that a caller might need to act
+    /// on differently. The canonical example: every `/errors/service_unavailable`
+    /// 503 shares `kind`/`title`/`status`, but "a host-wide transaction cap
+    /// was hit" (back off) and "this transaction's rows are hot" (fix the
+    /// data model) call for different client behaviour — see the
+    /// [`cause`] module. Absent from the wire when `None` (same
+    /// `skip_serializing_if` convention as `detail`); most `ApiError`s
+    /// carry no cause at all. A generic client should branch on `cause`
+    /// when present rather than parsing `detail` prose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+
+    /// Seconds a caller should wait before retrying, when retrying is a
+    /// meaningful response to this error. **Not part of the JSON body** —
+    /// RFC 7231 defines `Retry-After` as a header, so
+    /// `From<ApiError> for HttpResponse` emits it as a real header rather
+    /// than serializing it into `detail` prose (the previous behaviour;
+    /// see the removed note on [`Self::service_unavailable`]). `None` when
+    /// retrying wouldn't help — e.g. a per-request op ceiling, where an
+    /// identical retry trips the same ceiling again.
+    #[serde(skip)]
+    pub retry_after_secs: Option<u64>,
+}
+
+/// Stable, `snake_case`, machine-readable cause tokens. Each names a
+/// specific emission site so a generic HTTP client can branch on `cause`
+/// without parsing `detail` prose — see
+/// `docs/superpowers/audits/2026-08-platform-audit.md` F-07/F-08.
+///
+/// All five causes below render as HTTP 503 with the SAME
+/// `kind = "/errors/service_unavailable"` — that collapse, with nothing
+/// distinguishing the causes on the wire, is exactly the defect this
+/// module fixes. Four are per-request store congestion (routed through
+/// [`StoreError`](crate::store::StoreError)); the fifth is the host's fair
+/// scheduler shedding a request before it ever reaches store code.
+pub mod cause {
+    /// The host-wide cap on concurrently open cross-service transactions
+    /// was hit (`begin_transaction` admission). Not a data-model problem —
+    /// back off and retry; if it recurs, reduce how many transactions this
+    /// caller holds open at once.
+    pub const TX_ADMISSION_EXHAUSTED: &str = "tx_admission_exhausted";
+    /// A single request performed more store operations than
+    /// `[limits] store_max_ops_per_request` allows. Retrying the identical
+    /// request trips the same ceiling again — do fewer store operations
+    /// per request instead. This is why `service_unavailable_with_cause`
+    /// is called with `retry_after_secs: None` for this cause.
+    pub const STORE_OP_CEILING_EXCEEDED: &str = "store_op_ceiling_exceeded";
+    /// This request's origin exceeded its store-operation rate budget.
+    /// Slow down; the token bucket refills continuously so a short
+    /// backoff clears it.
+    pub const STORE_OP_RATE_LIMITED: &str = "store_op_rate_limited";
+    /// A transaction exhausted its retry budget against repeated
+    /// serialization conflicts (`tx()`'s auto-retry gave up). Unlike the
+    /// other three causes, this DOES point at the data model or query
+    /// shape: split a hot key, use a counter column, or narrow a search
+    /// so it doesn't take a whole table as its read set.
+    pub const TX_CONTENDED: &str = "tx_contended";
+    /// The host's fair scheduler shed this request before it reached the
+    /// guest at all — no instance slot was available under contention.
+    /// Pure capacity signal; back off and retry.
+    pub const SCHEDULER_SHED: &str = "scheduler_shed";
 }
 
 impl ApiError {
@@ -125,6 +188,8 @@ impl ApiError {
             status: 400,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -137,6 +202,8 @@ impl ApiError {
             status: 401,
             detail: None,
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -150,6 +217,8 @@ impl ApiError {
             status: 403,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -162,6 +231,8 @@ impl ApiError {
             status: 404,
             detail: None,
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -173,6 +244,8 @@ impl ApiError {
             status: 409,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -194,6 +267,8 @@ impl ApiError {
             status: 422,
             detail: Some(format!("{n} field{} failed validation", if n == 1 { "" } else { "s" })),
             errors,
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -211,6 +286,8 @@ impl ApiError {
             status: 422,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -224,6 +301,8 @@ impl ApiError {
             status: 500,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -236,6 +315,8 @@ impl ApiError {
             status: 507,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -252,6 +333,8 @@ impl ApiError {
             status: 409,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -263,6 +346,8 @@ impl ApiError {
             status: 400,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -274,25 +359,78 @@ impl ApiError {
             status: 501,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
-    /// 503 Service Unavailable — a transient host concurrency cap was hit
-    /// (e.g. too many open cross-service transactions). The caller should
-    /// retry shortly.
+    /// 503 Service Unavailable — a generic transient failure with no
+    /// specific [`cause`] to report (e.g. a catalog service proxying an
+    /// upstream 503). Carries a real `Retry-After: 1` header (see
+    /// `From<ApiError> for HttpResponse`) — 1s is a safe generic hint for
+    /// "transient, try again shortly" when the emitting site doesn't know
+    /// more.
     ///
-    /// NOTE: the `(Retry-After: 1)` suffix appended to `detail` below is
-    /// **body text, not an HTTP header** — `ApiError` carries no header bag, so
-    /// there is nowhere to put a real one. A client parsing headers will not
-    /// find `Retry-After` on this response. Do not document this as sending the
-    /// header; it is a human-readable hint inside the problem+json `detail`.
+    /// Store-congestion call sites should prefer
+    /// [`Self::service_unavailable_with_cause`], which additionally sets a
+    /// machine-readable `cause` distinguishing WHY (see F-07: four
+    /// different store congestion causes used to collapse onto this exact
+    /// shape with nothing on the wire telling them apart).
     pub fn service_unavailable(msg: impl Into<String>) -> Self {
         Self {
             kind: "/errors/service_unavailable".to_string(),
             title: "Service unavailable".to_string(),
             status: 503,
-            detail: Some(format!("{} (Retry-After: 1)", msg.into())),
+            detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: Some(1),
+        }
+    }
+
+    /// 503 Service Unavailable with a machine-readable [`cause`] token and
+    /// an optional `Retry-After` hint. Same `kind`/`title`/`status` as
+    /// [`Self::service_unavailable`] — the four/five store-congestion sites
+    /// this exists for are deliberately still ONE problem class on the
+    /// wire (splitting `kind` would be a breaking change for any client
+    /// already matching `/errors/service_unavailable`) — but `cause` lets a
+    /// client branch on which congestion condition fired.
+    ///
+    /// `retry_after_secs: None` is a deliberate, meaningful choice: pass it
+    /// for a cause where waiting helps (the default for every cause in
+    /// [`cause`] except [`cause::STORE_OP_CEILING_EXCEEDED`], where an
+    /// identical retry trips the same per-request ceiling again).
+    pub fn service_unavailable_with_cause(
+        msg: impl Into<String>,
+        cause: &str,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            kind: "/errors/service_unavailable".to_string(),
+            title: "Service unavailable".to_string(),
+            status: 503,
+            detail: Some(msg.into()),
+            errors: Default::default(),
+            cause: Some(cause.to_string()),
+            retry_after_secs,
+        }
+    }
+
+    /// 429 Too Many Requests — the ingress rate limiter rejected this
+    /// request. RFC 6585 / RFC 7231: carries a real `Retry-After` header
+    /// (see `From<ApiError> for HttpResponse`) rather than a bare
+    /// `{"error": "rate_limited"}` body with no problem+json envelope —
+    /// see F-08. Token buckets refill continuously, so `retry_after_secs`
+    /// is always a safe (if approximate) earliest-retry hint.
+    pub fn rate_limited(msg: impl Into<String>, retry_after_secs: u64) -> Self {
+        Self {
+            kind: "/errors/rate_limited".to_string(),
+            title: "Too many requests".to_string(),
+            status: 429,
+            detail: Some(msg.into()),
+            errors: Default::default(),
+            cause: None,
+            retry_after_secs: Some(retry_after_secs),
         }
     }
 
@@ -304,6 +442,27 @@ impl ApiError {
             status: 504,
             detail: Some(msg.into()),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
+        }
+    }
+
+    /// 504 Gateway Timeout — the request exceeded its overall wall-clock
+    /// budget (`[limits] cpu_deadline_ms`'s outer `tokio::time::timeout`
+    /// backstop, `B_req`). Distinct from [`Self::timeout`] (a single
+    /// storage operation timing out): this is the WHOLE request — including
+    /// any `peer::fetch` fan-out — running too long. Not usefully retryable
+    /// with an identical request (it would very likely exceed budget
+    /// again), so this carries no `Retry-After`.
+    pub fn request_budget_exceeded(msg: impl Into<String>) -> Self {
+        Self {
+            kind: "/errors/request_budget_exceeded".to_string(),
+            title: "Request budget exceeded".to_string(),
+            status: 504,
+            detail: Some(msg.into()),
+            errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 
@@ -328,14 +487,17 @@ impl std::error::Error for ApiError {}
 
 impl From<ApiError> for HttpResponse {
     fn from(e: ApiError) -> Self {
-        HttpResponse {
-            status: e.status,
-            headers: vec![(
-                "content-type".to_string(),
-                PROBLEM_JSON.to_string(),
-            )],
-            body: Some(e.to_json_bytes()),
+        let mut headers = vec![(
+            "content-type".to_string(),
+            PROBLEM_JSON.to_string(),
+        )];
+        // F-07: a real header, not a prose hint baked into `detail` — a
+        // generic client can read this without parsing the body at all.
+        if let Some(secs) = e.retry_after_secs {
+            headers.push(("retry-after".to_string(), secs.to_string()));
         }
+        let body = Some(e.to_json_bytes());
+        HttpResponse { status: e.status, headers, body }
     }
 }
 
@@ -389,6 +551,8 @@ impl From<RpcError> for ApiError {
                 status: n as u16,
                 detail: Some(e.message),
                 errors: Default::default(),
+                cause: None,
+                retry_after_secs: None,
             },
             // JSON-RPC standard codes — framing problems, not domain.
             _ => ApiError::internal(e.message),
@@ -443,6 +607,8 @@ impl From<crate::peer::PeerError> for ApiError {
             status: 502,
             detail: Some(format!("upstream call failed: {class}")),
             errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
         }
     }
 }
@@ -640,6 +806,96 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "content-type" && v == PROBLEM_JSON));
+    }
+
+    /// F-07: when `retry_after_secs` is set, `From<ApiError> for
+    /// HttpResponse` must emit a REAL `Retry-After` header — the previous
+    /// behaviour only ever appended prose to `detail`, which no HTTP-aware
+    /// client (or the platform's own `docs/compute-fairness.md`, which
+    /// promised the header) could observe.
+    #[test]
+    fn into_http_response_emits_a_real_retry_after_header_when_set() {
+        let err = ApiError::rate_limited("too fast", 7);
+        let resp: HttpResponse = err.into();
+        assert_eq!(resp.status, 429);
+        assert!(
+            resp.headers.iter().any(|(k, v)| k == "retry-after" && v == "7"),
+            "expected a real retry-after header, got {:?}",
+            resp.headers
+        );
+    }
+
+    /// The inverse: no `retry_after_secs` set → no header at all (not an
+    /// empty one). `not_found` is a representative error with no retry
+    /// semantics.
+    #[test]
+    fn into_http_response_omits_retry_after_when_unset() {
+        let resp: HttpResponse = ApiError::not_found().into();
+        assert!(!resp.headers.iter().any(|(k, _)| k == "retry-after"));
+    }
+
+    /// `service_unavailable` (the generic, cause-less constructor still used
+    /// by unrelated call sites like the catalog wallet/stripe services) now
+    /// carries a real 1s `Retry-After` header instead of the old
+    /// header-less prose hint — additive for those callers, not a behaviour
+    /// they need to change anything for.
+    #[test]
+    fn service_unavailable_carries_a_real_retry_after_header() {
+        let resp: HttpResponse = ApiError::service_unavailable("upstream down").into();
+        assert_eq!(resp.status, 503);
+        assert!(resp.headers.iter().any(|(k, v)| k == "retry-after" && v == "1"));
+    }
+
+    /// F-07/F-08 wire vocabulary: `cause` is present and correct for the
+    /// causes this task introduces, and absent (not `null`) for an
+    /// ApiError that doesn't set one.
+    #[test]
+    fn cause_field_present_only_when_set() {
+        let with_cause = ApiError::service_unavailable_with_cause(
+            "too many concurrent transactions",
+            cause::TX_ADMISSION_EXHAUSTED,
+            Some(1),
+        );
+        let json: serde_json::Value = serde_json::from_slice(&with_cause.to_json_bytes()).unwrap();
+        assert_eq!(json["cause"], cause::TX_ADMISSION_EXHAUSTED);
+
+        let without_cause = ApiError::not_found();
+        let json: serde_json::Value = serde_json::from_slice(&without_cause.to_json_bytes()).unwrap();
+        assert!(json.get("cause").is_none(), "cause must be omitted, not null, when unset");
+    }
+
+    /// `retry_after_secs` must NEVER appear in the JSON body — it is an
+    /// HTTP header per RFC 7231, not a wire-body field. Regression guard
+    /// against `#[serde(skip)]` being dropped from the struct field.
+    #[test]
+    fn retry_after_secs_never_serializes_into_the_body() {
+        let err = ApiError::rate_limited("too fast", 3);
+        let json: serde_json::Value = serde_json::from_slice(&err.to_json_bytes()).unwrap();
+        assert!(
+            json.get("retry_after_secs").is_none() && json.get("retryAfterSecs").is_none(),
+            "retry_after_secs leaked into the JSON body: {json}"
+        );
+    }
+
+    #[test]
+    fn rate_limited_is_429_with_retry_after() {
+        let err = ApiError::rate_limited("slow down", 1);
+        assert_eq!(err.status, 429);
+        assert_eq!(err.kind, "/errors/rate_limited");
+        assert_eq!(err.retry_after_secs, Some(1));
+    }
+
+    /// Distinct from a store operation timeout: this is the WHOLE request's
+    /// wall-clock budget, so it gets its own `kind` (not `timeout`'s) and no
+    /// retry hint — retrying identically would very likely exceed budget
+    /// again.
+    #[test]
+    fn request_budget_exceeded_is_504_with_a_distinct_kind_and_no_retry_after() {
+        let err = ApiError::request_budget_exceeded("exceeded 30000ms");
+        assert_eq!(err.status, 504);
+        assert_eq!(err.kind, "/errors/request_budget_exceeded");
+        assert_ne!(err.kind, ApiError::timeout("x").kind);
+        assert_eq!(err.retry_after_secs, None);
     }
 
     #[derive(Debug, serde::Deserialize, garde::Validate)]

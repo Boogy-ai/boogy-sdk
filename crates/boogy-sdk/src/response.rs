@@ -174,8 +174,11 @@ pub trait IntoResponse {
 
     /// Spec-capture hook: what does this response type look like on the
     /// wire? `None` = undescribable (raw `HttpResponse`, custom types
-    /// that don't override). Called at route-registration time by
-    /// `IntoHandler::describe()` — never on the request path.
+    /// that don't override). Reached through `IntoHandler::describe()`,
+    /// which `Router::route` stores but does not call until a spec
+    /// document is actually requested — never on the request-dispatch
+    /// path, and not merely "at registration" either (see that hook's
+    /// doc comment).
     fn describe() -> Option<crate::spec::ResponseSpec>
     where
         Self: Sized,

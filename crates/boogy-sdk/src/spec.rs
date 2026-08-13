@@ -77,7 +77,23 @@ pub enum SpecEntry {
     Rest {
         method: String,
         path: String,
-        op: OperationSpec,
+        /// Computes this route's request/response shape — the same value
+        /// `Router::route` used to compute eagerly (`OperationSpec`,
+        /// captured as `op` at registration time). Deferred to a bare
+        /// `fn() -> OperationSpec` (the handler's `H::describe`, which
+        /// takes no captures) so registration is a pointer store, not a
+        /// `schema_value::<T>()` call: these fields are read ONLY by
+        /// `is_guarded` and `build_openapi`, both spec-serving-only —
+        /// never on the request-dispatch path. See H-04 in
+        /// `docs/superpowers/audits/2026-08-platform-audit.md` §10.
+        describe: fn() -> OperationSpec,
+        /// Set via `Router::summary` at registration time — a cheap
+        /// `String` move, applied to the resolved `OperationSpec` when
+        /// `describe` is finally called.
+        summary: Option<String>,
+        /// Set via `Router::description` at registration time; same
+        /// deferred-application note as `summary`.
+        description: Option<String>,
         /// Set when the route was registered inside a `.group([guards], …)`
         /// — a guard wraps the handler independent of any `Principal`
         /// extractor. Either signal marks the operation `security`-required.
@@ -123,7 +139,10 @@ impl SpecEntry {
     /// `true` when the entry requires an authenticated caller.
     pub(crate) fn is_guarded(&self) -> bool {
         match self {
-            SpecEntry::Rest { guarded, op, .. } => *guarded || op.requires_principal,
+            // Resolves `describe` fresh — cheap relative to the doc-serving
+            // request this runs on, and avoids caching a value nothing else
+            // needs to see (`build_openapi` resolves it again independently).
+            SpecEntry::Rest { guarded, describe, .. } => *guarded || describe().requires_principal,
             SpecEntry::Mcp { guarded, .. } | SpecEntry::Rpc { guarded, .. } => *guarded,
         }
     }
@@ -172,7 +191,13 @@ pub fn build_openapi(info: &DocInfo, reg: &SpecRegistry) -> Value {
 
     for entry in &reg.entries {
         match entry {
-            SpecEntry::Rest { method, path, op, guarded } => {
+            SpecEntry::Rest { method, path, describe, summary, description, guarded } => {
+                // Resolve the operation shape now — the one place per entry
+                // per doc request this actually needs computing.
+                let mut op = describe();
+                op.summary = summary.clone();
+                op.description = description.clone();
+
                 let mut operation = serde_json::Map::new();
 
                 if let Some(s) = &op.summary {
@@ -429,7 +454,9 @@ mod tests {
         reg.entries.push(SpecEntry::Rest {
             method: "GET".into(),
             path: "/files/{*path}".into(),
-            op: OperationSpec::default(),
+            describe: OperationSpec::default,
+            summary: None,
+            description: None,
             guarded: false,
         });
         let doc = build_openapi(&DocInfo::default(), &reg);
@@ -443,11 +470,22 @@ mod tests {
 
     #[test]
     fn openapi_doc_basic_shape() {
+        fn describe_create_note() -> OperationSpec {
+            let mut op = OperationSpec::default();
+            op.request_body = Some(schema_value::<CreateNote>());
+            op.response = Some(ResponseSpec { status: 201, schema: Some(schema_value::<CreateNote>()) });
+            op
+        }
+
         let mut reg = SpecRegistry::default();
-        let mut op = OperationSpec::default();
-        op.request_body = Some(schema_value::<CreateNote>());
-        op.response = Some(ResponseSpec { status: 201, schema: Some(schema_value::<CreateNote>()) });
-        reg.entries.push(SpecEntry::Rest { method: "POST".into(), path: "/api/notes".into(), op, guarded: true });
+        reg.entries.push(SpecEntry::Rest {
+            method: "POST".into(),
+            path: "/api/notes".into(),
+            describe: describe_create_note,
+            summary: None,
+            description: None,
+            guarded: true,
+        });
         reg.entries.push(SpecEntry::Mcp { path: "/mcp".into(), guarded: false });
 
         let doc = build_openapi(&DocInfo::default(), &reg);

@@ -134,6 +134,56 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// Wire micro-format embedding a machine-readable [`crate::error::cause`]
+/// inside a `StoreError::ResourceExhausted` message.
+///
+/// The WIT `resource-exhausted` variant carries only a `string` — it has no
+/// room for a typed sub-cause, and extending it would ripple the WIT
+/// binding across every host/guest crossing for what is, underneath, three
+/// call sites in one host file. The host is the only side that knows WHICH
+/// of its three concurrency caps tripped (the tx-admission cap, the
+/// per-request op ceiling, the per-origin op-rate throttle all reject with
+/// this same variant), so it prefixes the message with a stable
+/// `"<cause>: "` token from [`crate::error::cause`]; [`untag`] strips it
+/// back out in `From<StoreError> for ApiError`.
+///
+/// This is NOT prose-matching a human-authored message that could be
+/// reworded for style — it's a small, tested, same-repo wire contract
+/// between two ends of the same crossing (see
+/// `resource_exhausted_tag_round_trips` and the
+/// `resource_exhausted_untags_all_three_host_causes` /
+/// `resource_exhausted_falls_back_gracefully_when_untagged` tests below).
+pub mod resource_exhausted_tag {
+    const SEP: &str = ": ";
+
+    /// Every cause `untag` recognizes. Kept as one list so a new
+    /// `ResourceExhausted` emission site can't be added without either
+    /// reusing an existing cause or updating this (and its own test).
+    const KNOWN: &[&str] = &[
+        crate::error::cause::TX_ADMISSION_EXHAUSTED,
+        crate::error::cause::STORE_OP_CEILING_EXCEEDED,
+        crate::error::cause::STORE_OP_RATE_LIMITED,
+    ];
+
+    /// Host-side: embed `cause` into a `ResourceExhausted` message.
+    pub fn tag(cause: &str, msg: impl std::fmt::Display) -> String {
+        format!("{cause}{SEP}{msg}")
+    }
+
+    /// SDK-side: split a possibly-tagged message into `(cause, rest)`.
+    /// Falls back to `(None, msg)` unchanged when the message doesn't start
+    /// with a recognized token — defensive against the host and SDK
+    /// drifting out of sync, rather than panicking or guessing a cause.
+    pub fn untag(msg: &str) -> (Option<&'static str>, &str) {
+        for &c in KNOWN {
+            if let Some(rest) = msg.strip_prefix(c).and_then(|r| r.strip_prefix(SEP)) {
+                return (Some(c), rest);
+            }
+        }
+        (None, msg)
+    }
+}
+
 impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
         let msg = e.to_string();
@@ -149,12 +199,35 @@ impl From<StoreError> for ApiError {
             // 409, but NOT blindly retryable — the ambiguity is conveyed by the
             // message body, not a distinct status (see `CommitUnknown` doc).
             StoreError::CommitUnknown(_)       => ApiError::conflict(msg),
-            StoreError::ResourceExhausted(_)   => ApiError::service_unavailable(msg),
+            // F-07: three host emission sites, three remedies, one WIT
+            // variant. `resource_exhausted_tag::untag` recovers WHICH one so
+            // the wire `cause` field can distinguish them (was previously
+            // impossible from any client's point of view).
+            StoreError::ResourceExhausted(m)   => {
+                let (cause, text) = resource_exhausted_tag::untag(&m);
+                match cause {
+                    // Retrying an IDENTICAL request trips the same
+                    // per-request ceiling again — a retry hint here would be
+                    // actively misleading.
+                    Some(c) if c == crate::error::cause::STORE_OP_CEILING_EXCEEDED => {
+                        ApiError::service_unavailable_with_cause(text, c, None)
+                    }
+                    Some(c) => ApiError::service_unavailable_with_cause(text, c, Some(1)),
+                    // Untagged/unrecognized: degrade to the pre-F-07 shape
+                    // (still a real 503, just no cause) instead of guessing.
+                    None => ApiError::service_unavailable(text),
+                }
+            }
             // 409 like a plain conflict — the caller's transaction genuinely
             // failed — but NOT retryable; see the variant doc.
             StoreError::Poisoned(_)            => ApiError::conflict(msg),
-            // 503 + Retry-After, identical to ResourceExhausted on the wire.
-            StoreError::TooContended(_)        => ApiError::service_unavailable(msg),
+            // F-07: same `kind`/`status` as `ResourceExhausted` by design
+            // (both are "transient store congestion, retry"), but a
+            // DIFFERENT cause — this one IS a data-model/query-shape signal,
+            // unlike any of the three `ResourceExhausted` causes.
+            StoreError::TooContended(_)        => {
+                ApiError::service_unavailable_with_cause(msg, crate::error::cause::TX_CONTENDED, Some(1))
+            }
             StoreError::Internal(_)            => ApiError::internal(msg),
         }
     }
@@ -992,35 +1065,93 @@ mod tests {
             .contains("participant failed"));
     }
 
-    /// `TooContended` is a sibling of `ResourceExhausted`, not a replacement:
-    /// byte-identical wire behaviour (503 + the `Retry-After` hint), separate
-    /// variant so the CAUSE — a hot row vs. a saturated platform — stays
-    /// diagnosable.
+    /// F-07 (2026-08 platform audit): `TooContended` and `ResourceExhausted`
+    /// used to be byte-identical on the wire — same `kind`/`title`/`status`,
+    /// same `detail` shape, nothing distinguishing them. That was pinned as
+    /// *intentional* by this test's previous version. It wasn't: the two
+    /// have different remedies (data-model fix vs. back off), so a client
+    /// needs to tell them apart. `status`/`kind`/`title` staying identical
+    /// is still correct (splitting `kind` would be a breaking wire change,
+    /// per the audit's own remedy ranking) — `cause` is what must now
+    /// differ.
     #[test]
-    fn too_contended_matches_resource_exhausted_on_the_wire() {
+    fn too_contended_and_resource_exhausted_share_kind_but_not_cause() {
         let contended: ApiError = StoreError::TooContended("row is hot".into()).into();
-        let exhausted: ApiError = StoreError::ResourceExhausted("row is hot".into()).into();
+        let exhausted: ApiError =
+            StoreError::ResourceExhausted(resource_exhausted_tag::tag(
+                crate::error::cause::TX_ADMISSION_EXHAUSTED,
+                "too many concurrent transactions; retry shortly",
+            ))
+            .into();
         assert_eq!(contended.status, 503);
         assert_eq!(contended.status, exhausted.status);
-        assert_eq!(contended.kind, exhausted.kind);
+        assert_eq!(contended.kind, exhausted.kind, "both stay one problem class on the wire");
         assert_eq!(contended.title, exhausted.title);
-        assert_eq!(
-            contended.detail, exhausted.detail,
-            "identical wire behaviour, including the Retry-After hint",
+        assert_ne!(
+            contended.cause, exhausted.cause,
+            "F-07: these two causes must be distinguishable on the wire"
         );
-        assert!(contended
-            .detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Retry-After: 1"));
+        assert_eq!(contended.cause.as_deref(), Some(crate::error::cause::TX_CONTENDED));
+        assert_eq!(exhausted.cause.as_deref(), Some(crate::error::cause::TX_ADMISSION_EXHAUSTED));
+    }
+
+    /// `TooContended` genuinely means "retry shortly" (the SDK's own
+    /// auto-retry just gave up) — carries a real `Retry-After`, not just
+    /// prose.
+    #[test]
+    fn too_contended_carries_a_real_retry_after_hint() {
+        let api: ApiError = StoreError::TooContended("row is hot".into()).into();
+        assert_eq!(api.retry_after_secs, Some(1));
+    }
+
+    /// The three `ResourceExhausted` emission sites are the SAME WIT variant
+    /// (the type system can't tell them apart), so the host tags the cause
+    /// into the message (`resource_exhausted_tag`) and this conversion
+    /// untags it. This is the F-07 fix for "three distinct emission sites,
+    /// three different remedies, collapsed onto one wire shape."
+    #[test]
+    fn resource_exhausted_untags_all_three_host_causes() {
+        use crate::error::cause::{
+            STORE_OP_CEILING_EXCEEDED, STORE_OP_RATE_LIMITED, TX_ADMISSION_EXHAUSTED,
+        };
+        let cases = [
+            (TX_ADMISSION_EXHAUSTED, "too many concurrent transactions; retry shortly", Some(1)),
+            (STORE_OP_CEILING_EXCEEDED, "request exceeded the store-op ceiling of 1", None),
+            (STORE_OP_RATE_LIMITED, "store op-rate limit exceeded for this origin; retry shortly", Some(1)),
+        ];
+        for (cause, human, want_retry) in cases {
+            let tagged = resource_exhausted_tag::tag(cause, human);
+            let api: ApiError = StoreError::ResourceExhausted(tagged).into();
+            assert_eq!(api.status, 503);
+            assert_eq!(api.cause.as_deref(), Some(cause), "cause for {human:?}");
+            assert_eq!(
+                api.detail.as_deref(),
+                Some(human),
+                "the human-readable text, with the cause tag stripped back out"
+            );
+            assert_eq!(api.retry_after_secs, want_retry, "retry hint for {cause}");
+        }
+    }
+
+    /// Defensive fallback: an untagged (or unrecognized) `ResourceExhausted`
+    /// message must not panic or silently misclassify — it degrades to the
+    /// pre-F-07 generic behaviour (no cause, but still a real 503 with the
+    /// message preserved).
+    #[test]
+    fn resource_exhausted_falls_back_gracefully_when_untagged() {
+        let api: ApiError = StoreError::ResourceExhausted("some future message".into()).into();
+        assert_eq!(api.status, 503);
+        assert_eq!(api.cause, None);
+        assert_eq!(api.detail.as_deref(), Some("some future message"));
     }
 
     #[test]
-    fn resource_exhausted_maps_to_503_with_retry_hint() {
-        let api: ApiError = StoreError::ResourceExhausted("too many concurrent transactions".into()).into();
-        assert_eq!(api.status, 503);
-        // The detail carries the message so callers know it's a transient backpressure signal.
-        assert!(api.detail.as_deref().unwrap_or_default().contains("too many concurrent transactions"));
+    fn resource_exhausted_tag_round_trips() {
+        use crate::error::cause::TX_ADMISSION_EXHAUSTED;
+        let tagged = resource_exhausted_tag::tag(TX_ADMISSION_EXHAUSTED, "retry shortly");
+        let (cause, rest) = resource_exhausted_tag::untag(&tagged);
+        assert_eq!(cause, Some(TX_ADMISSION_EXHAUSTED));
+        assert_eq!(rest, "retry shortly");
     }
 }
 

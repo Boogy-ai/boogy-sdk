@@ -261,8 +261,12 @@ pub type Guard = Rc<dyn Fn(&mut Req<'_>) -> Result<(), crate::response::HttpResp
 pub trait IntoHandler<Args> {
     fn into_handler(self) -> Handler;
 
-    /// Spec-capture hook, called once at registration. Default: an empty
-    /// spec (path+method appear in the doc with no shape detail).
+    /// Spec-capture hook. `Router::route` stores this as a function
+    /// pointer at registration time but does NOT call it then — it's
+    /// called only when a spec document (`…/openapi.json`) is actually
+    /// requested, so an ordinary request never pays for schema derivation.
+    /// Default: an empty spec (path+method appear in the doc with no
+    /// shape detail).
     fn describe() -> crate::spec::OperationSpec
     where
         Self: Sized,
@@ -653,10 +657,14 @@ pub struct Router {
     /// leaking them in the generated spec.
     undocumented: bool,
     /// JSON-RPC method tables keyed by mount path. Each entry is
-    /// `(path, guarded, methods)`. Populated by `Router::rpc` (Task 5);
-    /// declared here so `rpc_method_specs()` and the `undocumented()`
-    /// builder can reference it now.
-    rpc_specs: Vec<(String, bool, Vec<crate::spec::MethodSpec>)>,
+    /// `(path, guarded, methods)`, where `methods` computes the mount's
+    /// method specs on demand (deferred for the same H-04 reason `Rest`
+    /// entries defer `describe`: building a `Dispatcher` just to read its
+    /// shape is real work — every `.method::<P, R, _>()` call derives two
+    /// schemas — and `build_router()` runs fresh per request). Populated
+    /// by `Router::rpc`; declared here so `rpc_method_specs()` and the
+    /// `undocumented()` builder can reference it now.
+    rpc_specs: Vec<(String, bool, Rc<dyn Fn() -> Vec<crate::spec::MethodSpec>>)>,
     /// Summary staged by `Router::summary`, applied to (and cleared by) the
     /// NEXT route registered. `None` between annotations.
     pending_summary: Option<String>,
@@ -716,14 +724,23 @@ impl Router {
     where
         H: IntoHandler<Args> + 'static,
     {
-        let mut op = H::describe();
-        op.summary = self.pending_summary.take();
-        op.description = self.pending_description.take();
+        let summary = self.pending_summary.take();
+        let description = self.pending_description.take();
         if !self.undocumented {
+            // `H::describe` is stored as a bare function pointer, NOT
+            // called here. H-04: calling it eagerly ran `schema_value::<T>()`
+            // (real allocation work) on every route, on every request —
+            // `build_router()` runs fresh per request, so "once at
+            // registration" was actually "once per request". `describe`
+            // takes no captures (it's `H::describe`, an associated fn), so
+            // deferring it to spec-serving time costs nothing but a pointer
+            // store here and is exact — no caching, no staleness risk.
             self.specs.push(crate::spec::SpecEntry::Rest {
                 method: method.to_uppercase(),
                 path: path.to_string(),
-                op,
+                describe: H::describe,
+                summary,
+                description,
                 guarded: !self.group_guards.is_empty(),
             });
         }
@@ -767,18 +784,22 @@ impl Router {
     where
         H: IntoHandler<Args> + 'static,
     {
-        // Capture the spec once (before type erasure) then push per method.
-        // Using route_inner for each registration avoids double spec entries.
-        let mut op = H::describe();
-        op.summary = self.pending_summary.take();
-        op.description = self.pending_description.take();
+        // Stage summary/description once (before type erasure) then push
+        // per method. `describe` is `H::describe` — a capture-free fn
+        // pointer, `Copy`, so no clone is needed to share it across
+        // methods (unlike the eager `OperationSpec` this replaced, which
+        // needed `.clone()` per method). See `route`'s H-04 note.
+        let summary = self.pending_summary.take();
+        let description = self.pending_description.take();
         let h = handler.into_handler();
         for m in methods {
             if !self.undocumented {
                 self.specs.push(crate::spec::SpecEntry::Rest {
                     method: m.to_uppercase(),
                     path: path.to_string(),
-                    op: op.clone(),
+                    describe: H::describe,
+                    summary: summary.clone(),
+                    description: description.clone(),
                     guarded: !self.group_guards.is_empty(),
                 });
             }
@@ -880,8 +901,8 @@ impl Router {
             // Propagate the outer guard flag if needed.
             let entry = if nest_is_guarded {
                 match entry {
-                    crate::spec::SpecEntry::Rest { method, path, op, .. } =>
-                        crate::spec::SpecEntry::Rest { method, path, op, guarded: true },
+                    crate::spec::SpecEntry::Rest { method, path, describe, summary, description, .. } =>
+                        crate::spec::SpecEntry::Rest { method, path, describe, summary, description, guarded: true },
                     crate::spec::SpecEntry::Mcp { path, .. } =>
                         crate::spec::SpecEntry::Mcp { path, guarded: true },
                     crate::spec::SpecEntry::Rpc { path, .. } =>
@@ -1169,12 +1190,30 @@ impl Router {
         F: Fn() -> crate::rpc::Dispatcher + 'static,
     {
         let guarded = !self.group_guards.is_empty();
+        // Shared so BOTH the spec-lookup closure and the per-request
+        // dispatch handler below can call `build()` without re-registering
+        // the whole method chain twice. Critically, sharing does NOT make
+        // this eager: `build` (and therefore every `.method::<P, R, _>()`
+        // call inside it, each deriving two schemas) now runs only when
+        // something actually asks — spec-serving time, or an actual
+        // request landing on this mount — never at registration. It used
+        // to run once at registration unconditionally (`registration_probe`)
+        // PLUS again per dispatched request; same H-04 cost as `Rest`
+        // entries, since `build_router()` (and so this `.rpc()` call)
+        // re-runs on every request regardless of which route is hit.
+        let build = Rc::new(build);
         if !self.undocumented {
-            let registration_probe = build();
-            self.rpc_specs.push((path.to_string(), guarded, registration_probe.method_specs().to_vec()));
+            let build_for_specs = build.clone();
+            self.rpc_specs.push((
+                path.to_string(),
+                guarded,
+                Rc::new(move || build_for_specs().method_specs().to_vec())
+                    as Rc<dyn Fn() -> Vec<crate::spec::MethodSpec>>,
+            ));
             self.specs.push(crate::spec::SpecEntry::Rpc { path: path.to_string(), guarded });
         }
-        let handler: Handler = std::rc::Rc::new(move |req: &mut Req<'_>| build().handle(req.request));
+        let build_for_handler = build.clone();
+        let handler: Handler = Rc::new(move |req: &mut Req<'_>| build_for_handler().handle(req.request));
         self.route_inner("POST", path, handler)
     }
 
@@ -1266,7 +1305,7 @@ impl Router {
         let authenticated = caller.is_some();
         let methods: Vec<crate::spec::MethodSpec> = self.rpc_specs.iter()
             .filter(|(_, guarded, _)| authenticated || !guarded)
-            .flat_map(|(_, _, methods)| methods.iter().cloned())
+            .flat_map(|(_, _, build_methods)| build_methods())
             .collect();
         // Return None (→ 404) when all mounts are guarded and caller is
         // anonymous — the openrpc.json document would be empty, which
@@ -2542,6 +2581,109 @@ mod tests {
         let gadgets = &doc["paths"]["/gadgets"]["get"];
         assert!(gadgets.get("summary").is_none(), "summary must not leak to the next route");
         assert!(gadgets.get("description").is_none(), "description must not leak to the next route");
+    }
+
+    /// H-04: `Router::route` must NOT run `H::describe()` (and therefore
+    /// `schema_value::<T>()`, real allocation work) at registration time,
+    /// nor while dispatching an ordinary (non-doc) request. It must run
+    /// ONLY when a spec document is actually requested. See
+    /// `docs/superpowers/audits/2026-08-platform-audit.md` §10 (P-00):
+    /// the P-00 measurement found router construction responsible for
+    /// 97.3% of guest heap allocations on a minimal request.
+    #[test]
+    fn describe_is_deferred_to_spec_serving_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        struct Probe;
+        impl response::IntoResponse for Probe {
+            fn into_response(self) -> response::HttpResponse {
+                response::ok(&serde_json::json!({"ok": true}))
+            }
+            fn describe() -> Option<crate::spec::ResponseSpec> {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Some(crate::spec::ResponseSpec { status: 200, schema: None })
+            }
+        }
+        fn probe_handler(_req: &mut Req<'_>) -> Probe {
+            Probe
+        }
+
+        let before = CALLS.load(Ordering::SeqCst);
+
+        // Registration must not call describe().
+        let r = Router::new().get("/probe", probe_handler);
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            before,
+            "H::describe() ran during Router::route registration — H-04 requires this \
+             deferred to spec-serving time (build_router() runs fresh per request, so an \
+             eager call here pays schema-derivation cost on every single request)"
+        );
+
+        // Dispatching an ordinary request must not call describe() either.
+        let resp = r.handle(&req("GET", "/probe"));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            before,
+            "H::describe() ran while handling an ordinary (non-doc) request"
+        );
+
+        // Sanity: describe() DOES run once the spec is actually requested —
+        // this is laziness, not dead code.
+        let spec_resp = r.handle(&req("GET", "/openapi.json"));
+        assert_eq!(spec_resp.status, 200);
+        assert!(
+            CALLS.load(Ordering::SeqCst) > before,
+            "H::describe() never ran even when /openapi.json was requested — spec output \
+             would be empty"
+        );
+    }
+
+    /// H-04, `.rpc()` half: `Router::rpc`'s `build` closure (each call
+    /// re-derives every method's params/result schema via
+    /// `Dispatcher::method`) must not run at registration time, nor while
+    /// dispatching an unrelated ordinary request. It must run only for an
+    /// actual request to the mount, or when `…/openrpc.json` is requested.
+    #[test]
+    fn rpc_mount_build_is_not_called_at_registration_or_unrelated_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+        let r = Router::new()
+            .get("/ping", ok_handler)
+            .rpc("/rpc", || {
+                BUILDS.fetch_add(1, Ordering::SeqCst);
+                crate::rpc::Dispatcher::new()
+            });
+
+        assert_eq!(
+            BUILDS.load(Ordering::SeqCst),
+            0,
+            "the rpc `build` closure ran during Router::rpc registration — H-04 requires \
+             this deferred to spec-serving time or an actual request to the mount \
+             (build_router() runs fresh per request, so an eager 'registration probe' \
+             pays every method's schema-derivation cost on every single request, \
+             regardless of which route was actually hit)"
+        );
+
+        // An ordinary request to an unrelated route must not touch it either.
+        let resp = r.handle(&req("GET", "/ping"));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            BUILDS.load(Ordering::SeqCst),
+            0,
+            "the rpc `build` closure ran while handling an unrelated ordinary request"
+        );
+
+        // Sanity: requesting openrpc.json DOES trigger it — laziness, not dead code.
+        let spec_resp = r.handle(&req("GET", "/openrpc.json"));
+        assert_eq!(spec_resp.status, 404, "empty Dispatcher has no methods, so this 404s");
+        assert!(
+            BUILDS.load(Ordering::SeqCst) > 0,
+            "openrpc.json request never invoked `build`"
+        );
     }
 
     /// Test 5: direct unit test of `doc_path` covering the boundary cases
