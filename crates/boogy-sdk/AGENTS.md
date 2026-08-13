@@ -201,7 +201,11 @@ fn get_room_post(req: &mut Req<'_>) -> Json<json::Value> {
 }
 ```
 
-REST list endpoint — `auth::find_owned` carries the auth check;
+REST list endpoint — `auth::find_owned` carries the auth check. It returns **every**
+row the principal owns, with no limit; that is right while a principal's set is small
+by construction. The moment it can grow with usage, switch to keyset (see
+"Filtering / sorting / paginating") — this recipe is the small-set case, not the
+default for lists in general.
 its `RpcError` converts to `ApiError` via `?`:
 ```rust
 #[derive(Serialize)]
@@ -475,7 +479,7 @@ difference matters, use `row.get(name)` and match `Val::Null`.
 | `get_row(table, id)` | `Result<Option<Row>, StoreError>` | Single row by `_id`. |
 | `find_all_rows(table)` | `Result<(Vec<Row>, u64), StoreError>` | Unfiltered list + total count. Use only when you specifically need all rows; for principal-scoping prefer `auth::find_owned`. |
 | `find_row_by(table, column, store::Value)` | `Result<Option<Row>, StoreError>` | First row matching `column = val`. Takes the WIT `store::Value` directly (e.g. `store::Value::Text("alice".into())`), same value type used by `store::insert` / `store::update`. |
-| `find_rows_by(table, column, store::Value)` | `Result<Vec<Row>, StoreError>` | **All** rows matching `column = val` (no limit). Use for unbounded backer lists, owned-resource enumeration, etc. — the index makes this an indexed scan. |
+| `find_rows_by(table, column, store::Value)` | `Result<Vec<Row>, StoreError>` | **All** rows matching `column = val` — **no limit, and the index does not bound it**: an indexed seek is bounded by MATCH COUNT, not table size, so a match set that grows is materialized in full. Correct for sets that are small **by construction** (one owner's own resources, a lookup by unique key). For anything a client pages through, or any set that grows with usage, **keyset pagination is the default** — see "Filtering / sorting / paginating". |
 | `find_rows(table, filters, sort, page)` | `Result<(Vec<Row>, u64), StoreError>` | General-purpose composite query: multi-filter, composite sort, optional page. `filters` is `Vec<store::Filter>`, `sort` is `Vec<store::SortBy>`. Composite sort lets you tiebreak (e.g. `created_at DESC, _id ASC`). For one-filter cases prefer `find_rows_by`; for an OR clause use `find_rows_grouped`. |
 | `find_rows_grouped(table, filters, or_groups, sort, page, allow_full_scan, skip_total)` | `Result<(Vec<Row>, u64), StoreError>` | Like `find_rows` but with an OR-of-AND clause: a row matches when `ALL(filters) AND (or_groups empty OR ANY(group: ALL(group)))`. `or_groups` is `Vec<Vec<store::Filter>>` — each inner `Vec` is one AND-group, groups are ORed. Use for composite keyset pagination (see below). The two trailing `bool`s are the ones `find_rows` hard-codes to `false`: `allow_full_scan` is the audited scan opt-out, and `skip_total` returns `0` for the count instead of computing it — pass `true` whenever you discard the total. Empty `or_groups` + both `false` == `find_rows`. |
 | `upsert_increment(table, key, counter, delta, columns)` | `Result<u64, StoreError>` | Atomic keyed counter: inserts the row (counter = delta, plus `columns.always ∪ columns.on_insert`) if it doesn't exist, or increments the counter and overwrites `columns.always` if it does. `key` is `&[store::Column]` identifying the unique key. `counter` is the column name. `delta` must be `store::Value::Integer` or `store::Value::Real` — the host rejects other types. **On a `#[counter]` column only `Integer` is accepted**: that column is a 64-bit signed integer cell mutated by an atomic add, so a `Real` delta is an error (and the add wraps on overflow rather than saturating). `columns` is a `store::UpsertColumns { always, on_insert }` (SDK: `UpsertColumns<'_>`) — `always` is `&[store::Column]` written on **every** call; `on_insert` is `&[store::Column]` written **only** by the call that creates the row. **A non-empty `always` is NOT conflict-free even on a `#[counter]` column**: those columns go through an ordinary row read-modify-write, so the call still conflicts under contention inside `tx(...)` — retried automatically, then 503 (see the `#[counter]` rules below). `on_insert` does not carry this cost on the insert arm, but the counter's own read-modify-write arm (a plain, non-`#[counter]` target column) still rewrites the row through the ordinary update regardless — `on_insert` narrows *which* columns get written, not whether that arm contends. Returns the row id. **Requires a UNIQUE index covering the key columns** — the call is refused with `ConstraintViolation` without one; there is no scan fallback. Use for per-key aggregations (e.g. view counts, score accumulators, per-tag event counts). **The first call for a key INSERTS, so `key ∪ always ∪ on_insert ∪ {counter}` must cover every non-nullable column that has no default** — otherwise that call is refused with `ConstraintViolation` naming the missing column (see *NOT NULL is enforced* above; prefer a `default` for a static value, `on_insert` for a computed one, over padding `always`, which is rewritten on every call). A column named in both `always` and `on_insert` is refused with `ConstraintViolation` naming it. |
@@ -1025,7 +1029,9 @@ above.
 ### Filtering / sorting / paginating
 
 **Keyset pagination is THE default for any list a client pages through — reach
-for it first.** It is O(page) regardless of depth (no offset re-scan), stable
+for it first.** This governs the list recipes earlier in this document:
+`auth::find_owned`, `find_rows_by` and `find_all_rows` are unbounded reads, and
+are the right tool only for sets that are small by construction. It is O(page) regardless of depth (no offset re-scan), stable
 under concurrent inserts (no skipped/repeated rows), and the SDK makes it a
 one-liner. Offset/`find` is a fallback for tiny, fixed, non-paged sets only.
 

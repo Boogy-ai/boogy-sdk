@@ -825,6 +825,7 @@ macro_rules! wit_glue {
         ///     Ok(id)
         /// }
         /// ```
+        #[allow(dead_code)]
         fn upsert(
             table: &str,
             key: &[$bindings::boogy::platform::store::Column],
@@ -3018,22 +3019,39 @@ macro_rules! wit_glue {
         // lives in `__boogy_idempotency` (table created via
         // `idempotency_init_table` from the user's `init_tables`).
         //
+        // The row for a scope key is claimed with a plain `insert`
+        // BEFORE the handler runs, not written after it returns. The
+        // table's `scope_key` unique index is what makes that a real
+        // claim: a second concurrent `insert` for the same scope key
+        // is refused by the store (`ConstraintViolation`), so two
+        // overlapping requests can never both fall through to running
+        // the handler — one always observes the other's row.
+        //
         // Failure modes:
         //   * No header on the request → pass-through (no caching).
-        //   * Cache hit, body fingerprint matches → 200 (or whatever
-        //     was cached) with the original response replayed.
-        //   * Cache hit, body fingerprint MISMATCH → 409 Conflict
-        //     ("Idempotency key reused with a different request").
-        //     Catches the common bug where a client retries with a
-        //     different payload under the same key.
-        //   * Cache miss → run handler, cache successful (2xx)
-        //     responses, return. 4xx/5xx skip caching so the client
-        //     can retry against a transient failure.
-        //
-        // Concurrency: best-effort. Two parallel retries with the
-        // same key race to the cache; one wins, the other re-runs
-        // the handler. Closes the duplicate-write window for
-        // sequential retries (the common case).
+        //   * Claim succeeds (row didn't exist) → run handler, then
+        //     finalize: 2xx updates the row with the real result,
+        //     non-2xx deletes it (transient failures aren't cached,
+        //     so the client can retry).
+        //   * Claim fails, existing row is PENDING and fresh (within
+        //     `STALE_CLAIM_SECONDS`) → 409 Conflict ("request already
+        //     in progress"). This is the concurrent case: the other
+        //     request is still running the handler right now.
+        //   * Claim fails, existing row is PENDING and stale (holder
+        //     crashed/trapped without finalizing) → attempt to steal
+        //     it via a conditional update; on success, run the
+        //     handler and finalize as above.
+        //   * Claim fails, existing row is COMPLETE and fresh (within
+        //     `DEFAULT_TTL_SECONDS`), fingerprint matches → replay the
+        //     cached response.
+        //   * Claim fails, existing row is COMPLETE and fresh,
+        //     fingerprint MISMATCH → 409 Conflict ("Idempotency-Key
+        //     reused with a different request"). Catches the common
+        //     bug where a client retries with a different payload
+        //     under the same key.
+        //   * Claim fails, existing row is COMPLETE and expired (past
+        //     `DEFAULT_TTL_SECONDS`) → reclaim the row and run the
+        //     handler again, as if the key were fresh.
 
         /// Create the idempotency cache table. Idempotent — the
         /// underlying `create_table` is. Call from `init_tables()`
@@ -3074,40 +3092,11 @@ macro_rules! wit_glue {
                     &principal,
                 );
                 let fp = $crate::idempotency::body_fingerprint(req.body());
+                let now = $bindings::boogy::platform::runtime::now_millis() as i64 / 1000;
 
-                // Look up cached row.
-                let cached = match find_row_by(
-                    $crate::idempotency::TABLE,
-                    "scope_key",
-                    $bindings::boogy::platform::store::Value::Text(scope.clone()),
-                ) {
-                    Ok(opt) => opt,
-                    Err(_) => {
-                        // Store error on lookup → fall through to
-                        // running the handler. Don't reject the
-                        // request just because the cache is broken.
-                        return inner(req);
-                    }
-                };
-
-                if let Some(row) = cached {
-                    let cached_fp = row.text("body_fingerprint").to_string();
-                    if cached_fp != fp {
-                        // Key reuse with a different body — caller bug.
-                        // Routes through ApiError::conflict so the wire
-                        // shape matches every other error response from
-                        // the SDK (RFC 7807 application/problem+json).
-                        return $crate::error::ApiError::conflict(
-                            "Idempotency-Key reused with a different request payload",
-                        )
-                        .into();
-                    }
-                    // Cache hit, body matches → replay.
-                    let status = match row.get("status") {
-                        $crate::store::Val::Integer(i) => *i as u16,
-                        _ => 500,
-                    };
-                    let headers: Vec<(String, String)> = row
+                fn decode_replay(row: &$crate::store::Row) -> $crate::response::HttpResponse {
+                    let status = row.int("status") as u16;
+                    let headers: ::std::vec::Vec<(::std::string::String, ::std::string::String)> = row
                         .text("headers_json")
                         .parse::<::serde_json::Value>()
                         .ok()
@@ -3130,15 +3119,173 @@ macro_rules! wit_glue {
                         }
                         _ => None,
                     };
-                    return $crate::response::HttpResponse { status, headers, body };
+                    $crate::response::HttpResponse { status, headers, body }
                 }
 
-                // Cache miss → run handler.
-                let resp = inner(req);
+                fn eq_filter(
+                    column: &str,
+                    val: $bindings::boogy::platform::store::Value,
+                ) -> $bindings::boogy::platform::store::Filter {
+                    $bindings::boogy::platform::store::Filter {
+                        column: column.to_string(),
+                        op: $bindings::boogy::platform::store::FilterOp::Eq,
+                        val,
+                        in_values: None,
+                    }
+                }
 
-                // Cache only successful (2xx) responses. Errors are
-                // transient by convention; the caller should retry
-                // and ideally get a different outcome.
+                // Claim the scope key BEFORE running the handler. `scope_key`
+                // carries a unique index (`idempotency_init_table`), so this
+                // `insert` is the actual enforcement point: at most one
+                // request can ever create this row. A concurrent second
+                // caller gets `ConstraintViolation` here — a real error, not
+                // a cache miss — so "two overlapping requests both see no
+                // row and both run the handler" is not representable.
+                let claim = $bindings::boogy::platform::store::insert(
+                    $crate::idempotency::TABLE,
+                    &[
+                        $bindings::boogy::platform::store::Column {
+                            name: "scope_key".into(),
+                            val: $bindings::boogy::platform::store::Value::Text(scope.clone()),
+                        },
+                        $bindings::boogy::platform::store::Column {
+                            name: "body_fingerprint".into(),
+                            val: $bindings::boogy::platform::store::Value::Text(fp.clone()),
+                        },
+                        $bindings::boogy::platform::store::Column {
+                            name: "status".into(),
+                            val: $bindings::boogy::platform::store::Value::Integer(
+                                $crate::idempotency::PENDING_STATUS,
+                            ),
+                        },
+                        $bindings::boogy::platform::store::Column {
+                            name: "headers_json".into(),
+                            val: $bindings::boogy::platform::store::Value::Text(::std::string::String::new()),
+                        },
+                        $bindings::boogy::platform::store::Column {
+                            name: "body_b64".into(),
+                            val: $bindings::boogy::platform::store::Value::Text(::std::string::String::new()),
+                        },
+                        $bindings::boogy::platform::store::Column {
+                            name: "created_at".into(),
+                            val: $bindings::boogy::platform::store::Value::Integer(now),
+                        },
+                    ],
+                );
+
+                // `owns_claim == true` means: we hold the scope key
+                // (outright, or by stealing an abandoned/expired row) and
+                // must run the handler and finalize the row ourselves.
+                // Every other outcome returns directly from this block.
+                let owns_claim: bool = match claim {
+                    Ok(_row_id) => true,
+                    Err(_) => {
+                        let existing = match find_row_by(
+                            $crate::idempotency::TABLE,
+                            "scope_key",
+                            $bindings::boogy::platform::store::Value::Text(scope.clone()),
+                        ) {
+                            Ok(Some(row)) => row,
+                            // The row our insert collided with is already
+                            // gone (raced with a non-2xx release) or the
+                            // cache is broken — run unguarded rather than
+                            // reject the request.
+                            Ok(None) => return inner(req),
+                            Err(_) => return inner(req),
+                        };
+                        let row_status = existing.int("status");
+                        let row_created_at = existing.int("created_at");
+
+                        if row_status == $crate::idempotency::PENDING_STATUS {
+                            let age = now - row_created_at;
+                            if age <= $crate::idempotency::STALE_CLAIM_SECONDS {
+                                // Genuinely concurrent: another request is
+                                // running the handler for this key right
+                                // now. Say so instead of silently re-running
+                                // the handler ourselves.
+                                return $crate::error::ApiError::conflict(
+                                    "Idempotency-Key request is already in progress",
+                                )
+                                .into();
+                            }
+                            // Past the reclaim window: the original holder
+                            // never finalized (trap, crash, kill). Steal the
+                            // claim with a conditional update — succeeds
+                            // only if the row is still that exact abandoned
+                            // PENDING row.
+                            let stolen = $bindings::boogy::platform::store::update_where(
+                                $crate::idempotency::TABLE,
+                                &[
+                                    eq_filter("scope_key", $bindings::boogy::platform::store::Value::Text(scope.clone())),
+                                    eq_filter("status", $bindings::boogy::platform::store::Value::Integer($crate::idempotency::PENDING_STATUS)),
+                                    eq_filter("created_at", $bindings::boogy::platform::store::Value::Integer(row_created_at)),
+                                ],
+                                &[$bindings::boogy::platform::store::Column {
+                                    name: "created_at".into(),
+                                    val: $bindings::boogy::platform::store::Value::Integer(now),
+                                }],
+                            );
+                            matches!(stolen, Ok(1))
+                        } else {
+                            // A completed response is cached. Honor
+                            // DEFAULT_TTL_SECONDS: past it, the row is
+                            // reclaimed for a fresh execution instead of
+                            // replayed.
+                            let age = now - row_created_at;
+                            if age <= $crate::idempotency::DEFAULT_TTL_SECONDS {
+                                let cached_fp = existing.text("body_fingerprint");
+                                if cached_fp != fp {
+                                    // Key reuse with a different body —
+                                    // caller bug. Routes through
+                                    // ApiError::conflict so the wire shape
+                                    // matches every other error response
+                                    // from the SDK (RFC 7807
+                                    // application/problem+json).
+                                    return $crate::error::ApiError::conflict(
+                                        "Idempotency-Key reused with a different request payload",
+                                    )
+                                    .into();
+                                }
+                                return decode_replay(&existing);
+                            }
+                            let stolen = $bindings::boogy::platform::store::update_where(
+                                $crate::idempotency::TABLE,
+                                &[
+                                    eq_filter("scope_key", $bindings::boogy::platform::store::Value::Text(scope.clone())),
+                                    eq_filter("created_at", $bindings::boogy::platform::store::Value::Integer(row_created_at)),
+                                ],
+                                &[
+                                    $bindings::boogy::platform::store::Column {
+                                        name: "status".into(),
+                                        val: $bindings::boogy::platform::store::Value::Integer(
+                                            $crate::idempotency::PENDING_STATUS,
+                                        ),
+                                    },
+                                    $bindings::boogy::platform::store::Column {
+                                        name: "created_at".into(),
+                                        val: $bindings::boogy::platform::store::Value::Integer(now),
+                                    },
+                                ],
+                            );
+                            matches!(stolen, Ok(1))
+                        }
+                    }
+                };
+
+                if !owns_claim {
+                    // Lost a steal race against another reclaimer for an
+                    // abandoned/expired row. Rare (crash-recovery path
+                    // only); ask the caller to retry rather than loop.
+                    return $crate::error::ApiError::conflict(
+                        "Idempotency-Key request is already in progress",
+                    )
+                    .into();
+                }
+
+                // We own the claim: run the handler, then finalize.
+                let resp = inner(req);
+                let finished_at = $bindings::boogy::platform::runtime::now_millis() as i64 / 1000;
+
                 if (200..300).contains(&resp.status) {
                     let headers_json = ::serde_json::to_string(&resp.headers)
                         .unwrap_or_else(|_| "[]".to_string());
@@ -3147,14 +3294,10 @@ macro_rules! wit_glue {
                         .as_deref()
                         .map(__sdk_base64_encode)
                         .unwrap_or_default();
-                    let now = $bindings::boogy::platform::runtime::now_millis() as i64 / 1000;
-                    let _ = upsert(
+                    let _ = $bindings::boogy::platform::store::update_where(
                         $crate::idempotency::TABLE,
-                        &[$bindings::boogy::platform::store::Column {
-                            name: "scope_key".into(),
-                            val: $bindings::boogy::platform::store::Value::Text(scope),
-                        }],
-                        UpsertColumns::always(&[
+                        &[eq_filter("scope_key", $bindings::boogy::platform::store::Value::Text(scope.clone()))],
+                        &[
                             $bindings::boogy::platform::store::Column {
                                 name: "body_fingerprint".into(),
                                 val: $bindings::boogy::platform::store::Value::Text(fp),
@@ -3175,9 +3318,17 @@ macro_rules! wit_glue {
                             },
                             $bindings::boogy::platform::store::Column {
                                 name: "created_at".into(),
-                                val: $bindings::boogy::platform::store::Value::Integer(now),
+                                val: $bindings::boogy::platform::store::Value::Integer(finished_at),
                             },
-                        ]),
+                        ],
+                    );
+                } else {
+                    // Transient failure — release the claim instead of
+                    // caching it, so a legitimate retry isn't blocked as
+                    // "in progress" or (worse) replayed against an error.
+                    let _ = $bindings::boogy::platform::store::delete_where(
+                        $crate::idempotency::TABLE,
+                        &[eq_filter("scope_key", $bindings::boogy::platform::store::Value::Text(scope))],
                     );
                 }
                 resp

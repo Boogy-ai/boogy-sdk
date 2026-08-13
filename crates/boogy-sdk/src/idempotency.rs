@@ -3,14 +3,23 @@
 //! Standard contract (Stripe / GitHub / etc.):
 //!
 //! - The client sends an `Idempotency-Key` header on a write
-//!   request. The server caches the response under
-//!   `(key, method, path)` for a TTL.
-//! - A retry of the same `(key, method, path)` with the **same body**
-//!   replays the cached response — the underlying handler does not
-//!   re-run.
+//!   request. The server claims the key **before** the handler runs
+//!   and caches the response under `(key, method, path, principal)`
+//!   for [`DEFAULT_TTL_SECONDS`].
+//! - A retry of the same `(key, method, path, principal)` with the
+//!   **same body** replays the cached response — the underlying
+//!   handler does not re-run.
 //! - A retry with a **different body** is rejected as a key-reuse
 //!   error (409 Conflict). Catches the common bug where a client
 //!   reuses an idempotency key by mistake.
+//! - **Two overlapping requests with the same key**: only one of
+//!   them ever runs the handler. The claim is a single atomic
+//!   `insert` guarded by a unique index on `scope_key` — the store
+//!   itself rejects a second concurrent claim (`ConstraintViolation`),
+//!   so "both requests miss the cache and both run the handler" is
+//!   not representable. The loser gets 409 Conflict ("request already
+//!   in progress") if it observes the claim while the winner is still
+//!   running, or a normal replay if it observes the finished result.
 //! - Requests without an `Idempotency-Key` header pass through
 //!   unchanged.
 //!
@@ -22,14 +31,24 @@
 //!
 //! ## Caveats
 //!
-//! - Best-effort under concurrent retries: two parallel requests
-//!   with the same key + body race to the table; one wins, the
-//!   other re-runs the handler. Closes the duplicate-write window
-//!   for sequential retries (the common case); doesn't replace a
-//!   distributed lock for high-fanout concurrency.
-//! - TTL pruning is the caller's responsibility — there's no
-//!   background sweeper. The SDK's `migrations` runner is a fine
-//!   place to drop old rows during a deploy.
+//! - **Crash recovery is best-effort.** If the handler that claimed a
+//!   key never returns (trap, host crash, killed instance) the claim
+//!   row is stuck `PENDING` until [`STALE_CLAIM_SECONDS`] elapses, at
+//!   which point the next request may steal it via a conditional
+//!   update. Two requests racing to steal the *same* abandoned claim
+//!   at the *same* instant are not guaranteed to serialize as cleanly
+//!   as the initial claim — one, both, or neither may see itself win,
+//!   depending on how the store resolves the concurrent
+//!   `update-where` calls. This is a narrow crash-recovery window,
+//!   not the ordinary concurrent-request case above (which is fully
+//!   closed).
+//! - **TTL is enforced at read time, not swept.** A cached response
+//!   older than [`DEFAULT_TTL_SECONDS`] is treated as expired the
+//!   next time its key is looked up (and the row is reclaimed for a
+//!   fresh execution); there's no background sweeper, so a key that's
+//!   never retried just sits in the table. The SDK's `migrations`
+//!   runner is a fine place to prune old rows during a deploy if
+//!   table size matters.
 //! - Response bodies above ~64 KiB inflate the per-service store
 //!   noticeably; consider scoping idempotency to small-write
 //!   endpoints (POST /orders, POST /charges) rather than bulk.
@@ -44,8 +63,27 @@ pub const HEADER: &str = "Idempotency-Key";
 pub const TABLE: &str = "__boogy_idempotency";
 
 /// Default TTL for cached responses (24 hours). Matches Stripe's
-/// public default. Callers can prune sooner via direct SQL.
+/// public default. A cache row older than this is no longer replayed
+/// — the next request for that key reclaims the row and runs the
+/// handler again, as if the key were fresh. Callers can prune sooner
+/// via direct SQL.
 pub const DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
+
+/// Sentinel `status` value for a row that has claimed its scope key
+/// but whose handler has not yet finished (or failed and released the
+/// claim). Never a real HTTP status (100–599), so it can't collide
+/// with a genuinely cached response.
+pub const PENDING_STATUS: i64 = 0;
+
+/// How long a `PENDING` claim is honored as "a request is genuinely
+/// still running" before a later request is allowed to steal it.
+/// Comfortably above the platform's default per-request wall-clock
+/// budget (`[limits] cpu_deadline_ms`, 30s default — see
+/// `docs/compute-fairness.md`), so it only fires once the original
+/// holder is provably gone (trapped, crashed, or otherwise never
+/// finalized its claim), not while a legitimate slow handler is still
+/// working.
+pub const STALE_CLAIM_SECONDS: i64 = 60;
 
 /// Compose the lookup key for the cache table. Composite of
 /// `(idempotency_key, method, path, principal)` so a retry of the same
