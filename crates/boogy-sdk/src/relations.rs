@@ -6,10 +6,16 @@
 //! with their comments" hits the N+1 trap if every parent issues
 //! its own child query.
 //!
-//! [`load_has_many`] batches the children: one parameterised
-//! `SELECT * FROM <child> WHERE <fk> IN (?, ?, ...)` regardless of
-//! how many parents are in scope, then groups the result by FK so
+//! [`load_has_many`] batches the children with a single `IN` FILTER over
+//! all parent ids — `store::find` with `FilterOp::In`, not SQL; the store
+//! speaks no SQL and rejects it outright — then groups the result by FK so
 //! handlers can splice children onto parents in O(1) per parent.
+//!
+//! It reads the matching children in pages, because the host caps a single
+//! `find` at `BOOGY_STORE_MAX_PAGE_ROWS`. Those pages are taken by OFFSET and
+//! request no sort, so above one page the result is not stable under
+//! concurrent writes — see the guarantee audit (1ae) before relying on it for
+//! a large child set.
 //!
 //! ## Typical handler
 //!
@@ -88,45 +94,6 @@ pub fn group_by_column_u64(rows: Vec<Row>, column: &str) -> HashMap<u64, Vec<Row
     out
 }
 
-/// Build the parameterised `SELECT ... IN (?, ?, ...)` string for a
-/// batched child fetch. Public so handlers that need a tweaked
-/// query (different `SELECT` columns, extra `WHERE` clauses) can
-/// reuse the placeholder-construction logic without copy-pasting
-/// the format machinery.
-///
-/// Returns `(sql, num_placeholders)`. Callers pass `num_placeholders`
-/// rows of actual parameter values to `store::query`.
-///
-/// Identifier escaping: the SQL the WIT store talks to is SQLite,
-/// where unquoted identifiers are case-insensitive ASCII; the SDK
-/// already restricts table/column names to that shape elsewhere
-/// (manifest validators, `Table::new` builders), so direct
-/// interpolation is safe here. The values themselves go through
-/// `?` placeholders so untrusted ids never reach the SQL string.
-pub fn build_in_query(
-    child_table: &str,
-    fk_column: &str,
-    parent_count: usize,
-) -> (String, usize) {
-    if parent_count == 0 {
-        // No parents → no query. Caller should short-circuit before
-        // calling store::query; if they don't, a SELECT with an
-        // empty IN list is a SQL parse error.
-        return (String::new(), 0);
-    }
-    let mut placeholders = String::with_capacity(parent_count * 2);
-    for i in 0..parent_count {
-        if i > 0 {
-            placeholders.push(',');
-        }
-        placeholders.push('?');
-    }
-    let sql = format!(
-        "SELECT * FROM {child_table} WHERE {fk_column} IN ({placeholders})"
-    );
-    (sql, parent_count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,24 +161,6 @@ mod tests {
         assert!(grouped.is_empty());
     }
 
-    #[test]
-    fn build_in_query_zero_parents_yields_empty_sql() {
-        let (sql, n) = build_in_query("comments", "note_id", 0);
-        assert!(sql.is_empty());
-        assert_eq!(n, 0);
+    
+    
     }
-
-    #[test]
-    fn build_in_query_single_parent() {
-        let (sql, n) = build_in_query("comments", "note_id", 1);
-        assert_eq!(sql, "SELECT * FROM comments WHERE note_id IN (?)");
-        assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn build_in_query_multiple_parents() {
-        let (sql, n) = build_in_query("comments", "note_id", 4);
-        assert_eq!(sql, "SELECT * FROM comments WHERE note_id IN (?,?,?,?)");
-        assert_eq!(n, 4);
-    }
-}

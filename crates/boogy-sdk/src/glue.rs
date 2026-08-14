@@ -847,8 +847,21 @@ macro_rules! wit_glue {
         /// `filters` + `or_groups` per row, walking in `order_col` /
         /// `dir` order — `order_col = None` is primary-key order) and
         /// calls `f` once per batch of up to `batch_size` rows until the
-        /// table is exhausted. Every matching row is visited exactly
-        /// once, in order, with no gaps or duplicates. This is the
+        /// table is exhausted.
+        ///
+        /// **Exactly-once holds in PRIMARY-KEY order** (`order_col =
+        /// None`): the cursor resumes from the row key, which never
+        /// moves for a live row.
+        ///
+        /// **In INDEX order it does not.** The resume bound is the index
+        /// entry, which embeds the indexed VALUE, so a row whose indexed
+        /// column is updated mid-walk relocates: backward past the
+        /// cursor it is visited TWICE, forward it is SKIPPED. Cursors are
+        /// read-committed, not snapshot-isolated, and no guard can
+        /// recover an entry that moved across the resume bound. If `f`
+        /// does anything non-idempotent — charging, sending,
+        /// incrementing — either walk in primary-key order or make `f`
+        /// safe to repeat. This is the
         /// bounded-memory alternative to `find_all_rows` / offset
         /// paging for large-table batch jobs: only `batch_size` rows are
         /// ever materialized at a time, and the cursor resumes strictly
@@ -906,8 +919,7 @@ macro_rules! wit_glue {
         /// Empty `parent_ids` short-circuits without a query.
         ///
         /// See [`boogy_sdk::relations`] for the design rationale
-        /// and the [`group_by_column`] / [`build_in_query`] primitives
-        /// this wrapper composes.
+        /// and the [`group_by_column`] primitive this wrapper composes.
         fn load_has_many(
             child_table: &str,
             fk_column: &str,
