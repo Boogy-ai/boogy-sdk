@@ -596,35 +596,31 @@ macro_rules! wit_glue {
         fn find_all_rows(
             table: &str,
         ) -> ::core::result::Result<(::std::vec::Vec<$crate::store::Row>, u64), $crate::store::StoreError> {
-            let mut rows: ::std::vec::Vec<$crate::store::Row> = ::std::vec::Vec::new();
-            let mut offset: u32 = 0;
-            let total = loop {
-                let res = $bindings::boogy::platform::store::find(
-                    table,
-                    &$bindings::boogy::platform::store::FindOptions {
-                        filters: vec![],
-                        sort: vec![],
-                        page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset }),
-                        or_groups: vec![],
-                        allow_full_scan: false,
-                        skip_total: false,
-                    },
-                )
-                .map_err($crate::store::StoreError::from_wit)?;
-                let n = res.rows.len() as u32;
-                rows.extend(res.rows.iter().map(|r| to_sdk_row(r)));
-                // Terminate ONLY on an empty page. We deliberately do NOT stop
-                // on `n < SDK_FIND_BATCH` (the host may clamp the page below
-                // SDK_FIND_BATCH, so a "short" page is normal, not the end) NOR
-                // on `rows.len() >= total_count`: a concurrent delete can shrink
-                // total_count below the already-collected count and truncate the
-                // result early. An empty page is the only reliable terminator.
-                if n == 0 {
-                    break res.total_count;
-                }
-                offset += n;
-            };
-            Ok((rows, total))
+            let res = $bindings::boogy::platform::store::find(
+                table,
+                &$bindings::boogy::platform::store::FindOptions {
+                    filters: vec![],
+                    sort: vec![],
+                    page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset: 0 }),
+                    or_groups: vec![],
+                    allow_full_scan: false,
+                    skip_total: false,
+                },
+            )
+            .map_err($crate::store::StoreError::from_wit)?;
+            let rows: ::std::vec::Vec<$crate::store::Row> =
+                res.rows.iter().map(|r| to_sdk_row(r)).collect();
+            // ONE page, then refuse. This helper has no filter, so there is no
+            // `list_by` composite that could give it a stable paged order —
+            // a whole-table read past one page cannot be made safe here.
+            $crate::store::refuse_beyond_one_page(
+                "find_all_rows",
+                rows.len(),
+                res.total_count,
+                "Stream it instead: for_each_batch(table, .., None, ..) walks in primary-key \
+                 order with a cursor and bounded memory.",
+            )?;
+            Ok((rows, res.total_count))
         }
 
         // -- Typed model CRUD (bridge to the WIT store; see boogy_sdk::model) --
@@ -656,32 +652,162 @@ macro_rules! wit_glue {
             val: $crate::store::Val,
         ) -> ::core::result::Result<::std::vec::Vec<M>, $crate::store::StoreError> {
             let wit_val = __boogy_val_to_wit(&val);
+            // Page along the model's DECLARED order for this filter. That
+            // declaration is what guarantees one index covers the filter AND
+            // the order, so each page is a bounded ordered range rather than a
+            // drain-and-sort. Without it there is no stable sequence and the
+            // old offset walk could return a row twice or skip it — so refuse
+            // instead of guessing an order no index serves.
+            let schema = M::schema();
+            let order = match $crate::store::read_strategy(&schema, col) {
+                // `#[lookup_by]`: unique, so at most one row — nothing to page.
+                // One bounded read, and the guard is a belt-and-braces check
+                // that the uniqueness the model claims actually held.
+                $crate::store::ReadStrategy::PointLookup => {
+                    let res = $bindings::boogy::platform::store::find(
+                        M::TABLE,
+                        &$bindings::boogy::platform::store::FindOptions {
+                            filters: ::std::vec![$bindings::boogy::platform::store::Filter {
+                                column: col.to_string(),
+                                op: $bindings::boogy::platform::store::FilterOp::Eq,
+                                val: wit_val.clone(),
+                                in_values: None,
+                            }],
+                            sort: ::std::vec![],
+                            page: Some($bindings::boogy::platform::store::Page {
+                                limit: SDK_FIND_BATCH,
+                                offset: 0,
+                            }),
+                            or_groups: ::std::vec![],
+                            allow_full_scan: false,
+                            skip_total: false,
+                        },
+                    )
+                    .map_err($crate::store::StoreError::from_wit)?;
+                    let out: ::std::vec::Vec<M> =
+                        res.rows.iter().map(|r| M::from_row(&to_sdk_row(r))).collect();
+                    $crate::store::refuse_beyond_one_page(
+                        "db_find_by",
+                        out.len(),
+                        res.total_count,
+                        "This column is declared unique (#[lookup_by]) but matched more rows \
+                         than one page — the uniqueness does not hold.",
+                    )?;
+                    return Ok(out);
+                }
+                $crate::store::ReadStrategy::Keyset(order) => order,
+                // No covering order: one page is still correct, so serve it and
+                // stop there. Only continuing past a page needs the order this
+                // model never declared.
+                $crate::store::ReadStrategy::SinglePageOnly => {
+                    let res = $bindings::boogy::platform::store::find(
+                        M::TABLE,
+                        &$bindings::boogy::platform::store::FindOptions {
+                            filters: ::std::vec![$bindings::boogy::platform::store::Filter {
+                                column: col.to_string(),
+                                op: $bindings::boogy::platform::store::FilterOp::Eq,
+                                val: wit_val.clone(),
+                                in_values: None,
+                            }],
+                            sort: ::std::vec![],
+                            page: Some($bindings::boogy::platform::store::Page {
+                                limit: SDK_FIND_BATCH,
+                                offset: 0,
+                            }),
+                            or_groups: ::std::vec![],
+                            allow_full_scan: false,
+                            skip_total: false,
+                        },
+                    )
+                    .map_err($crate::store::StoreError::from_wit)?;
+                    let out: ::std::vec::Vec<M> =
+                        res.rows.iter().map(|r| M::from_row(&to_sdk_row(r))).collect();
+                    $crate::store::refuse_beyond_one_page(
+                        "db_find_by",
+                        out.len(),
+                        res.total_count,
+                        &::std::format!(
+                            "Declare how {}.{} is listed so it can page safely: add \
+                             list_by(filter = \"{}\", newest = \"<a timestamp or sequence \
+                             column>\") to the model, or an index over [\"{}\", \"<sort \
+                             col>\"]. One index must cover the filter AND the order.",
+                            M::TABLE, col, col, col,
+                        ),
+                    )?;
+                    return Ok(out);
+                }
+            };
+            let dir = if order.desc {
+                $crate::store::SortDir::Desc
+            } else {
+                $crate::store::SortDir::Asc
+            };
+
             let mut out: ::std::vec::Vec<M> = ::std::vec::Vec::new();
-            let mut offset: u32 = 0;
+            let mut cursor: ::core::option::Option<$crate::pagination::Cursor> = None;
             loop {
+                // Resume strictly after the last row on (sort value, _id) — the
+                // composite boundary, so ties on the sort column cannot repeat
+                // or drop a row.
+                let (extra, kset_or) =
+                    $crate::pagination::keyset_resume_filter(cursor.as_ref(), &order.column, dir);
+                let mut filters = ::std::vec![$bindings::boogy::platform::store::Filter {
+                    column: col.to_string(),
+                    op: $bindings::boogy::platform::store::FilterOp::Eq,
+                    val: wit_val.clone(),
+                    in_values: None,
+                }];
+                filters.extend(extra.iter().map(__boogy_sdk_filter_to_wit));
+                let or_groups: ::std::vec::Vec<::std::vec::Vec<_>> = kset_or
+                    .iter()
+                    .map(|g| g.iter().map(__boogy_sdk_filter_to_wit).collect())
+                    .collect();
+
                 let res = $bindings::boogy::platform::store::find(
                     M::TABLE,
                     &$bindings::boogy::platform::store::FindOptions {
-                        filters: vec![$bindings::boogy::platform::store::Filter {
-                            column: col.to_string(),
-                            op: $bindings::boogy::platform::store::FilterOp::Eq,
-                            val: wit_val.clone(),
-                            in_values: None,
-                        }],
-                        sort: vec![],
-                        page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset }),
-                        or_groups: vec![],
+                        filters,
+                        sort: ::std::vec![
+                            $bindings::boogy::platform::store::SortBy {
+                                column: order.column.clone(),
+                                dir: __boogy_sdk_dir_to_wit(dir),
+                            },
+                            $bindings::boogy::platform::store::SortBy {
+                                column: "_id".to_string(),
+                                dir: __boogy_sdk_dir_to_wit(dir),
+                            },
+                        ],
+                        page: Some($bindings::boogy::platform::store::Page {
+                            limit: SDK_FIND_BATCH,
+                            offset: 0,
+                        }),
+                        or_groups,
                         allow_full_scan: false,
-                        skip_total: false,
+                        // Keyset never needs the count; the page itself says
+                        // whether another follows.
+                        skip_total: true,
                     },
                 )
                 .map_err($crate::store::StoreError::from_wit)?;
+
                 let n = res.rows.len() as u32;
-                out.extend(res.rows.iter().map(|r| M::from_row(&to_sdk_row(r))));
-                if n == 0 || out.len() as u64 >= res.total_count {
+                if n == 0 {
                     break;
                 }
-                offset += n;
+                if let Some(last) = res.rows.last() {
+                    let row = to_sdk_row(last);
+                    cursor = Some($crate::pagination::Cursor {
+                        last_id: row.id().to_string(),
+                        last_value: row.get(&order.column).to_json(),
+                    });
+                }
+                out.extend(res.rows.iter().map(|r| M::from_row(&to_sdk_row(r))));
+                // Terminate ONLY on an empty page. The host clamps a page to
+                // BOOGY_STORE_MAX_PAGE_ROWS, which can be well below
+                // SDK_FIND_BATCH, so a SHORT page is normal rather than the end
+                // — stopping on `n < SDK_FIND_BATCH` silently truncates to the
+                // host's cap. Costs one extra round trip at the end; returning
+                // a partial set as if it were complete costs correctness.
             }
             Ok(out)
         }
@@ -936,33 +1062,36 @@ macro_rules! wit_glue {
                     .iter()
                     .map(|id| $bindings::boogy::platform::store::Value::Integer(*id as i64))
                     .collect();
-            let mut sdk_rows: ::std::vec::Vec<$crate::store::Row> = ::std::vec::Vec::new();
-            let mut offset: u32 = 0;
-            loop {
-                let res = $bindings::boogy::platform::store::find(
-                    child_table,
-                    &$bindings::boogy::platform::store::FindOptions {
-                        filters: vec![$bindings::boogy::platform::store::Filter {
-                            column: fk_column.to_string(),
-                            op: $bindings::boogy::platform::store::FilterOp::In,
-                            val: $bindings::boogy::platform::store::Value::Null,
-                            in_values: Some(in_vals.clone()),
-                        }],
-                        sort: vec![],
-                        page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset }),
-                        or_groups: vec![],
-                        allow_full_scan: false,
-                        skip_total: false,
-                    },
-                )
-                .map_err($crate::store::StoreError::from_wit)?;
-                let n = res.rows.len() as u32;
-                sdk_rows.extend(res.rows.iter().map(|r| to_sdk_row(r)));
-                if n == 0 || sdk_rows.len() as u64 >= res.total_count {
-                    break;
-                }
-                offset += n;
-            }
+            let res = $bindings::boogy::platform::store::find(
+                child_table,
+                &$bindings::boogy::platform::store::FindOptions {
+                    filters: vec![$bindings::boogy::platform::store::Filter {
+                        column: fk_column.to_string(),
+                        op: $bindings::boogy::platform::store::FilterOp::In,
+                        val: $bindings::boogy::platform::store::Value::Null,
+                        in_values: Some(in_vals),
+                    }],
+                    sort: vec![],
+                    page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset: 0 }),
+                    or_groups: vec![],
+                    allow_full_scan: false,
+                    skip_total: false,
+                },
+            )
+            .map_err($crate::store::StoreError::from_wit)?;
+            let sdk_rows: ::std::vec::Vec<$crate::store::Row> =
+                res.rows.iter().map(|r| to_sdk_row(r)).collect();
+            // ONE page, then refuse. An `IN` list is planned as one seek PER
+            // parent, unioned and sorted in host memory — so unlike the single
+            // equality helpers, no declared composite would make this page in
+            // bounded work. Batching the parents is the caller's lever.
+            $crate::store::refuse_beyond_one_page(
+                "load_has_many",
+                sdk_rows.len(),
+                res.total_count,
+                "Split the parent ids into smaller batches and call it once per batch, or load \
+                 the children per parent with a keyset page each.",
+            )?;
             Ok($crate::relations::group_by_column_u64(sdk_rows, fk_column))
         }
 
@@ -1499,37 +1628,37 @@ macro_rules! wit_glue {
             column: &str,
             val: $bindings::boogy::platform::store::Value,
         ) -> ::core::result::Result<::std::vec::Vec<$crate::store::Row>, $crate::store::StoreError> {
-            let mut rows: ::std::vec::Vec<$crate::store::Row> = ::std::vec::Vec::new();
-            let mut offset: u32 = 0;
-            loop {
-                let res = $bindings::boogy::platform::store::find(
-                    table,
-                    &$bindings::boogy::platform::store::FindOptions {
-                        filters: vec![$bindings::boogy::platform::store::Filter {
-                            column: column.to_string(),
-                            op: $bindings::boogy::platform::store::FilterOp::Eq,
-                            val: val.clone(),
-                            in_values: None,
-                        }],
-                        sort: vec![],
-                        page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset }),
-                        or_groups: vec![],
-                        allow_full_scan: false,
-                        skip_total: false,
-                    },
-                )
-                .map_err($crate::store::StoreError::from_wit)?;
-                let n = res.rows.len() as u32;
-                rows.extend(res.rows.iter().map(|r| to_sdk_row(r)));
-                // Terminate ONLY on an empty page — see find_all_rows. Stopping
-                // on `rows.len() >= total_count` truncates the result when a
-                // concurrent delete shrinks total_count below the collected
-                // count; a short page is normal under host page clamping.
-                if n == 0 {
-                    break;
-                }
-                offset += n;
-            }
+            let res = $bindings::boogy::platform::store::find(
+                table,
+                &$bindings::boogy::platform::store::FindOptions {
+                    filters: vec![$bindings::boogy::platform::store::Filter {
+                        column: column.to_string(),
+                        op: $bindings::boogy::platform::store::FilterOp::Eq,
+                        val: val.clone(),
+                        in_values: None,
+                    }],
+                    sort: vec![],
+                    page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset: 0 }),
+                    or_groups: vec![],
+                    allow_full_scan: false,
+                    skip_total: false,
+                },
+            )
+            .map_err($crate::store::StoreError::from_wit)?;
+            let rows: ::std::vec::Vec<$crate::store::Row> =
+                res.rows.iter().map(|r| to_sdk_row(r)).collect();
+            // ONE page, then refuse. This is the UNTYPED lookup: with only a
+            // table name there is no model schema to read a declared `list_by`
+            // from, so there is no sort column it could page along safely.
+            // `db_find_by::<M>` is the typed equivalent that can.
+            $crate::store::refuse_beyond_one_page(
+                "find_rows_by",
+                rows.len(),
+                res.total_count,
+                "Use the typed db_find_by::<M>(..) with a model that declares \
+                 list_by(filter = \"<this column>\", newest = \"<sort col>\"), or page it \
+                 yourself with the Query DSL's keyset terminal.",
+            )?;
             Ok(rows)
         }
 
@@ -2960,45 +3089,120 @@ macro_rules! wit_glue {
             /// `StoreError → ApiError` so unique-violation / FK
             /// preservation works for any caller using `?` into a
             /// Result-typed handler.
-            pub fn find_owned(
-                table: &str,
+            /// TYPED so the model's declared access patterns are reachable:
+            /// the table comes from `M::TABLE` and the paging order from
+            /// `M::schema()`. Untyped, there was nothing to read a safe order
+            /// from, which is why this used to page by OFFSET with no sort and
+            /// could return a principal's row twice or not at all.
+            pub fn find_owned<M: $crate::model::Model>(
                 owner_col: &str,
             ) -> ::core::result::Result<::std::vec::Vec<$crate::store::Row>, $crate::error::ApiError>
             {
+                let table = <M as $crate::model::Model>::TABLE;
                 // Blank principal → unauthenticated. Otherwise a blank
                 // `current_principal()` would issue `WHERE owner_col = ''` and
                 // return every un-owned row as if the anonymous caller owned it.
                 let principal = $crate::request_state::_request_principal_nonblank()
                     .ok_or_else($crate::error::ApiError::unauthenticated)?;
+                let schema = <M as $crate::model::Model>::schema();
+                let order = match $crate::store::read_strategy(&schema, owner_col) {
+                    $crate::store::ReadStrategy::Keyset(o) => Some(o),
+                    // Unique owner column (one row per principal) or no declared
+                    // order: one page is correct either way, and only going past
+                    // it would need the order this model never declared.
+                    _ => None,
+                };
+
                 let mut rows: ::std::vec::Vec<$crate::store::Row> = ::std::vec::Vec::new();
-                let mut offset: u32 = 0;
+                let mut cursor: ::core::option::Option<$crate::pagination::Cursor> = None;
                 loop {
+                    let (extra, kset_or) = match &order {
+                        Some(o) => {
+                            let dir = if o.desc {
+                                $crate::store::SortDir::Desc
+                            } else {
+                                $crate::store::SortDir::Asc
+                            };
+                            $crate::pagination::keyset_resume_filter(cursor.as_ref(), &o.column, dir)
+                        }
+                        None => (::std::vec![], ::std::vec![]),
+                    };
+                    let mut filters = ::std::vec![super::$bindings::boogy::platform::store::Filter {
+                        column: owner_col.to_string(),
+                        op: super::$bindings::boogy::platform::store::FilterOp::Eq,
+                        val: super::$bindings::boogy::platform::store::Value::Text(principal.clone()),
+                        in_values: None,
+                    }];
+                    filters.extend(extra.iter().map(super::__boogy_sdk_filter_to_wit));
+                    let or_groups: ::std::vec::Vec<::std::vec::Vec<_>> = kset_or
+                        .iter()
+                        .map(|g| g.iter().map(super::__boogy_sdk_filter_to_wit).collect())
+                        .collect();
+                    let sort = match &order {
+                        Some(o) => {
+                            let d = super::__boogy_sdk_dir_to_wit(if o.desc {
+                                $crate::store::SortDir::Desc
+                            } else {
+                                $crate::store::SortDir::Asc
+                            });
+                            ::std::vec![
+                                super::$bindings::boogy::platform::store::SortBy {
+                                    column: o.column.clone(),
+                                    dir: d,
+                                },
+                                super::$bindings::boogy::platform::store::SortBy {
+                                    column: "_id".to_string(),
+                                    dir: d,
+                                },
+                            ]
+                        }
+                        None => ::std::vec![],
+                    };
+
                     let res = super::$bindings::boogy::platform::store::find(
                         table,
                         &super::$bindings::boogy::platform::store::FindOptions {
-                            filters: vec![super::$bindings::boogy::platform::store::Filter {
-                                column: owner_col.to_string(),
-                                op: super::$bindings::boogy::platform::store::FilterOp::Eq,
-                                val: super::$bindings::boogy::platform::store::Value::Text(principal.clone()),
-                                in_values: None,
-                            }],
-                            sort: vec![],
+                            filters,
+                            sort,
                             page: Some(super::$bindings::boogy::platform::store::Page {
                                 limit: super::SDK_FIND_BATCH,
-                                offset,
+                                offset: 0,
                             }),
-                            or_groups: vec![],
+                            or_groups,
                             allow_full_scan: false,
-                            skip_total: false,
+                            skip_total: order.is_some(),
                         },
                     )
                     .map_err($crate::store::StoreError::from_wit)?;
+
                     let n = res.rows.len() as u32;
-                    rows.extend(res.rows.iter().map(super::to_sdk_row));
-                    if n == 0 || rows.len() as u64 >= res.total_count {
+                    let Some(o) = order.as_ref() else {
+                        // No safe order: serve this page, refuse to guess past it.
+                        rows.extend(res.rows.iter().map(super::to_sdk_row));
+                        $crate::store::refuse_beyond_one_page(
+                            "find_owned",
+                            rows.len(),
+                            res.total_count,
+                            "Declare how this table is listed for its owner column so it can \
+                             page safely: add list_by(filter = \"<owner col>\", newest = \
+                             \"<a timestamp or sequence column>\") to the model.",
+                        )?;
+                        break;
+                    };
+                    if n == 0 {
                         break;
                     }
-                    offset += n;
+                    if let Some(last) = res.rows.last() {
+                        let row = super::to_sdk_row(last);
+                        cursor = Some($crate::pagination::Cursor {
+                            last_id: row.id().to_string(),
+                            last_value: row.get(&o.column).to_json(),
+                        });
+                    }
+                    rows.extend(res.rows.iter().map(super::to_sdk_row));
+                    // Empty page is the ONLY reliable terminator — see
+                    // db_find_by: the host's page cap can be below
+                    // SDK_FIND_BATCH, so a short page does not mean the end.
                 }
                 Ok(rows)
             }

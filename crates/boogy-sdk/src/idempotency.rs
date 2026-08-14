@@ -31,17 +31,25 @@
 //!
 //! ## Caveats
 //!
-//! - **Crash recovery is best-effort.** If the handler that claimed a
-//!   key never returns (trap, host crash, killed instance) the claim
-//!   row is stuck `PENDING` until [`STALE_CLAIM_SECONDS`] elapses, at
-//!   which point the next request may steal it via a conditional
-//!   update. Two requests racing to steal the *same* abandoned claim
-//!   at the *same* instant are not guaranteed to serialize as cleanly
-//!   as the initial claim — one, both, or neither may see itself win,
-//!   depending on how the store resolves the concurrent
-//!   `update-where` calls. This is a narrow crash-recovery window,
-//!   not the ordinary concurrent-request case above (which is fully
-//!   closed).
+//! - **Crash recovery is best-effort in *when*, not in *how many*.** If
+//!   the handler that claimed a key never returns (trap, host crash,
+//!   killed instance) the claim row is stuck `PENDING` until
+//!   [`STALE_CLAIM_SECONDS`] elapses — so the key is unavailable for up
+//!   to that long, and the retry that eventually recovers it is
+//!   whichever one happens to arrive after the window. That timing is
+//!   the best-effort part.
+//!
+//!   The steal itself is **exclusive**, like the initial claim. It is a
+//!   conditional `update-where` pinning the exact abandoned row
+//!   (`scope_key`, `status = PENDING`, and the `created_at` stamp the
+//!   stealer observed), and only the caller it reports one updated row
+//!   to runs the handler. Concurrent stealers serialize: the store
+//!   reads the rows a conditional update matches without taking a
+//!   snapshot, so two stealers conflict, the loser is retried, and on
+//!   the retry the stamp it quotes has already moved — its predicate
+//!   matches nothing and it reports zero. Exactly one wins. So an
+//!   abandoned claim does not become a second execution of the
+//!   handler, which is the whole point of the key.
 //! - **TTL is enforced at read time, not swept.** A cached response
 //!   older than [`DEFAULT_TTL_SECONDS`] is treated as expired the
 //!   next time its key is looked up (and the row is reclaimed for a

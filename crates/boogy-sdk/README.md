@@ -89,7 +89,7 @@ impl From<&Note> for NoteOut {
 }
 
 fn list_notes(_req: &mut Req<'_>) -> Result<Json<Vec<NoteOut>>, ApiError> {
-    let rows = auth::find_owned(Note::TABLE, DEFAULT_OWNER_COL)?;
+    let rows = auth::find_owned::<Note>(DEFAULT_OWNER_COL)?;
     Ok(Json(rows.iter().map(|r| NoteOut::from(&Note::from_row(r))).collect()))
 }
 

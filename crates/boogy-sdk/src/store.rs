@@ -387,6 +387,103 @@ pub enum AccessPattern {
     TaggedBy { tag: String, refs: String },
 }
 
+/// The ordering a model DECLARED for listing rows filtered by `filter_col` —
+/// its `list_by(filter = filter_col, newest|oldest = ...)`.
+///
+/// `None` means no declaration, and that is the point: without one, no single
+/// index covers the filter AND an order, so a multi-page read of that filter
+/// has no stable sequence to page along. Callers turn `None` into a refusal
+/// instead of paging by nothing — which is what they did before, returning a
+/// row twice or not at all while reporting success.
+pub fn declared_list_order(schema: &Table, filter_col: &str) -> Option<Order> {
+    schema.access_patterns.iter().find_map(|p| match p {
+        AccessPattern::ListBy { filter, order } if filter == filter_col => Some(order.clone()),
+        _ => None,
+    })
+}
+
+/// Refuse a result set that does not fit in ONE page.
+///
+/// The "return all rows" helpers used to loop with OFFSET paging and no sort.
+/// Offset paging needs a stable total order and had none — no sort was
+/// requested, and offsets shift under concurrent writes regardless — so a row
+/// could come back twice or not at all while the call still returned `Ok` with
+/// a plausible count. This makes that impossible: one page, or an error.
+///
+/// `Internal` (500), deliberately neither 4xx nor 501:
+///
+/// * **Not 4xx.** The end user's request was valid. A 4xx would tell them they
+///   erred and imply retrying or changing it helps. Neither is true.
+/// * **Not 501.** "Not Implemented" blames the platform for a missing
+///   capability. Keyset pagination exists and is documented; this service did
+///   not use it, and pointing at the platform sends the reader to the wrong
+///   place.
+///
+/// It is a service defect surfaced at runtime because the data grew, so the
+/// detail carries what the AUTHOR needs — they are the only one who can act.
+pub fn refuse_beyond_one_page(
+    what: &str,
+    got: usize,
+    total: u64,
+    remedy: &str,
+) -> Result<(), StoreError> {
+    if total > got as u64 {
+        return Err(StoreError::Internal(format!(
+            "{what} matched {total} rows but reads at most one page ({got}). It is for small \
+             bounded sets and cannot page safely: there is no stable order across pages, so \
+             continuing would silently duplicate or skip rows. {remedy}"
+        )));
+    }
+    Ok(())
+}
+
+/// How a filtered multi-row read may safely be executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadStrategy {
+    /// The filter column is UNIQUE (`#[lookup_by]`): at most one row matches,
+    /// so there is nothing to page and no order to declare.
+    PointLookup,
+    /// The model declared `list_by` for this filter: one index covers the
+    /// filter AND this order, so pages are bounded ordered ranges.
+    Keyset(Order),
+    /// Neither a unique column nor a covering composite. One page is still
+    /// safe — a set that fits needs no order to be returned correctly — but
+    /// continuing PAST a page is exactly where the missing order would have
+    /// been needed, so the read stops there and says so.
+    SinglePageOnly,
+}
+
+/// Decide how a read filtered on `filter_col` may be executed.
+///
+/// The distinction that matters: a UNIQUE column needs no order at all, while
+/// a non-unique one is unsafe to page without a declared composite. Conflating
+/// them breaks every point lookup — and breaks it at RUNTIME, since the call
+/// still compiles.
+pub fn read_strategy(schema: &Table, filter_col: &str) -> ReadStrategy {
+    let unique = schema.access_patterns.iter().any(|p| {
+        matches!(p, AccessPattern::LookupBy { column } if column == filter_col)
+    });
+    if unique {
+        return ReadStrategy::PointLookup;
+    }
+    if let Some(order) = declared_list_order(schema, filter_col) {
+        return ReadStrategy::Keyset(order);
+    }
+    // An explicit composite leading with the filter carries the same guarantee
+    // as `list_by`, declared the other way: `index(cols = [filter, order])`.
+    // Ignoring this form would stop services that ARE correctly indexed.
+    // Ascending, since a raw index has no declared direction and ascending is
+    // the index's own order.
+    for ix in &schema.indices {
+        if ix.columns.first().map(|c| c.as_str()) == Some(filter_col) {
+            if let Some(second) = ix.columns.get(1) {
+                return ReadStrategy::Keyset(Order { column: second.clone(), desc: false });
+            }
+        }
+    }
+    ReadStrategy::SinglePageOnly
+}
+
 /// Table definition builder.
 pub struct Table {
     pub name: String,
@@ -1271,5 +1368,148 @@ mod table_verbs_tests {
             t.columns.iter().all(|c| c.default.is_none()),
             "no column may acquire a default that was never declared",
         );
+    }
+
+    /// A model that declared `list_by(filter, order)` has ONE index covering
+    /// the filter and the order together — the only thing that makes a
+    /// multi-page read of that filter pageable in a stable sequence.
+    #[test]
+    fn declared_list_order_finds_the_pattern_for_that_filter() {
+        let schema = Table::new("things")
+            .text("owner_principal")
+            .text("created_at")
+            .list_by("owner_principal", newest("created_at"));
+
+        let order = declared_list_order(&schema, "owner_principal")
+            .expect("the declared pattern must be found");
+        assert_eq!(order.column, "created_at");
+        assert!(order.desc, "newest() is descending");
+    }
+
+    /// No declaration → None, so the caller can refuse. Defaulting to some
+    /// order here would recreate the bug this exists to stop: an order no
+    /// index covers is not a stable sequence to page along.
+    #[test]
+    fn declared_list_order_is_none_when_the_model_never_declared_one() {
+        let schema = Table::new("things").text("owner_principal");
+        assert!(declared_list_order(&schema, "owner_principal").is_none());
+    }
+
+    /// Another column's pattern must not be borrowed: its composite leads
+    /// with the wrong column, so it cannot serve this filter's ordered range.
+    #[test]
+    fn declared_list_order_does_not_match_another_columns_pattern() {
+        let schema = Table::new("things")
+            .text("team_id")
+            .text("created_at")
+            .list_by("team_id", newest("created_at"));
+        assert!(declared_list_order(&schema, "owner_principal").is_none());
+    }
+
+    /// A set that fits in one page is returned, not refused — the guard must
+    /// not break the small bounded reads these helpers exist for.
+    #[test]
+    fn one_page_of_results_is_allowed_through() {
+        assert!(refuse_beyond_one_page("find_owned", 40, 40, "use keyset").is_ok());
+        assert!(refuse_beyond_one_page("find_owned", 40, 12, "use keyset").is_ok());
+    }
+
+    /// More rows than one page → refuse. The old behaviour paged on with
+    /// OFFSET and no sort, which could return a row twice or skip it while
+    /// still reporting success. A loud error replaces a quiet wrong answer.
+    #[test]
+    fn more_than_one_page_is_refused() {
+        let err = refuse_beyond_one_page("find_owned", 1000, 4321, "use keyset")
+            .expect_err("a set larger than one page must be refused");
+        assert!(matches!(err, StoreError::Internal(_)), "got {err:?}");
+    }
+
+    /// The message must carry what the AUTHOR needs to act: which helper, how
+    /// big the set actually is, and the remedy. They are the only one who can
+    /// fix it — the end user's request was valid.
+    #[test]
+    fn the_refusal_names_the_helper_the_size_and_the_remedy() {
+        let err = refuse_beyond_one_page("find_owned", 1000, 4321, "switch to keyset paging")
+            .expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("find_owned"), "must name the helper: {msg}");
+        assert!(msg.contains("4321"), "must name the real size: {msg}");
+        assert!(msg.contains("switch to keyset paging"), "must name the remedy: {msg}");
+    }
+
+    /// No SDK helper may page by OFFSET any more.
+    ///
+    /// A source assertion because the helpers live inside `wit_glue!` and are
+    /// emitted into the user crate, so there is nothing to call here. The
+    /// invariant is still exact: `offset += n` is the offset-walk idiom, and
+    /// every one of them had the same defect — paging with no sort, so a
+    /// concurrent write could return a row twice or skip it while the call
+    /// reported success.
+    ///
+    /// Five helpers had it: find_all_rows, db_find_by, load_has_many,
+    /// find_rows_by, find_owned. Two now page by a model-DECLARED sort column
+    /// (keyset); three refuse past one page. Either way the offset walk is
+    /// gone, and if one comes back this fails.
+    #[test]
+    fn no_sdk_helper_paginates_by_offset() {
+        let glue = include_str!("glue.rs");
+        let offset_walks = glue.matches("offset += n").count();
+        assert_eq!(
+            offset_walks, 0,
+            "an offset-paginated loop is back in the SDK glue ({offset_walks} found). Offset \
+             paging has no stable order across pages here, so it silently duplicates or skips \
+             rows; use a declared list_by sort column (keyset) or refuse past one page.",
+        );
+    }
+
+    /// A `#[lookup_by]` column is UNIQUE: the read returns at most one row, so
+    /// there is nothing to page and no order to declare. Requiring `list_by`
+    /// here would break every point lookup in the example services
+    /// (`Room::SLUG`, `Poll::PUBLIC_ID`, …) at runtime while still compiling.
+    #[test]
+    fn a_unique_lookup_column_needs_no_declared_order() {
+        let schema = Table::new("rooms").text("slug").lookup_by("slug");
+        assert_eq!(read_strategy(&schema, "slug"), ReadStrategy::PointLookup);
+    }
+
+    /// A non-unique filter WITH a declared order pages along that order.
+    #[test]
+    fn a_declared_list_by_column_pages_by_its_order() {
+        let schema = Table::new("things")
+            .text("owner_principal")
+            .text("created_at")
+            .list_by("owner_principal", newest("created_at"));
+        match read_strategy(&schema, "owner_principal") {
+            ReadStrategy::Keyset(order) => {
+                assert_eq!(order.column, "created_at");
+                assert!(order.desc);
+            }
+            other => panic!("expected Keyset, got {other:?}"),
+        }
+    }
+
+    /// No declaration → ONE page only, not an outright refusal. A small set
+    /// fits in a page and is perfectly safe to return; only continuing PAST a
+    /// page is unsafe, because that is where the missing order would have been
+    /// needed. Failing a three-row lookup would break correct callers to
+    /// punish a bug they do not have.
+    #[test]
+    fn an_undeclared_non_unique_filter_is_limited_to_one_page() {
+        let schema = Table::new("things").text("owner_principal");
+        assert_eq!(read_strategy(&schema, "owner_principal"), ReadStrategy::SinglePageOnly);
+    }
+
+    /// An explicit composite covering (filter, order) is the same guarantee as
+    /// `list_by`, declared a different way — `index(cols = [filter, order])`.
+    /// Missing it would refuse services that ARE correctly indexed, like
+    /// tokenfeed's `idx_invest_post` over (post_id, invested_at).
+    #[test]
+    fn an_explicit_composite_leading_with_the_filter_is_keyset_too() {
+        let schema = Table::new("post_investments")
+            .index("idx_invest_post", &["post_id", "invested_at"]);
+        match read_strategy(&schema, "post_id") {
+            ReadStrategy::Keyset(order) => assert_eq!(order.column, "invested_at"),
+            other => panic!("an explicit composite must page by its second column, got {other:?}"),
+        }
     }
 }

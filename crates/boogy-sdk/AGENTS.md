@@ -156,8 +156,8 @@ directly.
 | `auth::current_principal()` → `Option<String>` | Caller's principal id. `None` for anonymous requests. |
 | `auth::required()` → `Guard` | 401 guard for routes that require any authenticated caller (no specific resource). Pair with `auth::find_owned` or business logic that reads identity. |
 | `auth::owns_resource(table, owner_col, id_param)` → `OwnsResource` (impl `IntoGuard`) | Builder for a `Router::guard(...)`. Loads the row identified by `req.params[id_param]`, denies-by-existence-mask (404) if the row is missing **or** isn't owned by `current_principal()`, and stashes the loaded row in `req.ctx` at a slot keyed by `table` — read it back with `req.ctx.require_at::<Row>(table)`. Two guards over *different* tables on one route therefore can't collide even without `.slot()`; only override `.slot("name")` when two guards load the *same* table on one route (they'd otherwise target the same auto-derived slot, which fails loudly — see `Ctx::insert_at`). |
-| `auth::find_owned(table, owner_col)` → `Result<Vec<Row>, RpcError>` | Principal-scoped row list for index endpoints. Returns 401-coded `RpcError` when anonymous. |
-| `auth::load_owned(table, owner_col, id)` → `Result<Option<Row>, RpcError>` | Single-row load with ownership check. `Ok(None)` for both "missing" and "not yours". Use in MCP / JSON-RPC handlers (where the resource id arrives in a body, not a path param). |
+| `auth::find_owned::<M>(owner_col)` → `Result<Vec<Row>, ApiError>` | Principal-scoped row list for index endpoints. The table comes from the model `M`, not a string — that is what lets the call read `M`'s declared access patterns and pick a safe read strategy. Returns 401-coded `ApiError` when anonymous. |
+| `auth::load_owned(table, owner_col, id)` → `Result<Option<Row>, ApiError>` | Single-row load with ownership check. `Ok(None)` for both "missing" and "not yours". Use in MCP / JSON-RPC handlers (where the resource id arrives in a body, not a path param). |
 | `DEFAULT_OWNER_COL: &str` | Convention column name (`"owner_principal"`). Use this constant in tables and auth helper calls. Do not invent alternatives like `"owner_id"` / `"created_by"`. |
 
 > **Principal opacity:** `current_principal()` returns an opaque `String`. Today that string is the caller's global agent id; once the end-user app-session tier lands, it will be a per-app **pairwise pseudonym** (`pw_…`) for callers reaching the service through the browser-side `@boogy/web` SDK. The change is transparent to handler code — **do not parse the principal, do not assume it's a UUID, do not strip prefixes**. Use it only as an opaque key in your `owner_principal` columns and as the input to `auth::*` helpers. Code that follows this rule keeps working unchanged across the cutover.
@@ -212,7 +212,7 @@ its `RpcError` converts to `ApiError` via `?`:
 struct NotesList { items: Vec<json::Value>, count: usize }
 
 fn list_notes(_req: &mut Req<'_>) -> Result<Json<NotesList>, ApiError> {
-    let rows = auth::find_owned("notes", DEFAULT_OWNER_COL)?;
+    let rows = auth::find_owned::<Note>(DEFAULT_OWNER_COL)?;
     let items: Vec<_> = rows.iter().map(|r| r.to_json(&["title", "body"])).collect();
     let count = items.len();
     Ok(Json(NotesList { items, count }))
@@ -1163,7 +1163,7 @@ struct SearchResult { items: Vec<json::Value> }
 
 fn search_notes(p: SearchParams) -> Result<SearchResult, RpcError> {
     // auth::find_owned / auth::load_owned are available here.
-    let rows = auth::find_owned("notes", DEFAULT_OWNER_COL)?;
+    let rows = auth::find_owned::<Note>(DEFAULT_OWNER_COL)?;
     let items = rows
         .iter()
         .filter(|r| r.text("title").contains(&p.query))

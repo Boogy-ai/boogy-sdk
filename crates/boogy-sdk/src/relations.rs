@@ -25,7 +25,7 @@
 //! // `use crate::load_has_many;`.
 //! fn list_notes_with_comments(_req: &mut Req<'_>) -> Result<Json<json::Value>, ApiError> {
 //!     // 1) parents
-//!     let notes = auth::find_owned("notes", DEFAULT_OWNER_COL)?;
+//!     let notes = auth::find_owned::<Note>(DEFAULT_OWNER_COL)?;
 //!     // `Row::id()` is a u64 — the key type `load_has_many` groups on.
 //!     let note_ids: Vec<u64> = notes.iter().map(|n| n.id()).collect();
 //!
