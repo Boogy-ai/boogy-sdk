@@ -307,6 +307,7 @@ macro_rules! wit_glue {
 
             // Resolve declared access patterns + explicit indexes into the
             // physical index set; surface build-time diagnostics via logging.
+            #[allow(unused)]
             let (__resolved, __diags) = table.resolved_indices();
             for d in &__diags {
                 match d {
@@ -316,55 +317,118 @@ macro_rules! wit_glue {
                         panic!("schema {}: {}", table.name, m),
                 }
             }
-            // create_index per resolved index: guarded by list_indexes. Skip if
-            // already present; propagate genuine engine errors via unwrap_or_else
-            // with context. Same "not granted" soft-skip as create_table above.
-            for idx in &__resolved {
-                let already = list_indexes(&table.name)
-                    .map(|v| v.iter().any(|i| i.name == idx.name))
-                    .unwrap_or(false);
-                if !already {
-                    $bindings::boogy::platform::store::create_index(
-                        &table.name,
-                        &$bindings::boogy::platform::store::IndexDef {
-                            name: idx.name.clone(),
-                            columns: idx.columns.clone(),
-                            unique: idx.unique,
-                            covering: idx.covering,
-                        },
-                    )
-                    .unwrap_or_else(|e| {
-                        let msg = ::std::string::String::from(e);
-                        // "not granted" → store capability denied (soft-skip).
-                        // "already exists" → a concurrent deploy created this index
-                        // between our stale list_indexes() guard and now; idempotent
-                        // success, not a failure. Anything else is a real error.
-                        if !msg.contains("not granted") && !msg.contains("already exists") {
-                            panic!(
-                                "create_index({}.{}) in create_table_from failed: {}",
-                                &table.name, &idx.name, msg,
-                            );
-                        }
-                    });
-                }
-            }
+            // Record the resolved set; the reconcile pass applies every
+            // table's changes once `Api::init_tables()` has declared them all.
+            // A per-table pass cannot work here: it would read every OTHER
+            // table's indexes as undeclared and drop them.
+            __BOOGY_DECLARED.with(|d| {
+                d.borrow_mut().push((table.name.clone(), __resolved.clone()))
+            });
+        }
 
-            // Orphaned-index warning: an index left behind by a removed access
-            // pattern (present on the table, no longer in the resolved desired
-            // set). We never auto-drop (destructive) — surface it so the author
-            // adds an explicit drop_index migration. Hand-managed names (no
-            // ix_/idx_ prefix) and the implicit _id PK are ignored by `orphaned`.
-            if let Ok(existing) = list_indexes(&table.name) {
-                let actual: ::std::vec::Vec<::std::string::String> =
-                    existing.into_iter().map(|i| i.name).collect();
-                for orphan in $crate::schema_resolve::orphaned(&__resolved, &actual) {
-                    $crate::log::warn!(
-                        "schema {}: index '{}' is no longer declared by any access pattern \
-                         (add an explicit drop_index migration to remove it)",
-                        table.name, orphan
-                    );
+        /// Table + resolved index set recorded by each `create_table_from` call
+        /// during `Api::init_tables()`.
+        ///
+        /// Declaration and application are separated by the init pass because
+        /// the reconcile needs the COMPLETE declared set before it can decide
+        /// anything. This is also what keeps runtime-named table families safe:
+        /// `create_model_as` records like any other declaration, so a service
+        /// that builds one table per time window has those tables in the
+        /// declared set rather than looking like a pile of orphans.
+        thread_local! {
+            static __BOOGY_DECLARED: ::std::cell::RefCell<
+                ::std::vec::Vec<(::std::string::String, ::std::vec::Vec<$crate::store::Index>)>
+            > = ::std::cell::RefCell::new(::std::vec::Vec::new());
+        }
+
+
+        /// Converge every declared table's index set on what its models declare.
+        ///
+        /// Runs after `Api::init_tables()` returns, on every request — which is
+        /// affordable because the reads it needs are FREE: `list_indexes` is
+        /// schema introspection and carries only a capability check, not the
+        /// `charge_read!` that meters `find` against the tenant's op-rate
+        /// budget. A converged pass therefore costs zero metered ops, and only
+        /// an actual change spends anything.
+        ///
+        /// An earlier version cached a fingerprint of the declared set in a
+        /// table to avoid re-reading. That was solving a cost that does not
+        /// exist: the cache's own `find` was metered, so it made every request
+        /// strictly more expensive than the introspection it was avoiding, and
+        /// exhausted a small burst budget before the handler could run.
+        fn __boogy_reconcile_indexes() {
+            let declared = __BOOGY_DECLARED.with(|d| ::std::mem::take(&mut *d.borrow_mut()));
+            for (table, desired) in &declared {
+                let actual: ::std::vec::Vec<$crate::store::Index> = match list_indexes(table) {
+                    Ok(v) => v.into_iter().map(|i| {
+                        // Destructured exhaustively on purpose. Adding a field to the WIT
+// record then fails to compile HERE instead of being silently
+// dropped — which is how `covering` went missing from IndexInfo.
+// Never add `..` to this pattern.
+                        let $crate::store::IndexInfo { name, columns, unique, covering } = i;
+                        $crate::store::Index { name, columns, unique, covering }
+                    }).collect(),
+                    // Store capability not granted, or the table is gone. Nothing
+                    // to reconcile against; the service fails properly on its
+                    // first data op rather than trapping during init.
+                    Err(_) => continue,
+                };
+                for action in $crate::schema_resolve::plan_reconcile(desired, &actual) {
+                    __boogy_apply_index_action(table, &action);
                 }
             }
+        }
+
+        /// Apply one planned change. Returns whether it landed.
+        ///
+        /// Drop precedes create for a rebuild, so the table never carries two
+        /// copies of one index at once.
+        fn __boogy_apply_index_action(
+            table: &str,
+            action: &$crate::schema_resolve::IndexAction,
+        ) -> bool {
+            use $crate::schema_resolve::ActionKind;
+            let name = action.index.name.clone();
+            if matches!(action.kind, ActionKind::Drop | ActionKind::Rebuild) {
+                if let Err(e) = $bindings::boogy::platform::store::drop_index(table, &name) {
+                    let msg = ::std::format!("{e:?}");
+                    if !msg.contains("not granted") && !msg.contains("not found") {
+                        $crate::log::warn!("schema {table}: drop index '{name}' failed: {msg}");
+                        // A drop we could not perform must NOT be followed by a
+                        // create under the same name: that fails as "already
+                        // exists", which the create arm treats as success, and the
+                        // stale definition would survive while the pass reported
+                        // convergence.
+                        return false;
+                    }
+                } else {
+                    $crate::log::info!("schema {table}: dropped index '{name}'");
+                }
+            }
+            if matches!(action.kind, ActionKind::Create | ActionKind::Rebuild) {
+                match $bindings::boogy::platform::store::create_index(
+                    table,
+                    &$bindings::boogy::platform::store::IndexDef {
+                        name: name.clone(),
+                        columns: action.index.columns.clone(),
+                        unique: action.index.unique,
+                        covering: action.index.covering,
+                    },
+                ) {
+                    Ok(()) => $crate::log::info!("schema {table}: created index '{name}'"),
+                    Err(e) => {
+                        let msg = ::std::format!("{e:?}");
+                        // "not granted" → capability denied (soft-skip, as above).
+                        // "already exists" → a concurrent deploy created it between
+                        // our list_indexes and now; idempotent success.
+                        if !msg.contains("not granted") && !msg.contains("already exists") {
+                            $crate::log::warn!("schema {table}: create index '{name}' failed: {msg}");
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
         }
 
         // -- Column migration free fns (map ColumnSpec ↔ ColumnDef / ColumnInfo) --
@@ -452,11 +516,12 @@ macro_rules! wit_glue {
         ) -> ::core::result::Result<::std::vec::Vec<$crate::store::IndexInfo>, ::std::string::String> {
             let wit_idxs = $bindings::boogy::platform::store::list_indexes(table)?;
             Ok(wit_idxs.into_iter().map(|i| {
-                $crate::store::IndexInfo {
-                    name: i.name,
-                    columns: i.columns,
-                    unique: i.unique,
-                }
+                // Destructured exhaustively on purpose. Adding a field to the WIT
+// record then fails to compile HERE instead of being silently
+// dropped — which is how `covering` went missing from IndexInfo.
+// Never add `..` to this pattern.
+                let $bindings::boogy::platform::store::IndexDef { name, columns, unique, covering } = i;
+                $crate::store::IndexInfo { name, columns, unique, covering }
             }).collect())
         }
 
@@ -470,10 +535,13 @@ macro_rules! wit_glue {
             ::std::string::String,
         > {
             let wit_tables = $bindings::boogy::platform::store::list_tables()?;
-            Ok(wit_tables.into_iter().map(|t| $crate::store::TableInfo {
-                name: t.name,
-                column_count: t.column_count,
-                index_count: t.index_count,
+            Ok(wit_tables.into_iter().map(|t| {
+                // Destructured exhaustively on purpose. Adding a field to the WIT
+// record then fails to compile HERE instead of being silently
+// dropped — which is how `covering` went missing from IndexInfo.
+// Never add `..` to this pattern.
+                let $bindings::boogy::platform::store::TableInfo { name, column_count, index_count } = t;
+                $crate::store::TableInfo { name, column_count, index_count }
             }).collect())
         }
 
@@ -3675,11 +3743,14 @@ macro_rules! wit_glue {
                 body: request.body.clone(),
             };
             match peer_bindings::fetch(target, &wit_req) {
-                Ok(resp) => Ok($crate::peer::PeerResponse {
-                    status: resp.status,
-                    headers: resp.headers,
-                    body: resp.body,
-                }),
+                Ok(resp) => {
+                    // Destructured exhaustively on purpose. Adding a field to the WIT
+// record then fails to compile HERE instead of being silently
+// dropped — which is how `covering` went missing from IndexInfo.
+// Never add `..` to this pattern.
+                    let peer_bindings::PeerResponse { status, headers, body } = resp;
+                    Ok($crate::peer::PeerResponse { status, headers, body })
+                },
                 Err(e) => Err(__peer_error_to_sdk(e)),
             }
         }
@@ -4221,6 +4292,10 @@ macro_rules! wit_glue {
                 );
 
                 <$api_struct as $crate::Api>::init_tables();
+                // Converge the physical index set on what the models declare.
+                // Must follow init_tables: the declared set has to be complete
+                // before anything is dropped.
+                __boogy_reconcile_indexes();
                 let sdk_req = __boogy_to_sdk_request(&req);
 
                 // Resolve an `sk_*` bearer up front, before any guard runs

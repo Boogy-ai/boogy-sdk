@@ -116,6 +116,77 @@ pub fn orphaned(resolved: &[Index], actual_names: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// What the reconcile will do to one index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    /// Declared, absent from the store.
+    Create,
+    /// Present under the same name with a DIFFERENT definition. Applied as a
+    /// drop followed by a create — an index cannot be altered in place.
+    Rebuild,
+    /// Present in the store, no longer declared.
+    Drop,
+}
+
+/// One planned change. For `Drop` only `index.name` is acted on; the remaining
+/// fields carry the definition found in the store so it can be logged.
+#[derive(Debug, Clone)]
+pub struct IndexAction {
+    pub index: Index,
+    pub kind: ActionKind,
+}
+
+/// Is this a name the SDK derives, and therefore one we own?
+///
+/// Same filter as [`orphaned`]: anything else is hand-managed (or the implicit
+/// `_id` primary key) and is never ours to remove.
+fn is_derived(name: &str) -> bool {
+    name.starts_with("ix_") || name.starts_with("idx_")
+}
+
+/// Compare two index definitions in full.
+///
+/// Comparing NAMES was the original defect: an index whose columns changed kept
+/// its name, so the exists-guard skipped it and the store silently retained the
+/// old definition. Column ORDER is significant — `[a, b]` and `[b, a]` serve
+/// different queries.
+fn same_definition(a: &Index, b: &Index) -> bool {
+    a.columns == b.columns && a.unique == b.unique && a.covering == b.covering
+}
+
+/// Diff the declared index set against what the store actually holds.
+///
+/// Pure: performs no IO and decides the entire change set, which is what makes
+/// every case unit-testable without a live store.
+///
+/// Action order is not significant to correctness — each is applied
+/// independently — but the result is sorted by name so logs and tests are
+/// stable.
+pub fn plan_reconcile(desired: &[Index], actual: &[Index]) -> Vec<IndexAction> {
+    let mut out: Vec<IndexAction> = Vec::new();
+
+    for d in desired {
+        match actual.iter().find(|a| a.name == d.name) {
+            None => out.push(IndexAction { index: d.clone(), kind: ActionKind::Create }),
+            // Carries the DESIRED definition: a rebuild drops the old index and
+            // creates this one.
+            Some(a) if !same_definition(a, d) => {
+                out.push(IndexAction { index: d.clone(), kind: ActionKind::Rebuild })
+            }
+            Some(_) => {}
+        }
+    }
+
+    for a in actual {
+        if is_derived(&a.name) && !desired.iter().any(|d| d.name == a.name) {
+            out.push(IndexAction { index: a.clone(), kind: ActionKind::Drop });
+        }
+    }
+
+    out.sort_by(|x, y| x.index.name.cmp(&y.index.name));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +385,99 @@ mod tests {
         let resolved = vec![ix("ix_t_a"), ix("ix_t_b")];
         let actual = vec!["ix_t_a".to_string(), "ix_t_b".to_string()];
         assert!(super::orphaned(&resolved, &actual).is_empty());
+    }
+
+    // --- reconcile plan --------------------------------------------------
+    // The diff that decides what the reconcile does. Pure, so every case that
+    // matters is checked here without a live store.
+
+    fn ixd(name: &str, cols: &[&str], unique: bool, covering: bool) -> Index {
+        Index {
+            name: name.into(),
+            columns: cols.iter().map(|s| s.to_string()).collect(),
+            unique,
+            covering,
+        }
+    }
+
+    fn kinds(plan: &[IndexAction]) -> Vec<(String, ActionKind)> {
+        plan.iter().map(|a| (a.index.name.clone(), a.kind)).collect()
+    }
+
+    #[test]
+    fn reconcile_creates_a_declared_index_that_does_not_exist() {
+        let plan = plan_reconcile(&[ixd("ix_posts_author", &["author"], false, false)], &[]);
+        assert_eq!(kinds(&plan), vec![("ix_posts_author".to_string(), ActionKind::Create)]);
+    }
+
+    #[test]
+    fn reconcile_drops_an_index_no_longer_declared() {
+        let plan = plan_reconcile(&[], &[ixd("ix_posts_author", &["author"], false, false)]);
+        assert_eq!(kinds(&plan), vec![("ix_posts_author".to_string(), ActionKind::Drop)]);
+    }
+
+    #[test]
+    fn reconcile_leaves_a_hand_managed_index_alone() {
+        // Same filter as `orphaned`: an index created out-of-band is not ours to
+        // remove, and neither is the implicit `_id` primary key.
+        let plan = plan_reconcile(&[], &[
+            ixd("my_custom_index", &["author"], false, false),
+            ixd("_id", &["_id"], true, false),
+        ]);
+        assert!(plan.is_empty(), "expected no actions, got {:?}", kinds(&plan));
+    }
+
+    #[test]
+    fn reconcile_rebuilds_an_index_whose_columns_changed_under_the_same_name() {
+        // THE headline case. A name-only comparison skips this silently and the
+        // store keeps the old definition, leaving the model declaring an access
+        // pattern that does not physically exist.
+        let plan = plan_reconcile(
+            &[ixd("ix_posts_author", &["author", "created_at"], false, false)],
+            &[ixd("ix_posts_author", &["author"], false, false)],
+        );
+        assert_eq!(kinds(&plan), vec![("ix_posts_author".to_string(), ActionKind::Rebuild)]);
+        assert_eq!(
+            plan[0].index.columns,
+            vec!["author".to_string(), "created_at".to_string()],
+            "a Rebuild must carry the DESIRED definition, since it is what gets created"
+        );
+    }
+
+    #[test]
+    fn reconcile_rebuilds_when_only_unique_changed() {
+        let plan = plan_reconcile(
+            &[ixd("ix_posts_slug", &["slug"], true, false)],
+            &[ixd("ix_posts_slug", &["slug"], false, false)],
+        );
+        assert_eq!(kinds(&plan), vec![("ix_posts_slug".to_string(), ActionKind::Rebuild)]);
+    }
+
+    #[test]
+    fn reconcile_rebuilds_when_only_covering_changed() {
+        let plan = plan_reconcile(
+            &[ixd("ix_posts_feed", &["created_at"], false, true)],
+            &[ixd("ix_posts_feed", &["created_at"], false, false)],
+        );
+        assert_eq!(kinds(&plan), vec![("ix_posts_feed".to_string(), ActionKind::Rebuild)]);
+    }
+
+    #[test]
+    fn reconcile_of_an_already_converged_table_is_empty() {
+        // Idempotence as a test: without it, "no changes" and "the diff is
+        // broken" look identical.
+        let same = ixd("ix_posts_author", &["author"], false, true);
+        assert!(plan_reconcile(std::slice::from_ref(&same), std::slice::from_ref(&same)).is_empty());
+    }
+
+    #[test]
+    fn reconcile_column_order_is_significant() {
+        // [a, b] and [b, a] are different physical indexes serving different
+        // queries — comparing as sets would silently accept the wrong one.
+        let plan = plan_reconcile(
+            &[ixd("ix_posts_ab", &["a", "b"], false, false)],
+            &[ixd("ix_posts_ab", &["b", "a"], false, false)],
+        );
+        assert_eq!(kinds(&plan), vec![("ix_posts_ab".to_string(), ActionKind::Rebuild)]);
     }
 }

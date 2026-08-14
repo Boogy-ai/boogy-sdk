@@ -932,6 +932,13 @@ pub struct IndexInfo {
     pub name: String,
     pub columns: Vec<String>,
     pub unique: bool,
+    /// Whether the index entry carries a copy of the row.
+    ///
+    /// Reported because it is part of what distinguishes one index from
+    /// another: an index reconcile that could not see this flag would treat a
+    /// covering index and a plain one over the same columns as identical and
+    /// leave the wrong one in place.
+    pub covering: bool,
 }
 
 /// SDK mirror of the WIT `table-info` record. What `list_tables`

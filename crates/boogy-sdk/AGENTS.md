@@ -738,6 +738,35 @@ fn create_link(target: &str) -> Result<Created<LinkOut>, ApiError> {
 }
 ```
 
+### The model is the sole source of truth for indexes
+
+A service's physical index set is **reconciled** against what its models declare.
+On each init the SDK diffs the declared set against the store and converges it:
+
+- declared but absent → **created**
+- present under the same name with a different definition (columns, `unique`, or
+  `covering`) → **rebuilt**
+- present but no longer declared → **dropped**
+
+Both destructive cases are safe, because an index is fully rebuildable from the
+rows: dropping one cannot lose data. Only names the SDK derives (`ix_`/`idx_`)
+are eligible — a hand-managed index and the implicit `_id` primary key are never
+touched.
+
+Two consequences for how you write services:
+
+- **Declare indexes on the model**, through access patterns or
+  `index(cols = [...])`. Editing a declaration is now sufficient: the change
+  takes effect on the next deploy. Previously a changed declaration was silently
+  ignored if its name had not also changed.
+- **Do not create a permanent index from a migration.** `MigrationCtx::create_index`
+  is for an index a *data* migration needs while it runs. An `ix_`-named index the
+  models do not declare is indistinguishable from one whose declaration was
+  deleted, so the reconcile removes it.
+
+Tables and columns are never reconciled. Dropping those is lossy, so they stay
+behind explicit versioned migrations — see below.
+
 ### Migrations
 
 Schema evolution after first deploy uses the `migrations` runner.
