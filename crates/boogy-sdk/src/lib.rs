@@ -14,8 +14,8 @@
 //! struct TodoApi;
 //!
 //! impl Api for TodoApi {
-//!     fn init_tables() {
-//!         create_table_from(&Table::new("todos").text("title").boolean("done"));
+//!     fn schema(s: &mut Schema) {
+//!         s.model::<Post>();
 //!     }
 //!     fn build_router() -> Router {
 //!         Router::new().get("/api/todos", list_todos)
@@ -67,6 +67,8 @@ pub mod request_state;
 pub mod response;
 pub mod router;
 pub mod rpc;
+pub mod migration_registry;
+pub mod schema_decl;
 pub mod schema_resolve;
 pub mod secrets;
 pub mod signing;
@@ -126,7 +128,7 @@ pub fn wit_path() -> &'static str {
 ///
 /// Both methods are associated functions — they describe the API as a
 /// whole, not an instance. The `wit_glue!` macro generates an `impl Guest`
-/// that calls them in the right order: `init_tables` once on every
+/// that calls them in the right order: `schema` + `migrate` + `bootstrap` on every
 /// request (idempotent because each table create is idempotent) and
 /// `build_router` per request to dispatch to handlers.
 ///
@@ -136,8 +138,8 @@ pub fn wit_path() -> &'static str {
 /// struct MyApi;
 ///
 /// impl boogy_sdk::Api for MyApi {
-///     fn init_tables() {
-///         create_table_from(&Table::new("users").text("email"));
+///     fn schema(s: &mut Schema) {
+///         s.model::<Post>();
 ///     }
 ///
 ///     fn build_router() -> Router {
@@ -148,8 +150,33 @@ pub fn wit_path() -> &'static str {
 /// }
 /// ```
 pub trait Api {
-    /// Idempotent table creation. Default is a no-op for APIs with no tables.
-    fn init_tables() {}
+    /// Declare this service's tables. Called before any request is served.
+    ///
+    /// Declaration only — no IO happens here. The SDK creates missing tables and
+    /// reconciles the physical index set against what is declared, so editing a
+    /// model's indexes is sufficient to change them.
+    fn schema(_s: &mut schema_decl::Schema) {}
+
+    /// Apply this service's versioned migrations.
+    ///
+    /// For changes a declaration cannot express: adding a column to a table that
+    /// already exists, backfilling, renaming. Conventionally one module per
+    /// migration collected by `migrations![...]`, so the body is a single line:
+    ///
+    /// ```ignore_snippet: the migrations runner and Migration type are emitted into the service crate by wit_glue
+    /// fn migrate() {
+    ///     migrations(&crate::migrations::all()).expect("migrations failed");
+    /// }
+    /// ```
+    ///
+    /// Returns nothing because `Migration` and `MigrationCtx` are emitted into
+    /// the service's own crate by `wit_glue!` — they wrap that crate's store
+    /// bindings — so they cannot appear in a signature declared here.
+    fn migrate() {}
+
+    /// Seed data the service needs before serving. Runs after the schema is
+    /// final. Must be idempotent — it runs on every instance.
+    fn bootstrap() {}
 
     /// Build the request router. Called per request; cheap to construct.
     fn build_router() -> router::Router;

@@ -57,8 +57,8 @@ struct Note {
 struct NotesApi;
 
 impl Api for NotesApi {
-    fn init_tables() {
-        create_model::<Note>();
+    fn schema(s: &mut Schema) {
+        s.model::<Note>();
     }
 
     fn build_router() -> Router {
@@ -138,7 +138,7 @@ The `smoke/` crate shipped alongside this SDK is the smallest working version of
 
 ```rust
 pub trait Api {
-    fn init_tables() {}                                   // default: no-op
+    fn schema(_s: &mut Schema) {}                         // default: no-op
     fn build_router() -> boogy_sdk::router::Router;
     fn build_job_router() -> boogy_sdk::JobRouter {       // default: empty
         boogy_sdk::JobRouter::new()

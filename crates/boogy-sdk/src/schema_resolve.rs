@@ -103,9 +103,16 @@ pub fn resolve(table: &str, patterns: &[AccessPattern], explicit: &[Index]) -> (
 }
 
 /// Index names present on the table but NOT in the resolved desired set —
-/// candidates left behind by a removed access pattern. Reconcile WARNS about
-/// these; it never auto-drops (destructive). Ignores the implicit `_id` PK and
-/// any name not matching our `ix_`/`idx_` derived prefixes (hand-managed).
+/// left behind by a removed access pattern.
+///
+/// The reconcile **drops** these. It is not destructive in the way a dropped
+/// column is: an index is rebuildable from the rows, so re-declaring it
+/// restores it. Ignores the implicit `_id` PK and any name not matching the
+/// `ix_`/`idx_` derived prefixes (hand-managed, and not ours to remove).
+///
+/// Kept alongside [`plan_reconcile`], which applies the same filter via
+/// `is_derived`. This function is the name-only view of that diff and is
+/// retained for callers that only need the orphan list.
 pub fn orphaned(resolved: &[Index], actual_names: &[String]) -> Vec<String> {
     let desired: std::collections::HashSet<&str> =
         resolved.iter().map(|i| i.name.as_str()).collect();

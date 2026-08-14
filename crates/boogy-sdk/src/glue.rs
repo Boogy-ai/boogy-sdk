@@ -4,7 +4,7 @@
 //! that are local to the user's crate. This macro takes that module and emits:
 //!
 //! - The `Guest` impl for the user's API struct, wired to the
-//!   [`Api`](crate::Api) trait (`init_tables` + `build_router`).
+//!   [`Api`](crate::Api) trait (`schema` / `migrate` / `bootstrap` + `build_router`).
 //! - Conversion helpers between WIT types and SDK types
 //!   (`to_sdk_request`, `to_wit_response`, `to_sdk_row`, `create_table_from`).
 //! - User-facing row helpers (`get_row`, `find_all_rows`).
@@ -4291,11 +4291,21 @@ macro_rules! wit_glue {
                     wit_identity.as_ref().map(|i| i.principal.clone()),
                 );
 
-                <$api_struct as $crate::Api>::init_tables();
-                // Converge the physical index set on what the models declare.
-                // Must follow init_tables: the declared set has to be complete
-                // before anything is dropped.
-                __boogy_reconcile_indexes();
+                {
+                    // Phase order is load-bearing. Declaration completes before
+                    // the reconcile, which decides what to drop from the FULL
+                    // declared set; the reconcile completes before migrations,
+                    // which may rely on a declared index; bootstrap is last,
+                    // because seeding needs the final schema.
+                    let mut __schema = $crate::schema_decl::Schema::new();
+                    <$api_struct as $crate::Api>::schema(&mut __schema);
+                    for __t in __schema.tables() {
+                        create_table_from(__t);
+                    }
+                    __boogy_reconcile_indexes();
+                    <$api_struct as $crate::Api>::migrate();
+                    <$api_struct as $crate::Api>::bootstrap();
+                }
                 let sdk_req = __boogy_to_sdk_request(&req);
 
                 // Resolve an `sk_*` bearer up front, before any guard runs

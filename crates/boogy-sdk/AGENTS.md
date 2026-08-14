@@ -57,8 +57,8 @@ struct Thing {
 }
 
 impl Api for MyApi {
-    fn init_tables() {
-        create_model::<Thing>();
+    fn schema(s: &mut Schema) {
+        s.model::<Thing>();
     }
 
     fn build_router() -> Router {
@@ -411,10 +411,10 @@ struct Thing {
     created_at: Timestamp,
 }
 
-fn init_tables() {
-    // Registers the schema the derive computed — table, columns, and the
+fn schema(s: &mut Schema) {
+    // Declares the schema the derive computed — table, columns, and the
     // indexes the declared access patterns imply.
-    create_model::<Thing>();
+    s.model::<Thing>();
 }
 
 // In a handler. `Thing::TABLE` comes from the `Model` trait, so bring the
@@ -780,28 +780,31 @@ subsequent requests.
 // not re-export them (the unqualified `store` is the WIT bindings module).
 use boogy_sdk::store::{col, ColType, Val};
 
-fn init_tables() {
-    create_model::<Note>();   // `Note` is a `#[derive(Model)]` struct
+fn schema(s: &mut Schema) {
+    s.model::<Post>();
+}
 
-    migrations(&[
-        migration(1, "add_priority", |m| {
-            // Structured DDL via MigrationCtx — NOT raw SQL. The ctx has
-            // add_column / rename_column / drop_column / create_table /
-            // create_index / drop_index (+ data helpers for backfills).
-            m.add_column("notes", &col("priority", ColType::Integer).default(Val::Integer(0)))?;
-            Ok(())
-        }),
-        migration(2, "index_owner", |m| {
-            m.create_index("notes", &store::IndexDef {
-                name: "idx_notes_owner".into(),
-                columns: vec![DEFAULT_OWNER_COL.into()],
-                unique: false,
-                covering: false,
-            })?;
-            Ok(())
-        }),
-    ])
-    .expect("migrations failed");
+// One module per migration, collected by an ordered registry in
+// src/migrations/mod.rs:
+//
+//     pub fn all() -> Vec<Migration> {
+//         migrations![m001_add_priority, m002_add_owner_index]
+//     }
+//
+// fn migrate() is then one line: migrations(&crate::migrations::all())
+// The registry is the only thing that grows.
+
+// src/migrations/m001_add_priority.rs
+// Existing rows need the column the model now declares.
+pub const VERSION: i64 = 1;
+pub const NAME: &str = "add_priority";
+
+pub fn up(m: &MigrationCtx) -> Result<(), String> {
+    // Structured DDL via MigrationCtx — NOT raw SQL. The ctx has
+    // add_column / rename_column / drop_column / create_table
+    // (+ data helpers for backfills).
+    m.add_column(Post::TABLE, &col("priority", ColType::Integer).default(Val::Integer(0)))?;
+    Ok(())
 }
 ```
 
