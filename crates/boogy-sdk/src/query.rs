@@ -71,7 +71,6 @@ pub struct QueryArgs {
     pub offset: u32,
     pub cursor: Option<Cursor>,
     pub keyset_mode: Option<(String, SortDir)>,
-    pub allow_full_scan: bool,
 }
 
 impl QueryArgs {
@@ -86,7 +85,6 @@ impl QueryArgs {
             offset: 0,
             cursor: None,
             keyset_mode: None,
-            allow_full_scan: false,
         }
     }
 
@@ -206,14 +204,6 @@ impl QueryArgs {
     }
     pub fn keyset_by(mut self, col: &str, dir: SortDir) -> Self {
         self.keyset_mode = Some((col.to_string(), dir));
-        self
-    }
-
-    /// Explicitly permit a full table scan for this query (suppresses the
-    /// strict-mode full-scan guardrail). Pass a human reason for grep-ability.
-    /// Use ONLY when the scan is genuinely intentional (tiny/bounded table).
-    pub fn allow_full_scan(mut self, _reason: &str) -> Self {
-        self.allow_full_scan = true;
         self
     }
 

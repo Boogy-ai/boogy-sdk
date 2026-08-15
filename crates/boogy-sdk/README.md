@@ -322,7 +322,7 @@ let n: u64 = Query::on(Post::TABLE).where_eq(Post::ROOM_ID, 42_i64).count()?;
 
 `fetch_all` and `fetch_one` discard the total row count, so they set the store's `skip_total` flag and the host skips computing it. Use `fetch_all_with_total()` when you actually display a total, and `fetch_page(|row| …)` for keyset pagination after `.keyset_by(col, dir)`. `count()` sends **only** the base AND-filters — it ignores `.or(...)`, ordering and paging, because the store's count operation is filters-only.
 
-Declare the access pattern your query needs (`list_by`, `ranked_by`, `lookup_by`, `tagged_by`, or an explicit index) so the planner has an index to walk. A query it cannot serve from one degrades to a table scan, and past a few hundred rows an un-opted-in scan is refused outright in strict mode (on by default outside production). `.allow_scan("why")` downgrades that to a warning; it is an audited escape hatch for a genuinely small table, not a substitute for the index — the scan still costs O(table).
+Declare the access pattern your query needs (`list_by`, `ranked_by`, `lookup_by`, `tagged_by`, or an explicit index) so the planner has an index to walk. A query the planner cannot serve from an index degrades to a table scan. That is **warned and metered, never refused**: the guardrail logs an actionable hint and `keys_examined` records what the read actually looked at, so the cost is visible and priced. What stops an abusive scan is the per-request budget (`[limits] cpu_deadline_ms`), which cuts the request off *and* cancels the work. There is no per-query opt-out and no strict mode — an unindexed read on a declared column is caught at BUILD time by the service-conventions gate instead.
 
 Underneath, `store::find(table, &opts)` is the raw form, and it is what you reach for when you need a shape the builder does not express:
 
@@ -338,7 +338,6 @@ let opts = store::FindOptions {
     or_groups: vec![],
     sort: vec![store::SortBy { column: "created_at".into(), dir: store::SortDir::Desc }],
     page: Some(store::Page { limit: 50, offset: 0 }),
-    allow_full_scan: false,
     skip_total: true,
 };
 let result = store::find("users", &opts)?;

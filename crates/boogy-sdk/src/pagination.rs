@@ -64,7 +64,6 @@
 //!         }],
 //!         page: Some(store::Page { limit: (q.limit + 1) as u32, offset: 0 }),
 //!         or_groups: vec![],
-//!         allow_full_scan: false,
 //!         skip_total: true,
 //!     })
 //!     .map_err(ApiError::internal)?;

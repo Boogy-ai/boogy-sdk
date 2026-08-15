@@ -100,14 +100,6 @@ interface store {
         /// Empty `or-groups` (the default) is exactly the filters-only
         /// behavior — fully backward compatible.
         or-groups: list<list<filter>>,
-        /// Explicit opt-in to permit a full table scan for this query,
-        /// suppressing the strict-mode full-scan guardrail: past the row
-        /// threshold the scan warns instead of failing. Defaults to `false`.
-        /// It is an audited escape hatch for a genuinely intentional scan of a
-        /// small or single-owner table, not a fix for a missing index — the
-        /// scan still costs O(table). It has no effect on a read inside a
-        /// transaction, where the guardrail does not run.
-        allow-full-scan: bool,
         /// Skip computing `total-count` (the host returns 0). Set by callers
         /// that discard the total — keyset/`fetch-page`, `fetch-all`,
         /// `fetch-one` — so the host can avoid the count entirely on the

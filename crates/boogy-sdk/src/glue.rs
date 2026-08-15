@@ -636,7 +636,6 @@ macro_rules! wit_glue {
                             sort,
                             page,
                             or_groups,
-                            allow_full_scan: q.0.allow_full_scan,
                             // Rows-only helper → discard totals (count-elision
                             // fast path on the index walk).
                             skip_total: true,
@@ -671,7 +670,6 @@ macro_rules! wit_glue {
                     sort: vec![],
                     page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset: 0 }),
                     or_groups: vec![],
-                    allow_full_scan: false,
                     skip_total: false,
                 },
             )
@@ -747,7 +745,6 @@ macro_rules! wit_glue {
                                 offset: 0,
                             }),
                             or_groups: ::std::vec![],
-                            allow_full_scan: false,
                             skip_total: false,
                         },
                     )
@@ -783,7 +780,6 @@ macro_rules! wit_glue {
                                 offset: 0,
                             }),
                             or_groups: ::std::vec![],
-                            allow_full_scan: false,
                             skip_total: false,
                         },
                     )
@@ -850,7 +846,6 @@ macro_rules! wit_glue {
                             offset: 0,
                         }),
                         or_groups,
-                        allow_full_scan: false,
                         // Keyset never needs the count; the page itself says
                         // whether another follows.
                         skip_total: true,
@@ -1080,7 +1075,6 @@ macro_rules! wit_glue {
                     sort: vec![],
                     page: None,
                     or_groups,
-                    allow_full_scan: false,
                     skip_total: false,
                 },
                 &$bindings::boogy::platform::store::ScanOrder {
@@ -1142,7 +1136,6 @@ macro_rules! wit_glue {
                     sort: vec![],
                     page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset: 0 }),
                     or_groups: vec![],
-                    allow_full_scan: false,
                     skip_total: false,
                 },
             )
@@ -1187,7 +1180,6 @@ macro_rules! wit_glue {
                     sort: vec![],
                     page: Some($bindings::boogy::platform::store::Page { limit: 1, offset: 0 }),
                     or_groups: vec![],
-                    allow_full_scan: false,
                     skip_total: false,
                 },
             ) {
@@ -1588,7 +1580,7 @@ macro_rules! wit_glue {
         /// `or_groups` is exactly [`find_rows`].
         ///
         /// The two trailing `bool`s are the ones [`find_rows`] hard-codes to
-        /// `false`: `allow_full_scan` is the audited scan opt-out, and
+        /// `false`: `skip_total` is the one trailing bool —
         /// `skip_total` returns `0` for the count instead of computing it —
         /// pass `true` whenever you discard the total.
         ///
@@ -1608,7 +1600,6 @@ macro_rules! wit_glue {
         ///         ],
         ///         vec![sort_desc("score"), sort_desc("_id")],
         ///         Some(page(20, 0)),
-        ///         false, // allow_full_scan
         ///         true,  // skip_total — the total is discarded here
         ///     )?;
         ///     Ok(page_rows)
@@ -1620,12 +1611,11 @@ macro_rules! wit_glue {
             or_groups: ::std::vec::Vec<::std::vec::Vec<$bindings::boogy::platform::store::Filter>>,
             sort: ::std::vec::Vec<$bindings::boogy::platform::store::SortBy>,
             page: ::core::option::Option<$bindings::boogy::platform::store::Page>,
-            allow_full_scan: bool,
             skip_total: bool,
         ) -> ::core::result::Result<(::std::vec::Vec<$crate::store::Row>, u64), $crate::store::StoreError> {
             match $bindings::boogy::platform::store::find(
                 table,
-                &$bindings::boogy::platform::store::FindOptions { filters, sort, page, or_groups, allow_full_scan, skip_total },
+                &$bindings::boogy::platform::store::FindOptions { filters, sort, page, or_groups, skip_total },
             ) {
                 Ok(result) => {
                     let rows: ::std::vec::Vec<$crate::store::Row> =
@@ -1658,7 +1648,7 @@ macro_rules! wit_glue {
             sort: ::std::vec::Vec<$bindings::boogy::platform::store::SortBy>,
             page: ::core::option::Option<$bindings::boogy::platform::store::Page>,
         ) -> ::core::result::Result<(::std::vec::Vec<$crate::store::Row>, u64), $crate::store::StoreError> {
-            find_rows_grouped(table, filters, ::std::vec::Vec::new(), sort, page, false, false)
+            find_rows_grouped(table, filters, ::std::vec::Vec::new(), sort, page, false)
         }
 
         /// Count rows matching `filters` in `table`. Delegates to the
@@ -1708,7 +1698,6 @@ macro_rules! wit_glue {
                     sort: vec![],
                     page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset: 0 }),
                     or_groups: vec![],
-                    allow_full_scan: false,
                     skip_total: false,
                 },
             )
@@ -1824,7 +1813,6 @@ macro_rules! wit_glue {
         ///         SortDir::Desc,
         ///         cursor,
         ///         limit,
-        ///         false, // allow_full_scan
         ///         |row| {
         ///             let view = PostView { id: row.id(), title: row.text("title") };
         ///             let last_id    = row.id().to_string();
@@ -1843,7 +1831,6 @@ macro_rules! wit_glue {
             dir: $crate::store::SortDir,
             cursor: ::core::option::Option<$crate::pagination::Cursor>,
             limit: usize,
-            allow_full_scan: bool,
             row_to_item_and_cursor: F,
         ) -> ::core::result::Result<$crate::pagination::CursorPage<T>, $crate::error::ApiError>
         where
@@ -1897,7 +1884,7 @@ macro_rules! wit_glue {
             // Execute the query (converts rows to SDK Row via to_sdk_row inside).
             // Keyset pagination derives "has next page" from the limit+1 overfetch,
             // never from the total — so skip the count entirely.
-            let (rows, _total) = find_rows_grouped(table, wit_filters, wit_or_groups, sort, wit_page, allow_full_scan, true)
+            let (rows, _total) = find_rows_grouped(table, wit_filters, wit_or_groups, sort, wit_page, true)
                 .map_err($crate::error::ApiError::from)?;
 
             // Map each row to (T, Cursor) before slicing.
@@ -2028,20 +2015,6 @@ macro_rules! wit_glue {
                 Self(self.0.keyset_by(col, dir))
             }
 
-            // -- Full-scan opt-in --
-
-            pub fn allow_full_scan(self, reason: &str) -> Self {
-                Self(self.0.allow_full_scan(reason))
-            }
-
-            /// Explicitly permit a table scan for this query, with an audited
-            /// reason — the escape hatch when no access pattern is declared.
-            /// Alias for `allow_full_scan` with a logged justification.
-            pub fn allow_scan(self, reason: &str) -> Self {
-                $crate::log::info!("allow_scan: {} (table {})", reason, self.0.table);
-                Self(self.0.allow_full_scan(reason))
-            }
-
             // -- Internal: convert QueryArgs to the WIT-typed args find_rows_grouped expects --
 
             fn to_wit_args(&self) -> (
@@ -2080,10 +2053,9 @@ macro_rules! wit_glue {
                 $crate::error::ApiError,
             > {
                 self.0 = self.0.for_fetch_one();
-                let afs = self.0.allow_full_scan;
                 let (f, og, s, p) = self.to_wit_args();
                 // Discards the total → skip the count.
-                let (rows, _total) = find_rows_grouped(&self.0.table, f, og, s, p, afs, true)
+                let (rows, _total) = find_rows_grouped(&self.0.table, f, og, s, p, true)
                     .map_err($crate::error::ApiError::from)?;
                 Ok(rows.into_iter().next())
             }
@@ -2095,9 +2067,8 @@ macro_rules! wit_glue {
             > {
                 // Discards the total → skip the count (don't route through
                 // `fetch_all_with_total`, which must compute it).
-                let afs = self.0.allow_full_scan;
                 let (f, og, s, p) = self.to_wit_args();
-                let (rows, _total) = find_rows_grouped(&self.0.table, f, og, s, p, afs, true)
+                let (rows, _total) = find_rows_grouped(&self.0.table, f, og, s, p, true)
                     .map_err($crate::error::ApiError::from)?;
                 Ok(rows)
             }
@@ -2107,9 +2078,8 @@ macro_rules! wit_glue {
                 (::std::vec::Vec<$crate::store::Row>, u64),
                 $crate::error::ApiError,
             > {
-                let afs = self.0.allow_full_scan;
                 let (f, og, s, p) = self.to_wit_args();
-                find_rows_grouped(&self.0.table, f, og, s, p, afs, false)
+                find_rows_grouped(&self.0.table, f, og, s, p, false)
                     .map_err($crate::error::ApiError::from)
             }
 
@@ -2152,7 +2122,6 @@ macro_rules! wit_glue {
                     )),
                 };
                 let limit = self.0.limit.unwrap_or(20);
-                let allow_full_scan = self.0.allow_full_scan;
 
                 keyset_paginate::<T, _>(
                     &self.0.table,
@@ -2162,7 +2131,6 @@ macro_rules! wit_glue {
                     dir,
                     self.0.cursor,
                     limit,
-                    allow_full_scan,
                     |row| {
                         let item = row_to_item(row);
                         let cursor = $crate::query::build_keyset_cursor(row, &keyset_col);
@@ -2370,7 +2338,6 @@ macro_rules! wit_glue {
                         sort,
                         page,
                         or_groups: vec![],
-                        allow_full_scan: false,
                         skip_total: false,
                     },
                 )?;
@@ -2558,7 +2525,6 @@ macro_rules! wit_glue {
                     }],
                     page: Some($bindings::boogy::platform::store::Page { limit: 1, offset: 0 }),
                     or_groups: vec![],
-                    allow_full_scan: false,
                     skip_total: false,
                 },
             )?;
@@ -3237,7 +3203,6 @@ macro_rules! wit_glue {
                                 offset: 0,
                             }),
                             or_groups,
-                            allow_full_scan: false,
                             skip_total: order.is_some(),
                         },
                     )
