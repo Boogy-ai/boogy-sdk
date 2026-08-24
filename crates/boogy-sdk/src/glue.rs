@@ -284,6 +284,7 @@ macro_rules! wit_glue {
                         }),
                         default: c.default.as_ref().map(|v| __boogy_val_to_wit(v)),
                         counter: c.counter,
+                        counter_max: c.counter_max,
                     }
                 }).collect();
             // create_table: guarded by list_tables. Skip if table already exists;
@@ -585,6 +586,8 @@ macro_rules! wit_glue {
                 // existing column to one is the backfill path, which has to move
                 // the value out of already-written rows.
                 counter: false,
+                // …and therefore has no accumulator op to choose.
+                counter_max: false,
             };
             $bindings::boogy::platform::store::add_column(table, &cd)
                 .map_err(::std::string::String::from)

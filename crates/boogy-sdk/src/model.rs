@@ -490,6 +490,72 @@ pub trait Counter {
     }
 }
 
+/// A **max accumulator**: a conflict-free cell holding the LARGEST value ever
+/// observed for its key.
+///
+/// The same shape as [`Counter`] — declared beside the model rather than as a
+/// field, addressed by a key, maintained by an atomic op that never reads — but
+/// it keeps a maximum instead of a sum.
+///
+/// # What it is for
+///
+/// "When did this room last have a post?" is the canonical case. Written the
+/// obvious way it is an ordinary column on the parent row, stamped on every
+/// child write — and that rewrites the parent row every time, so every writer
+/// contends with every other. Measured on the `board` example: **59.4% of
+/// commit attempts conflicted** at 600 concurrent writers, against **2** for
+/// the counter cell beside it. Observing into a max accumulator instead takes
+/// no read-conflict range at all, so the writers never see each other.
+///
+/// # Observing is not assigning
+///
+/// [`MaxAccum::observe`] keeps the value only if it is larger than what is
+/// stored. A smaller observation is a silent no-op, not an error: "the latest
+/// post is older than the latest post" is a race between two writers, not a
+/// fault, and the cell already holds the right answer.
+///
+/// It follows that a max accumulator can only move **forward**. There is no
+/// "unobserve" — deleting the newest post does not roll the stamp back. Where
+/// that matters, the value is derived data and should be recomputed, not
+/// accumulated.
+///
+/// # Reading it
+///
+/// [`MaxAccum::get`] and [`MaxAccum::get_for_update`] carry exactly
+/// [`Counter`]'s trade: the snapshot read is cheap and **must not be branched
+/// on** inside a transaction; the update read takes the conflict range, is safe
+/// to decide with, and contends by design.
+///
+/// `None` means nothing has ever been observed — distinct from any value that
+/// has been, and the reason this returns an `Option` rather than a floor value
+/// that would look like a real timestamp.
+pub trait MaxAccum {
+    /// `"<table>.<column>"` for `of = Model`, or the accumulator's own name
+    /// for `key = (..)`. Shares one namespace with [`Counter`]: a name
+    /// declared as one cannot be used as the other.
+    const NAME: &'static str;
+    /// The key addressing one cell, exactly as [`Counter::Key`].
+    type Key: Into<Vec<Val>>;
+
+    /// Observe a value. Kept only if larger than what is stored. No read, so
+    /// this never conflicts on the cell.
+    fn observe<S: CounterStore>(store: &S, key: Self::Key, value: i64) -> Result<(), ApiError> {
+        store.max_observe(Self::NAME, &key.into(), value).map_err(ApiError::from)
+    }
+
+    /// Snapshot read: cheap, takes no read-conflict range, NOT safe to branch
+    /// on inside a transaction. `None` = nothing observed yet.
+    fn get<S: CounterStore>(store: &S, key: Self::Key) -> Result<Option<i64>, ApiError> {
+        store.max_get(Self::NAME, &key.into(), true).map_err(ApiError::from)
+    }
+
+    /// Ordinary read: takes the read-conflict range, safe to branch on,
+    /// contends by design.
+    fn get_for_update<S: CounterStore>(store: &S, key: Self::Key) -> Result<Option<i64>, ApiError> {
+        store.max_get(Self::NAME, &key.into(), false).map_err(ApiError::from)
+    }
+}
+
 /// The store operations [`Counter::add`]/[`Counter::get`]/
 /// [`Counter::get_for_update`] call through — binding-agnostic, the same
 /// seam [`IntoStoreError`](crate::store::IntoStoreError) uses to keep this
@@ -504,6 +570,11 @@ pub trait CounterStore {
     /// branch on inside a transaction); `false` takes the range (safe to
     /// branch on, contends by design).
     fn counter_get(&self, name: &str, key: &[Val], snapshot: bool) -> Result<i64, StoreError>;
+    /// Observe a value for a max accumulator. See [`MaxAccum::observe`].
+    fn max_observe(&self, name: &str, key: &[Val], value: i64) -> Result<(), StoreError>;
+    /// Read a max accumulator. `None` = nothing observed. See [`MaxAccum`].
+    fn max_get(&self, name: &str, key: &[Val], snapshot: bool)
+        -> Result<Option<i64>, StoreError>;
 }
 
 /// Compile-time `"<table>.<column>"` builder for `#[derive(Counter)]`'s
@@ -538,6 +609,19 @@ pub fn col_def_for<T: Field>(
     counter: bool,
     default: Option<Val>,
 ) -> ColDef {
+    col_def_for_accum::<T>(name, unique, counter, false, default)
+}
+
+/// `col_def_for`, with the accumulator op stated. A MAX column is a counter
+/// column whose cell keeps the largest value observed rather than a sum.
+#[doc(hidden)]
+pub fn col_def_for_accum<T: Field>(
+    name: &str,
+    unique: bool,
+    counter: bool,
+    counter_max: bool,
+    default: Option<Val>,
+) -> ColDef {
     ColDef {
         name: name.to_string(),
         col_type: T::col_type(),
@@ -545,6 +629,7 @@ pub fn col_def_for<T: Field>(
         unique,
         references: None,
         counter,
+        counter_max,
         default,
     }
 }
@@ -756,6 +841,8 @@ mod tests {
     enum RecordedCall {
         Add { name: String, key: Vec<Val>, delta: i64 },
         Get { name: String, key: Vec<Val>, snapshot: bool },
+        MaxObserve { name: String, key: Vec<Val>, value: i64 },
+        MaxGet { name: String, key: Vec<Val>, snapshot: bool },
     }
 
     struct FakeCounterStore {
@@ -779,6 +866,66 @@ mod tests {
             });
             Ok(42)
         }
+        fn max_observe(&self, name: &str, key: &[Val], value: i64) -> Result<(), StoreError> {
+            self.calls.borrow_mut().push(RecordedCall::MaxObserve {
+                name: name.to_string(),
+                key: key.to_vec(),
+                value,
+            });
+            Ok(())
+        }
+        fn max_get(
+            &self,
+            name: &str,
+            key: &[Val],
+            snapshot: bool,
+        ) -> Result<Option<i64>, StoreError> {
+            self.calls.borrow_mut().push(RecordedCall::MaxGet {
+                name: name.to_string(),
+                key: key.to_vec(),
+                snapshot,
+            });
+            Ok(Some(7))
+        }
+    }
+
+    struct LastPost;
+    impl MaxAccum for LastPost {
+        const NAME: &'static str = "rooms.last_post_at";
+        type Key = [Val; 1];
+    }
+
+    /// The two reads must reach the store with DIFFERENT snapshot flags, and
+    /// `observe` must not read at all. Same claim the counter's own test makes,
+    /// because the same silent-hazard rule applies.
+    #[test]
+    fn max_accum_verbs_carry_their_snapshot_flag_to_the_store() {
+        let s = FakeCounterStore { calls: Default::default() };
+        let k = || [Val::Text("general".into())];
+        LastPost::observe(&s, k(), 123).unwrap();
+        assert_eq!(LastPost::get(&s, k()).unwrap(), Some(7));
+        assert_eq!(LastPost::get_for_update(&s, k()).unwrap(), Some(7));
+
+        let calls = s.calls.borrow();
+        assert_eq!(
+            calls[0],
+            RecordedCall::MaxObserve {
+                name: "rooms.last_post_at".into(),
+                key: vec![Val::Text("general".into())],
+                value: 123,
+            },
+            "observe must not read — no Get precedes it",
+        );
+        assert!(
+            matches!(&calls[1], RecordedCall::MaxGet { snapshot: true, .. }),
+            "get is the SNAPSHOT read: {:?}",
+            calls[1],
+        );
+        assert!(
+            matches!(&calls[2], RecordedCall::MaxGet { snapshot: false, .. }),
+            "get_for_update takes the conflict range: {:?}",
+            calls[2],
+        );
     }
 
     struct Hits;

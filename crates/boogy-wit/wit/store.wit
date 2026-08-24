@@ -390,6 +390,19 @@ interface store {
         // previous value to remove the stale entry, and an atomic add never
         // reads one. The SDK's `Model` derive rejects that at compile time.
         counter: bool,
+        // A counter column maintained with MAX rather than ADD: the cell keeps
+        // the LARGEST value ever observed for that row, and a smaller write is
+        // a silent no-op.
+        //
+        // This is how "last activity" is expressed without contention. The
+        // ordinary way — a plain column stamped on the parent row every time a
+        // child is written — rewrites that row on every write, and is the
+        // largest single source of commit conflicts measured on this platform.
+        //
+        // Only meaningful with `counter` set: a max column IS a counter column
+        // with a different op, and shares every other rule (kept out of the
+        // packed row, cannot back an index, no read-conflict range).
+        counter-max: bool,
     }
 
     record column-info {
@@ -636,6 +649,42 @@ interface store {
     /// and `key`'s arity must match `key-cols` (`constraint-violation`,
     /// naming both arities, if not).
     counter-get: func(name: string, key: list<value>, snapshot: bool) -> result<s64, store-error>;
+
+    /// Declare a MAX accumulator: a conflict-free cell holding the LARGEST
+    /// value ever observed for its key.
+    ///
+    /// Same sidecar cell and the same atomic-op discipline as `create-counter`
+    /// — it keeps a maximum instead of a sum. This is how "last activity" is
+    /// expressed without contention. The alternative, stamping an ordinary
+    /// column on a shared parent row, rewrites that row on every child write
+    /// and is the single largest source of commit conflicts measured on this
+    /// platform.
+    ///
+    /// Rules are `create-counter`'s: `key-cols` must be non-empty, the name is
+    /// unique across ALL accumulators, and declaring one never backfills — the
+    /// cell simply has no value until something observes one.
+    create-max: func(name: string, key-cols: list<string>) -> result<u32, store-error>;
+
+    /// Observe a value. The cell keeps it only if it is larger than what is
+    /// already there; a smaller observation is a silent no-op, not an error.
+    ///
+    /// Conflict-free in the strong sense: the op never reads, so it takes no
+    /// read-conflict range and concurrent observers of the SAME key do not
+    /// contend. That is the property an ordinary column cannot give you.
+    ///
+    /// * `name` must be declared via `create-max` — `not-found` otherwise.
+    /// * aiming this at an `add` accumulator is a `constraint-violation`: the
+    ///   two encode their cells differently, so it would corrupt rather than
+    ///   fail.
+    max-observe: func(name: string, key: list<value>, value: s64) -> result<_, store-error>;
+
+    /// Read a MAX accumulator's cell. `none` means nothing has been observed.
+    ///
+    /// `snapshot` carries `counter-get`'s cost/safety trade exactly: `true`
+    /// takes no read-conflict range and must not be branched on; `false` takes
+    /// the range and is safe to decide with. Reading back a cell this
+    /// transaction just observed into, at snapshot isolation, is refused.
+    max-get: func(name: string, key: list<value>, snapshot: bool) -> result<option<s64>, store-error>;
 
     /// Add a column, or set/update the `default` of one that already exists.
     ///

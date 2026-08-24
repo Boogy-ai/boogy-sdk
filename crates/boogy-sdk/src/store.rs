@@ -330,6 +330,13 @@ pub struct ColDef {
     /// leaves counter fields out of `to_columns`, so an update never mentions
     /// the column and cannot overwrite it with a stale value.
     pub counter: bool,
+    /// A counter column maintained with MAX instead of ADD: the cell keeps the
+    /// largest value ever observed for the row.
+    ///
+    /// This is the conflict-free way to record "last activity". Writing it as
+    /// an ordinary column instead means stamping the parent row on every child
+    /// write, and every writer then contends with every other.
+    pub counter_max: bool,
     /// Value a read resolves this column to when the row has no value for it —
     /// the equivalent of `DEFAULT 'pending'` in a `CREATE TABLE`.
     ///
@@ -387,6 +394,19 @@ pub fn lowest(column: &str) -> Order { Order { column: column.into(), desc: fals
 pub enum AccessPattern {
     /// Rows where `filter == v`, ordered by `order`, paginated.
     ListBy { filter: String, order: Order },
+    /// `ListBy` whose ORDER column is an accumulator (a counter or max
+    /// column), so the two halves are served by different mechanisms.
+    ///
+    /// An accumulator's values live outside the row, so no index can order by
+    /// them and the composite index `ListBy` resolves to cannot exist. The
+    /// ordering comes from a maintained projection over the cells instead; what
+    /// still needs an index is the FILTER, so the projection can be scoped to
+    /// the matching rows without reading the table.
+    ///
+    /// A distinct variant rather than a flag on `ListBy` because it resolves to
+    /// a different index — filter-only, and not covering, since the value being
+    /// ordered by is not in the row to be covered.
+    ListByRanked { filter: String, order: Order },
     /// Top rows by `order`, paginated, no filter.
     RankedBy { order: Order },
     /// The unique row where `column == v` (point lookup).
@@ -414,6 +434,9 @@ pub enum AccessPattern {
 pub fn declared_list_order(schema: &Table, filter_col: &str) -> Option<Order> {
     schema.access_patterns.iter().find_map(|p| match p {
         AccessPattern::ListBy { filter, order } if filter == filter_col => Some(order.clone()),
+        // Same declaration to a caller: the ordering is real and stable, it is
+        // simply served from a projection rather than an index.
+        AccessPattern::ListByRanked { filter, order } if filter == filter_col => Some(order.clone()),
         _ => None,
     })
 }
@@ -663,37 +686,37 @@ impl Table {
     }
 
     pub fn text(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: false, unique: false, references: None, counter: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
         self
     }
 
     pub fn integer(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: false, unique: false, references: None, counter: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
         self
     }
 
     pub fn real(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Real, nullable: false, unique: false, references: None, counter: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Real, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
         self
     }
 
     pub fn boolean(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Boolean, nullable: false, unique: false, references: None, counter: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Boolean, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
         self
     }
 
     pub fn blob(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Blob, nullable: false, unique: false, references: None, counter: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Blob, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
         self
     }
 
     pub fn nullable_text(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: true, unique: false, references: None, counter: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None });
         self
     }
 
     pub fn nullable_integer(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: true, unique: false, references: None, counter: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None });
         self
     }
 

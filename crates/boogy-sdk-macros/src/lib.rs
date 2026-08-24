@@ -167,6 +167,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // ordinals, so there is no "correct" position to reproduce and no
     // reason to expose one. (column name)
     let mut struct_counters: Vec<String> = Vec::new();
+    // Which of `struct_counters` are MAX accumulators. Kept as a marker set
+    // rather than a second list so both kinds share ONE name namespace — the
+    // duplicate-name check below then covers them without knowing they differ.
+    let mut struct_max_names: std::collections::HashSet<String> = Default::default();
+    // `list_by` order columns, resolved after the attribute loop so a
+    // `counter`/`max` declared later in the same attribute still counts.
+    let mut list_by_order_cols: Vec<String> = Vec::new();
+    let mut access_patterns_deferred: Vec<(String, String, bool)> = Vec::new();
     // (column, pattern name) for every column an access pattern sorts or
     // filters on. Collected in parallel because the patterns below are quoted
     // into token streams immediately, after which their column names cannot be
@@ -211,13 +219,18 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 let desc = !newest.is_empty();
                 let order_col = if desc { newest } else { oldest };
                 pattern_cols.push((filter.clone(), "list_by(filter)"));
-                pattern_cols.push((order_col.clone(), "list_by sort column"));
-                access_patterns.push(quote! {
-                    __t.access_patterns.push(::boogy_sdk::store::AccessPattern::ListBy {
-                        filter: #filter.into(),
-                        order: ::boogy_sdk::store::Order { column: #order_col.into(), desc: #desc },
-                    });
-                });
+                // The SORT column is checked against the counter list only when
+                // it is not itself an accumulator. An accumulator ordering is
+                // legal and is the whole point of `ListByRanked` — refusing it
+                // here is what blocked the conflict-free `last_post_at` from
+                // being adopted at all.
+                //
+                // Deferred to after the attribute loop because `max(..)` and
+                // `counter(..)` may be declared AFTER `list_by(..)` in the
+                // attribute, and reading `struct_counters` here would depend on
+                // that order.
+                list_by_order_cols.push(order_col.clone());
+                access_patterns_deferred.push((filter.clone(), order_col.clone(), desc));
                 Ok(())
             } else if meta.path.is_ident("rollup") {
                 // rollup(group = "...", sum = "...", count = true)
@@ -398,11 +411,69 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 }
                 struct_counters.push(name);
                 Ok(())
+            } else if meta.path.is_ident("max") {
+                // max(name = "last_post_at")
+                //
+                // A counter column maintained with MAX instead of ADD: the cell
+                // keeps the LARGEST value ever observed for the row, and a
+                // smaller write is a silent no-op.
+                //
+                // This is how "last activity" is declared without contention.
+                // The ordinary way — a plain column stamped on the parent row
+                // whenever a child is written — rewrites that row on every
+                // write, so every writer conflicts with every other. Same
+                // field-free shape as `counter(...)`, and the same reasons for
+                // it: the value lives in its own cell, so there is no field to
+                // clobber and no default that would ever be observed.
+                let mut name = String::new();
+                meta.parse_nested_meta(|m| {
+                    if m.path.is_ident("name") {
+                        name = m.value()?.parse::<LitStr>()?.value();
+                        Ok(())
+                    } else {
+                        Err(m.error("max(...) takes only `name = \"...\"` (required)"))
+                    }
+                })?;
+                if name.is_empty() {
+                    return Err(meta.error(
+                        "#[model(max(...))] requires a `name = \"...\"` naming the \
+                         column, e.g. `max(name = \"last_post_at\")`",
+                    ));
+                }
+                struct_max_names.insert(name.clone());
+                struct_counters.push(name);
+                Ok(())
             } else {
                 Err(meta.error("unknown model attribute"))
             }
         })?;
     }
+
+    // Resolve the deferred `list_by` declarations now that every `counter(..)`
+    // and `max(..)` on this struct is known.
+    for (filter, order_col, desc) in &access_patterns_deferred {
+        let is_accum = struct_counters.iter().any(|c| c == order_col);
+        let (f, o, d) = (filter.clone(), order_col.clone(), *desc);
+        if is_accum {
+            // Ordering by an accumulator: the index is the filter alone and the
+            // ordering comes from a projection over the cells.
+            access_patterns.push(quote! {
+                __t.access_patterns.push(::boogy_sdk::store::AccessPattern::ListByRanked {
+                    filter: #f.into(),
+                    order: ::boogy_sdk::store::Order { column: #o.into(), desc: #d },
+                });
+            });
+        } else {
+            pattern_cols.push((order_col.clone(), "list_by sort column"));
+            access_patterns.push(quote! {
+                __t.access_patterns.push(::boogy_sdk::store::AccessPattern::ListBy {
+                    filter: #f.into(),
+                    order: ::boogy_sdk::store::Order { column: #o.into(), desc: #d },
+                });
+            });
+        }
+    }
+    let _ = &list_by_order_cols;
 
     // --- fields ---
     let fields = match &input.data {
@@ -1100,9 +1171,12 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     });
     let struct_counter_pushes = struct_counters.iter().map(|name| {
+        let is_max = struct_max_names.contains(name);
         quote! {
             __t.columns.push(
-                ::boogy_sdk::model::col_def_for::<i64>(#name, false, true, ::core::option::Option::None)
+                ::boogy_sdk::model::col_def_for_accum::<i64>(
+                    #name, false, true, #is_max, ::core::option::Option::None,
+                )
             );
         }
     });

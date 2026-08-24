@@ -62,6 +62,14 @@ pub fn resolve(table: &str, patterns: &[AccessPattern], explicit: &[Index]) -> (
         match p {
             AccessPattern::ListBy { filter, order } =>
                 want(vec![filter.clone(), order.column.clone()], false, true, false, false),
+            // Filter-only, and NOT covering. The ordering comes from a
+            // projection over the accumulator's cells, so the order column
+            // cannot be in the index (its value is not in the row) and there is
+            // nothing for a covering copy to carry. What the index is for is
+            // enumerating the rows the filter matches, so the projection can be
+            // scoped without reading the table.
+            AccessPattern::ListByRanked { filter, .. } =>
+                want(vec![filter.clone()], false, false, false, false),
             AccessPattern::RankedBy { order } =>
                 want(vec![order.column.clone()], false, true, false, true),
             AccessPattern::LookupBy { column } =>
