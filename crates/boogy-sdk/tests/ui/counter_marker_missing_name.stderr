@@ -1,0 +1,5 @@
+error: #[counter(...)] is missing `name = "<column>"` — the name of the counter column on the model this type addresses, e.g. `#[counter(of = Room, name = "post_count")]`
+  --> tests/ui/counter_marker_missing_name.rs:15:12
+   |
+15 | pub struct RoomPostCount;
+   |            ^^^^^^^^^^^^^

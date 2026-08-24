@@ -1,0 +1,8 @@
+error[E0599]: no method named `is_null` found for struct `Col<i64>` in the current scope
+ --> tests/ui/expr_is_null_on_non_nullable.rs:9:21
+  |
+9 |     let _ = ROOM_ID.is_null();
+  |                     ^^^^^^^ method not found in `Col<i64>`
+  |
+  = note: the method was found for
+          - `Col<Option<T>>`

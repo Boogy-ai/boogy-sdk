@@ -117,6 +117,7 @@ macro_rules! wit_glue {
                     store::StoreError::ResourceExhausted(m)   => S::ResourceExhausted(m),
                     store::StoreError::Poisoned(m)            => S::Poisoned(m),
                     store::StoreError::TooContended(m)        => S::TooContended(m),
+                    store::StoreError::Gone(m)                => S::Gone(m),
                     store::StoreError::Internal(m)            => S::Internal(m),
                 }
             }
@@ -232,6 +233,20 @@ macro_rules! wit_glue {
             }
         }
 
+        /// One WIT value → the SDK's `Val`. Same mapping `to_sdk_row` applies
+        /// per column, named so the aggregate path can reuse it rather than
+        /// writing a second copy that could drift.
+        fn __boogy_wit_to_val(v: &$bindings::boogy::platform::store::Value) -> $crate::store::Val {
+            match v {
+                $bindings::boogy::platform::store::Value::Null      => $crate::store::Val::Null,
+                $bindings::boogy::platform::store::Value::Text(s)   => $crate::store::Val::Text(s.clone()),
+                $bindings::boogy::platform::store::Value::Integer(i)=> $crate::store::Val::Integer(*i),
+                $bindings::boogy::platform::store::Value::Real(f)   => $crate::store::Val::Real(*f),
+                $bindings::boogy::platform::store::Value::Blob(b)   => $crate::store::Val::Blob(b.clone()),
+                $bindings::boogy::platform::store::Value::Boolean(b)=> $crate::store::Val::Boolean(*b),
+            }
+        }
+
         // -- Cascade action SDK→WIT mapping (used by FK threading below) --
         fn __boogy_cascade(
             a: $crate::store::CascadeAction,
@@ -324,6 +339,114 @@ macro_rules! wit_glue {
             __BOOGY_DECLARED.with(|d| {
                 d.borrow_mut().push((table.name.clone(), __resolved.clone()))
             });
+            let __rollups: ::std::vec::Vec<(
+                ::std::string::String,
+                ::std::vec::Vec<::std::string::String>,
+                ::std::vec::Vec<::std::string::String>,
+                bool,
+            )> = table
+                .access_patterns
+                .iter()
+                .filter_map(|p| match p {
+                    $crate::store::AccessPattern::Rollup { group, sum, count } => Some((
+                        // The name carries every grouping column, so declaring
+                        // `[room_id, post_id]` and `[room_id]` on one table
+                        // gives two rollups rather than one silently winning.
+                        ::std::format!("rollup_{}", group.join("_")),
+                        group.clone(),
+                        sum.clone(),
+                        *count,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if !__rollups.is_empty() {
+                __BOOGY_DECLARED_ROLLUPS
+                    .with(|d| d.borrow_mut().push((table.name.clone(), __rollups)));
+            }
+        }
+
+        /// Rollups recorded by each `create_table_from`, applied after the
+        /// index reconcile for the same reason: the complete declared set has
+        /// to be known before anything is dropped.
+        #[allow(clippy::type_complexity)]
+        thread_local! {
+            static __BOOGY_DECLARED_ROLLUPS: ::std::cell::RefCell<
+                ::std::vec::Vec<(
+                    ::std::string::String,
+                    ::std::vec::Vec<(
+                        ::std::string::String,
+                        ::std::vec::Vec<::std::string::String>,
+                        ::std::vec::Vec<::std::string::String>,
+                        bool,
+                    )>,
+                )>
+            > = ::std::cell::RefCell::new(::std::vec::Vec::new());
+        }
+
+        /// Converge each table's declared rollups on what its models declare.
+        ///
+        /// **Idempotence is the property that matters here, far more than for
+        /// indexes.** This runs on EVERY request, and creating a rollup walks
+        /// the whole table to count the rows already there. A comparison that
+        /// wrongly reported a declared rollup as missing would re-backfill the
+        /// table on every request — so the match is on the full shape (group,
+        /// summed columns, count), and `rollups_are_declared_once_not_per_request`
+        /// pins it.
+        fn __boogy_reconcile_rollups() {
+            // Drained first, unconditionally: the declarations are refilled by
+            // `Api::schema()` on every request, so leaving them would grow the
+            // thread-local without bound.
+            let declared =
+                __BOOGY_DECLARED_ROLLUPS.with(|d| ::std::mem::take(&mut *d.borrow_mut()));
+            for (table, desired) in &declared {
+                let actual = match list_rollups(table) {
+                    Ok(v) => v,
+                    // Store capability not granted, or the table is gone.
+                    // Nothing to reconcile against; the service fails properly
+                    // on its first data op rather than trapping during init.
+                    Err(_) => continue,
+                };
+                for (name, group, sum, count) in desired {
+                    let matches = actual.iter().any(|r| {
+                        r.name == *name
+                            && r.group == *group
+                            && r.sum == *sum
+                            && r.count == *count
+                    });
+                    if matches {
+                        continue;
+                    }
+                    // A rollup under this name whose SHAPE changed is dropped
+                    // first, or the create would be refused as already
+                    // existing and the declaration would silently never take
+                    // effect.
+                    if actual.iter().any(|r| r.name == *name) {
+                        let _ = drop_rollup(table, name);
+                    }
+                    if let Err(e) = create_rollup(
+                        table,
+                        &$crate::store::RollupInfo {
+                            name: name.clone(),
+                            group: group.clone(),
+                            sum: sum.clone(),
+                            count: *count,
+                        },
+                    ) {
+                        // Declaring is a schema step, and the schema phase must
+                        // not trap the request: a refusal here (a nullable
+                        // summed column, an unbounded group key) is an
+                        // authoring error the developer needs to SEE, and a
+                        // trap inside wasm reaches them as an opaque 500.
+                        $crate::log::error!(
+                            "schema {table}: rollup {name} was refused: {}. \
+                             Aggregates over this grouping will be computed \
+                             from the rows instead.",
+                            e
+                        );
+                    }
+                }
+            }
         }
 
         /// Table + resolved index set recorded by each `create_table_from` call
@@ -525,6 +648,49 @@ macro_rules! wit_glue {
             }).collect())
         }
 
+        /// The maintained rollups declared on a table.
+        ///
+        /// Useful as an idempotency guard in a migration: check before calling
+        /// `create_rollup`, which refuses a name that already exists.
+        fn list_rollups(
+            table: &str,
+        ) -> ::core::result::Result<::std::vec::Vec<$crate::store::RollupInfo>, ::std::string::String> {
+            let wit = $bindings::boogy::platform::store::list_rollups(table)
+                .map_err(::std::string::String::from)?;
+            Ok(wit.into_iter().map(|r| {
+                // Destructured exhaustively on purpose, for the reason spelled
+                // out on `list_indexes`: a new WIT field then fails to compile
+                // HERE rather than being silently dropped from the comparison
+                // the reconcile makes.
+                let $bindings::boogy::platform::store::RollupDef { name, group, sum, count } = r;
+                $crate::store::RollupInfo { name, group, sum, count }
+            }).collect())
+        }
+
+        /// Declare a maintained rollup. Prefer `#[model(rollup(...))]`, which
+        /// declares it with the table and keeps it in the reconcile.
+        fn create_rollup(
+            table: &str,
+            rollup: &$crate::store::RollupInfo,
+        ) -> ::core::result::Result<(), ::std::string::String> {
+            $bindings::boogy::platform::store::create_rollup(
+                table,
+                &$bindings::boogy::platform::store::RollupDef {
+                    name: rollup.name.clone(),
+                    group: rollup.group.clone(),
+                    sum: rollup.sum.clone(),
+                    count: rollup.count,
+                },
+            )
+            .map_err(::std::string::String::from)
+        }
+
+        /// Remove a maintained rollup and the totals it holds.
+        fn drop_rollup(table: &str, name: &str) -> ::core::result::Result<(), ::std::string::String> {
+            $bindings::boogy::platform::store::drop_rollup(table, name)
+                .map_err(::std::string::String::from)
+        }
+
         /// List the tables in this store with lightweight per-table metadata
         /// (name + live column count + user-defined index count).
         ///
@@ -614,35 +780,48 @@ macro_rules! wit_glue {
         /// as one pipelined host round-trip in autocommit (sequential inside an
         /// ambient `tx`). Build each query with the same `Query` chain as
         /// `fetch_all`; the result is positional — `out[i]` is the rows for
-        /// `queries[i]`. Totals are discarded (rows only), matching `fetch_all`.
+        /// `queries[i]`.
+        ///
+        /// Takes `Query<Bounded>` — every query in the batch must have stated a
+        /// `.limit(n)`. Batching is not a bound: an unbounded query in a batch
+        /// sends `page: None` exactly as it would alone, and the host then
+        /// substitutes a ceiling of its own and returns no cursor with which to
+        /// tell a truncated answer from a complete one. N of those in one round
+        /// trip is N times the same defect, not a cheaper version of it. Totals are discarded (rows only), matching `fetch_all`.
         /// Prefer this over a loop of `.fetch_all()` when reading independent
         /// sets across tables — the host pipelines them instead of paying one
         /// round-trip chain each.
         #[allow(dead_code)]
         fn find_many(
-            queries: ::std::vec::Vec<Query>,
+            queries: ::std::vec::Vec<Query<$crate::query::Bounded>>,
         ) -> ::core::result::Result<
             ::std::vec::Vec<::std::vec::Vec<$crate::store::Row>>,
             $crate::store::StoreError,
         > {
-            let wit_queries: ::std::vec::Vec<$bindings::boogy::platform::store::FindQuery> = queries
-                .iter()
-                .map(|q| {
-                    let (filters, or_groups, sort, page) = q.to_wit_args();
-                    $bindings::boogy::platform::store::FindQuery {
-                        table: q.0.table.clone(),
-                        options: $bindings::boogy::platform::store::FindOptions {
-                            filters,
-                            sort,
-                            page,
-                            or_groups,
-                            // Rows-only helper → discard totals (count-elision
-                            // fast path on the index walk).
-                            skip_total: true,
-                        },
-                    }
-                })
-                .collect();
+            let mut wit_queries: ::std::vec::Vec<$bindings::boogy::platform::store::FindQuery> =
+                ::std::vec::Vec::with_capacity(queries.len());
+            for q in &queries {
+                // Same enforcement `to_wit_args` gives every other terminal —
+                // a `.with_counter(..)` on one of the batched queries that
+                // names an untouched key column is refused here, before any
+                // of the batch dispatches.
+                let (filters, or_groups, sort, page, counters) = q.to_wit_args()
+                    .map_err(|e| $crate::store::StoreError::InvalidArgument(e.to_string()))?;
+                wit_queries.push($bindings::boogy::platform::store::FindQuery {
+                    table: q.0.table.clone(),
+                    options: $bindings::boogy::platform::store::FindOptions {
+                        filters,
+                        order_by: sort,
+                        page,
+                        or_groups,
+                        // Rows-only helper → discard totals (count-elision
+                        // fast path on the index walk).
+                        skip_total: SDK_SKIP_TOTAL,
+                        group_cursor: ::core::option::Option::None,
+                        counters,
+                    },
+                });
+            }
             match $bindings::boogy::platform::store::find_many(&wit_queries) {
                 Ok(results) => Ok(results
                     .into_iter()
@@ -660,6 +839,46 @@ macro_rules! wit_glue {
         /// Robust even when the host clamps this batch below 1000.
         const SDK_FIND_BATCH: u32 = 1000;
 
+        /// What the SDK puts in the WIT `find`'s `skip-total` for a read that
+        /// DISCARDS the count — which is nearly every read it issues.
+        ///
+        /// `true`: the cheap path is the default one. An exact total cannot be
+        /// produced without visiting every matching row, so a request that
+        /// carries a page AND asks for a total is bounded in ROWS and unbounded
+        /// in WORK. Measured on a 3,000-row table, the exact-total page
+        /// examined **61x** the index keys the skip-total page did for the
+        /// identical 50 rows. A caller that never looks at the count paid all
+        /// of that.
+        ///
+        /// That 61x is one PATH and one PLAN — an autocommit read on a plan
+        /// whose walk can stop at the page's edge — and is not what every read
+        /// saves. On a plan that must materialise the whole matching set before
+        /// it can order or filter it (a fan-out of `IN` seeks, an equality seek
+        /// on a composite's leading column with no sort, a scan) nothing stops
+        /// early and the count comes free with the drain, so declining saves
+        /// that read nothing at all. Both are the same default, for different
+        /// reasons: one name with countable exceptions beats a bare literal per
+        /// call site.
+        ///
+        /// `has-more` is unaffected — it is the page's own edge, the store
+        /// states it under either value, and it is what the one-page refusals
+        /// test. So declining the total costs a REFUSAL nothing; it costs the
+        /// refusal's MESSAGE an exact row count, which
+        /// `refuse_beyond_one_page` already has a branch for.
+        const SDK_SKIP_TOTAL: bool = true;
+
+        /// The opposite, spelled at every call site whose own contract is to
+        /// hand a total back: `find_all_rows`, `find_rows`,
+        /// `fetch_all_with_total`, `MigrationOps::find_rows`.
+        ///
+        /// These four end in `required_total`, which refuses to fold an absent
+        /// count into `0` — so a verb that stopped asking would fail as a
+        /// platform fault rather than quietly report an empty table. That is
+        /// the safe direction, and it is why the flip above is expressible at
+        /// all; naming the exception here is what keeps it from being read as
+        /// an oversight and "tidied" into the default.
+        const SDK_WANT_TOTAL: bool = false;
+
         fn find_all_rows(
             table: &str,
         ) -> ::core::result::Result<(::std::vec::Vec<$crate::store::Row>, u64), $crate::store::StoreError> {
@@ -667,10 +886,12 @@ macro_rules! wit_glue {
                 table,
                 &$bindings::boogy::platform::store::FindOptions {
                     filters: vec![],
-                    sort: vec![],
+                    order_by: vec![],
                     page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset: 0 }),
                     or_groups: vec![],
-                    skip_total: false,
+                    skip_total: SDK_WANT_TOTAL,
+                    group_cursor: ::core::option::Option::None,
+                    counters: ::std::vec::Vec::new(),
                 },
             )
             .map_err($crate::store::StoreError::from_wit)?;
@@ -683,10 +904,12 @@ macro_rules! wit_glue {
                 "find_all_rows",
                 rows.len(),
                 res.total_count,
+                res.has_more,
                 "Stream it instead: for_each_batch(table, .., None, ..) walks in primary-key \
                  order with a cursor and bounded memory.",
             )?;
-            Ok((rows, res.total_count))
+            let total = $crate::store::required_total("find_all_rows", res.total_count)?;
+            Ok((rows, total))
         }
 
         // -- Typed model CRUD (bridge to the WIT store; see boogy_sdk::model) --
@@ -712,7 +935,17 @@ macro_rules! wit_glue {
             }
         }
 
-        /// Fetch all `Model` rows where `col == val`.
+        /// The `Model` rows where `col == val` — **at most one page of them.**
+        ///
+        /// For the two shapes where one page IS the answer: a `#[lookup_by]`
+        /// column (unique, so at most one row) and a small set the handler wants
+        /// whole. If more rows match than one page holds, this returns a named
+        /// error carrying the remedy — it never returns a prefix that looks
+        /// complete.
+        ///
+        /// For a set that grows with the tenant, use
+        /// [`db_find_by_page`] instead: same filter, plus the cursor that
+        /// continues the listing.
         fn db_find_by<M: $crate::model::Model>(
             col: &str,
             val: $crate::store::Val,
@@ -725,7 +958,10 @@ macro_rules! wit_glue {
             // old offset walk could return a row twice or skip it — so refuse
             // instead of guessing an order no index serves.
             let schema = M::schema();
-            let order = match $crate::store::read_strategy(&schema, col) {
+            // Every arm RETURNS: this verb reads at most one page in all three
+            // strategies, so the match is the whole body rather than a
+            // preamble that picks an order for a loop below it.
+            match $crate::store::read_strategy(&schema, col) {
                 // `#[lookup_by]`: unique, so at most one row — nothing to page.
                 // One bounded read, and the guard is a belt-and-braces check
                 // that the uniqueness the model claims actually held.
@@ -739,13 +975,15 @@ macro_rules! wit_glue {
                                 val: wit_val.clone(),
                                 in_values: None,
                             }],
-                            sort: ::std::vec![],
+                            order_by: ::std::vec![],
                             page: Some($bindings::boogy::platform::store::Page {
                                 limit: SDK_FIND_BATCH,
                                 offset: 0,
                             }),
                             or_groups: ::std::vec![],
-                            skip_total: false,
+                            skip_total: SDK_SKIP_TOTAL,
+                            group_cursor: ::core::option::Option::None,
+                            counters: ::std::vec::Vec::new(),
                         },
                     )
                     .map_err($crate::store::StoreError::from_wit)?;
@@ -755,12 +993,12 @@ macro_rules! wit_glue {
                         "db_find_by",
                         out.len(),
                         res.total_count,
+                        res.has_more,
                         "This column is declared unique (#[lookup_by]) but matched more rows \
                          than one page — the uniqueness does not hold.",
                     )?;
                     return Ok(out);
                 }
-                $crate::store::ReadStrategy::Keyset(order) => order,
                 // No covering order: one page is still correct, so serve it and
                 // stop there. Only continuing past a page needs the order this
                 // model never declared.
@@ -774,13 +1012,15 @@ macro_rules! wit_glue {
                                 val: wit_val.clone(),
                                 in_values: None,
                             }],
-                            sort: ::std::vec![],
+                            order_by: ::std::vec![],
                             page: Some($bindings::boogy::platform::store::Page {
                                 limit: SDK_FIND_BATCH,
                                 offset: 0,
                             }),
                             or_groups: ::std::vec![],
-                            skip_total: false,
+                            skip_total: SDK_SKIP_TOTAL,
+                            group_cursor: ::core::option::Option::None,
+                            counters: ::std::vec::Vec::new(),
                         },
                     )
                     .map_err($crate::store::StoreError::from_wit)?;
@@ -790,6 +1030,7 @@ macro_rules! wit_glue {
                         "db_find_by",
                         out.len(),
                         res.total_count,
+                        res.has_more,
                         &::std::format!(
                             "Declare how {}.{} is listed so it can page safely: add \
                              list_by(filter = \"{}\", newest = \"<a timestamp or sequence \
@@ -800,79 +1041,215 @@ macro_rules! wit_glue {
                     )?;
                     return Ok(out);
                 }
+                // A non-unique column WITH a declared order. The index covers
+                // filter AND order, so this listing CAN be paged safely — which
+                // is exactly why it must not be drained here.
+                //
+                // It used to loop keyset pages until an empty one and
+                // concatenate every page into this `Vec`. That is the same
+                // shape `find_owned` had when it trapped a guest on
+                // `handle_alloc_error` at ~2k rows: safe paging is not a bound,
+                // it is what makes a bound possible. The loop is gone; the
+                // pageable form is `db_find_by_page::<M>(col, val, &page)`,
+                // which hands back the cursor instead of the whole table.
+                $crate::store::ReadStrategy::Keyset(order) => {
+                    let res = $bindings::boogy::platform::store::find(
+                        M::TABLE,
+                        &$bindings::boogy::platform::store::FindOptions {
+                            filters: ::std::vec![$bindings::boogy::platform::store::Filter {
+                                column: col.to_string(),
+                                op: $bindings::boogy::platform::store::FilterOp::Eq,
+                                val: wit_val.clone(),
+                                in_values: None,
+                            }],
+                            order_by: ::std::vec![
+                                $bindings::boogy::platform::store::OrderTerm::Column(
+                                    $bindings::boogy::platform::store::SortBy {
+                                        column: order.column.clone(),
+                                        dir: __boogy_sdk_dir_to_wit(if order.desc {
+                                            $crate::store::SortDir::Desc
+                                        } else {
+                                            $crate::store::SortDir::Asc
+                                        }),
+                                    },
+                                ),
+                            ],
+                            page: Some($bindings::boogy::platform::store::Page {
+                                limit: SDK_FIND_BATCH,
+                                offset: 0,
+                            }),
+                            or_groups: ::std::vec![],
+                            skip_total: SDK_SKIP_TOTAL,
+                            group_cursor: ::core::option::Option::None,
+                            counters: ::std::vec::Vec::new(),
+                        },
+                    )
+                    .map_err($crate::store::StoreError::from_wit)?;
+                    let out: ::std::vec::Vec<M> =
+                        res.rows.iter().map(|r| M::from_row(&to_sdk_row(r))).collect();
+                    $crate::store::refuse_beyond_one_page(
+                        "db_find_by",
+                        out.len(),
+                        res.total_count,
+                        res.has_more,
+                        &::std::format!(
+                            "This listing CAN be paged — {}.{} declares an order over {} — so \
+                             page it instead of draining it: db_find_by_page::<{}>(\"{}\", val, \
+                             &PageRequest::new(limit, token)) returns one page plus the cursor \
+                             that continues it.",
+                            M::TABLE, col, order.column, M::TABLE, col,
+                        ),
+                    )?;
+                    return Ok(out);
+                }
+            }
+        }
+
+        /// One BOUNDED page of the `M` rows where `col == val`, plus the cursor
+        /// the next page resumes from.
+        ///
+        /// The pageable sibling of [`db_find_by`], and the reason that verb no
+        /// longer loops. `db_find_by` answers "this set is small and I want all
+        /// of it, and if I am wrong say so"; this one answers "this set grows
+        /// with the tenant and I will walk it".
+        ///
+        /// Needs the same DECLARED order `db_find_by` needs to page: one index
+        /// covering the filter AND the sort, from `list_by(filter = col, …)` or
+        /// an `index(cols = [col, sort_col])`. Without it there is no stable
+        /// sequence across pages, so this errors and names the declaration to
+        /// add rather than paging by an order no index serves — which would
+        /// silently duplicate or skip rows under concurrent writes.
+        ///
+        /// A `#[lookup_by]` column is unique: there is at most one row and
+        /// nothing to page, so use [`db_find_by`] for that shape.
+        #[allow(dead_code)]
+        fn db_find_by_page<M: $crate::model::Model>(
+            col: &str,
+            val: $crate::store::Val,
+            page: &$crate::pagination::PageRequest,
+        ) -> ::core::result::Result<$crate::pagination::ModelPage<M>, $crate::store::StoreError> {
+            let wit_val = __boogy_val_to_wit(&val);
+            // A token we cannot read is REFUSED, never silently dropped: dropping
+            // it restarts the listing while the caller believes it is continuing
+            // one, so the walk re-serves page one forever. Same rule
+            // `find_owned` enforces, for the same reason.
+            if page.has_unreadable_token() {
+                return Err($crate::store::StoreError::InvalidArgument(
+                    "cursor is not a listing position this service issued; omit it to start the \
+                     listing from the beginning"
+                        .to_string(),
+                ));
+            }
+            let schema = M::schema();
+            let order = match $crate::store::read_strategy(&schema, col) {
+                $crate::store::ReadStrategy::Keyset(o) => o,
+                $crate::store::ReadStrategy::PointLookup => {
+                    return Err($crate::store::StoreError::InvalidArgument(::std::format!(
+                        "{}.{} is declared unique (#[lookup_by]), so it matches at most one row \
+                         and there is nothing to page — use db_find_by::<{}>(..) instead.",
+                        M::TABLE, col, M::TABLE,
+                    )));
+                }
+                $crate::store::ReadStrategy::SinglePageOnly => {
+                    return Err($crate::store::StoreError::InvalidArgument(::std::format!(
+                        "{}.{} has no declared order, so this listing has no stable sequence to \
+                         resume from and cannot be paged. Declare how it is listed: add \
+                         list_by(filter = \"{}\", newest = \"<a timestamp or sequence column>\") \
+                         to the model, or an index over [\"{}\", \"<sort col>\"]. One index must \
+                         cover the filter AND the order.",
+                        M::TABLE, col, col, col,
+                    )));
+                }
             };
             let dir = if order.desc {
                 $crate::store::SortDir::Desc
             } else {
                 $crate::store::SortDir::Asc
             };
-
-            let mut out: ::std::vec::Vec<M> = ::std::vec::Vec::new();
-            let mut cursor: ::core::option::Option<$crate::pagination::Cursor> = None;
-            loop {
-                // Resume strictly after the last row on (sort value, _id) — the
-                // composite boundary, so ties on the sort column cannot repeat
-                // or drop a row.
-                let (extra, kset_or) =
-                    $crate::pagination::keyset_resume_filter(cursor.as_ref(), &order.column, dir);
-                let mut filters = ::std::vec![$bindings::boogy::platform::store::Filter {
-                    column: col.to_string(),
-                    op: $bindings::boogy::platform::store::FilterOp::Eq,
-                    val: wit_val.clone(),
-                    in_values: None,
-                }];
-                filters.extend(extra.iter().map(__boogy_sdk_filter_to_wit));
-                let or_groups: ::std::vec::Vec<::std::vec::Vec<_>> = kset_or
-                    .iter()
-                    .map(|g| g.iter().map(__boogy_sdk_filter_to_wit).collect())
-                    .collect();
-
-                let res = $bindings::boogy::platform::store::find(
-                    M::TABLE,
-                    &$bindings::boogy::platform::store::FindOptions {
-                        filters,
-                        sort: ::std::vec![
+            // Resume strictly after the last row on (sort value, _id) — the
+            // composite boundary, so ties on the sort column cannot repeat or
+            // drop a row.
+            let (extra, kset_or) =
+                $crate::pagination::keyset_resume_filter(page.cursor(), &order.column, dir.clone());
+            let mut filters = ::std::vec![$bindings::boogy::platform::store::Filter {
+                column: col.to_string(),
+                op: $bindings::boogy::platform::store::FilterOp::Eq,
+                val: wit_val.clone(),
+                in_values: None,
+            }];
+            filters.extend(extra.iter().map(__boogy_sdk_filter_to_wit));
+            let or_groups: ::std::vec::Vec<::std::vec::Vec<_>> = kset_or
+                .iter()
+                .map(|g| g.iter().map(__boogy_sdk_filter_to_wit).collect())
+                .collect();
+            let wit_dir = __boogy_sdk_dir_to_wit(dir);
+            let res = $bindings::boogy::platform::store::find(
+                M::TABLE,
+                &$bindings::boogy::platform::store::FindOptions {
+                    filters,
+                    order_by: ::std::vec![
+                        $bindings::boogy::platform::store::OrderTerm::Column(
                             $bindings::boogy::platform::store::SortBy {
                                 column: order.column.clone(),
-                                dir: __boogy_sdk_dir_to_wit(dir),
+                                dir: wit_dir.clone(),
                             },
+                        ),
+                        $bindings::boogy::platform::store::OrderTerm::Column(
                             $bindings::boogy::platform::store::SortBy {
                                 column: "_id".to_string(),
-                                dir: __boogy_sdk_dir_to_wit(dir),
+                                dir: wit_dir,
                             },
-                        ],
-                        page: Some($bindings::boogy::platform::store::Page {
-                            limit: SDK_FIND_BATCH,
-                            offset: 0,
-                        }),
-                        or_groups,
-                        // Keyset never needs the count; the page itself says
-                        // whether another follows.
-                        skip_total: true,
-                    },
-                )
-                .map_err($crate::store::StoreError::from_wit)?;
+                        ),
+                    ],
+                    page: Some($bindings::boogy::platform::store::Page {
+                        limit: page.limit() as u32,
+                        offset: 0,
+                    }),
+                    or_groups,
+                    // Keyset never needs the count: the page itself says whether
+                    // another follows, and asking for the total would walk the
+                    // whole matching set to answer a question the cursor already
+                    // answers. This is the difference between a verb bounded in
+                    // ROWS and one bounded in WORK.
+                    skip_total: SDK_SKIP_TOTAL,
+                    group_cursor: ::core::option::Option::None,
+                    counters: ::std::vec::Vec::new(),
+                },
+            )
+            .map_err($crate::store::StoreError::from_wit)?;
 
-                let n = res.rows.len() as u32;
-                if n == 0 {
-                    break;
+            let rows: ::std::vec::Vec<$crate::store::Row> =
+                res.rows.iter().map(|r| to_sdk_row(r)).collect();
+            // A SHORT page is not the end, and neither is a full one: the host
+            // clamps a page to BOOGY_STORE_MAX_PAGE_ROWS, which can sit below
+            // the requested limit, so "fewer than asked for" and "exactly as
+            // many as asked for" are both produced by the ceiling as well as by
+            // the data. Nothing about the page's SIZE answers the question.
+            //
+            // `has_more` is the host stating it. The host applies the ceiling,
+            // so it is the only party that can — and a cursor is emitted only
+            // when it says more follows, which is what makes the last page
+            // carrying rows also the last request.
+            let next_cursor = match rows.last() {
+                ::core::option::Option::Some(last) if res.has_more => {
+                    let next = $crate::pagination::Cursor {
+                        last_id: last.id().to_string(),
+                        last_value: last.get(&order.column).to_json(),
+                    };
+                    // A page that ends where the previous one did would re-serve
+                    // itself forever; refuse loudly rather than spin or truncate.
+                    $crate::pagination::keyset_advanced(
+                        M::TABLE, &order.column, page.cursor(), &next,
+                    )
+                    .map_err($crate::store::StoreError::Internal)?;
+                    ::core::option::Option::Some($crate::pagination::encode(&next))
                 }
-                if let Some(last) = res.rows.last() {
-                    let row = to_sdk_row(last);
-                    cursor = Some($crate::pagination::Cursor {
-                        last_id: row.id().to_string(),
-                        last_value: row.get(&order.column).to_json(),
-                    });
-                }
-                out.extend(res.rows.iter().map(|r| M::from_row(&to_sdk_row(r))));
-                // Terminate ONLY on an empty page. The host clamps a page to
-                // BOOGY_STORE_MAX_PAGE_ROWS, which can be well below
-                // SDK_FIND_BATCH, so a SHORT page is normal rather than the end
-                // — stopping on `n < SDK_FIND_BATCH` silently truncates to the
-                // host's cap. Costs one extra round trip at the end; returning
-                // a partial set as if it were complete costs correctness.
-            }
-            Ok(out)
+                _ => ::core::option::Option::None,
+            };
+            ::core::result::Result::Ok($crate::pagination::ModelPage {
+                items: rows.iter().map(|r| M::from_row(r)).collect(),
+                next_cursor,
+            })
         }
 
         /// Overwrite the row at `id` with the model's columns.
@@ -954,7 +1331,7 @@ macro_rules! wit_glue {
         /// `key` columns. Returns the row id.
         ///
         /// **Whether concurrent increments compose depends on the column.** When
-        /// `counter` names a `#[counter]` column the store performs a native
+        /// `counter` names a counter column the store performs a native
         /// atomic add on that column's own cell, taking no read-conflict range,
         /// and any number of concurrent increments commit. Any other column is
         /// read-modify-written: the row is read, the sum computed, and the whole
@@ -963,7 +1340,7 @@ macro_rules! wit_glue {
         /// transaction.
         ///
         /// A non-empty `always` is written through that same row update either
-        /// way, so passing one reintroduces the conflict even for a `#[counter]`
+        /// way, so passing one reintroduces the conflict even for a counter
         /// column. `on_insert` avoids that — it is written only by the arm that
         /// creates the row — but it does not buy conflict-freedom on the
         /// read-modify-write arm: there, the counter itself is written through
@@ -1059,6 +1436,29 @@ macro_rules! wit_glue {
         /// If `f` returns `Err`, iteration stops and the error
         /// propagates. The cursor resource is dropped when the loop
         /// ends (the host reaps it).
+        ///
+        /// `counters` names counter columns to merge into every row `f`
+        /// sees — same opt-in `Query::with_counter` gives row listings, on
+        /// the SAME `find-options.counters` wire field, matched to this
+        /// free function's existing "raw types, no builder" shape rather
+        /// than adding one just for this parameter. Empty (every existing
+        /// caller before this parameter existed) merges nothing: a counter
+        /// never arrives in a streamed row unasked. Per-table granularity,
+        /// same as every other opt-in path — naming one counter merges
+        /// every live counter column the table declares.
+        ///
+        /// ```ignore
+        /// for_each_batch(
+        ///     "widgets", vec![], vec![], None, store::SortDir::Asc, 100,
+        ///     &["widgets.touches"],
+        ///     |batch| {
+        ///         for row in batch {
+        ///             let touches = row.int("touches"); // merged, not Nil
+        ///         }
+        ///         Ok(())
+        ///     },
+        /// )?;
+        /// ```
         fn for_each_batch(
             table: &str,
             filters: ::std::vec::Vec<$bindings::boogy::platform::store::Filter>,
@@ -1066,16 +1466,23 @@ macro_rules! wit_glue {
             order_col: ::core::option::Option<&str>,
             dir: $bindings::boogy::platform::store::SortDir,
             batch_size: u32,
+            counters: &[&str],
             mut f: impl ::core::ops::FnMut(&[$crate::store::Row]) -> ::core::result::Result<(), $crate::store::StoreError>,
         ) -> ::core::result::Result<(), $crate::store::StoreError> {
             let cursor = $bindings::boogy::platform::store::open_cursor(
                 table,
                 &$bindings::boogy::platform::store::FindOptions {
                     filters,
-                    sort: vec![],
+                    order_by: vec![],
                     page: None,
                     or_groups,
-                    skip_total: false,
+                    // Inert on this path — `open_cursor` drives its own
+                    // ordering and batching and never reads the field. Named
+                    // anyway so the one construction that would be a real
+                    // exception has to say so.
+                    skip_total: SDK_SKIP_TOTAL,
+                    group_cursor: ::core::option::Option::None,
+                    counters: counters.iter().map(|s| s.to_string()).collect(),
                 },
                 &$bindings::boogy::platform::store::ScanOrder {
                     column: order_col.map(|s| s.to_string()),
@@ -1133,10 +1540,12 @@ macro_rules! wit_glue {
                         val: $bindings::boogy::platform::store::Value::Null,
                         in_values: Some(in_vals),
                     }],
-                    sort: vec![],
+                    order_by: vec![],
                     page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset: 0 }),
                     or_groups: vec![],
-                    skip_total: false,
+                    skip_total: SDK_SKIP_TOTAL,
+                    group_cursor: ::core::option::Option::None,
+                    counters: ::std::vec::Vec::new(),
                 },
             )
             .map_err($crate::store::StoreError::from_wit)?;
@@ -1150,6 +1559,7 @@ macro_rules! wit_glue {
                 "load_has_many",
                 sdk_rows.len(),
                 res.total_count,
+                res.has_more,
                 "Split the parent ids into smaller batches and call it once per batch, or load \
                  the children per parent with a keyset page each.",
             )?;
@@ -1177,10 +1587,12 @@ macro_rules! wit_glue {
                         val,
                         in_values: None,
                     }],
-                    sort: vec![],
+                    order_by: vec![],
                     page: Some($bindings::boogy::platform::store::Page { limit: 1, offset: 0 }),
                     or_groups: vec![],
-                    skip_total: false,
+                    skip_total: SDK_SKIP_TOTAL,
+                    group_cursor: ::core::option::Option::None,
+                    counters: ::std::vec::Vec::new(),
                 },
             ) {
                 Ok(result) => Ok(result.rows.first().map(to_sdk_row)),
@@ -1551,19 +1963,23 @@ macro_rules! wit_glue {
         /// Build an ascending `SortBy` for `column`. Pairs with
         /// [`sort_desc`]; pass a `Vec` of these to `find_rows` for
         /// composite sort (e.g. `vec![sort_desc("score"), sort_asc("_id")]`).
-        fn sort_asc(column: &str) -> $bindings::boogy::platform::store::SortBy {
-            $bindings::boogy::platform::store::SortBy {
-                column: column.to_string(),
-                dir: $bindings::boogy::platform::store::SortDir::Asc,
-            }
+        fn sort_asc(column: &str) -> $bindings::boogy::platform::store::OrderTerm {
+            $bindings::boogy::platform::store::OrderTerm::Column(
+                $bindings::boogy::platform::store::SortBy {
+                    column: column.to_string(),
+                    dir: $bindings::boogy::platform::store::SortDir::Asc,
+                },
+            )
         }
 
         /// Build a descending `SortBy` for `column`. See [`sort_asc`].
-        fn sort_desc(column: &str) -> $bindings::boogy::platform::store::SortBy {
-            $bindings::boogy::platform::store::SortBy {
-                column: column.to_string(),
-                dir: $bindings::boogy::platform::store::SortDir::Desc,
-            }
+        fn sort_desc(column: &str) -> $bindings::boogy::platform::store::OrderTerm {
+            $bindings::boogy::platform::store::OrderTerm::Column(
+                $bindings::boogy::platform::store::SortBy {
+                    column: column.to_string(),
+                    dir: $bindings::boogy::platform::store::SortDir::Desc,
+                },
+            )
         }
 
         /// Build a `Page` (limit + offset). For the first page use
@@ -1579,10 +1995,15 @@ macro_rules! wit_glue {
         /// group (its own AND), and the groups are ORed together. Empty
         /// `or_groups` is exactly [`find_rows`].
         ///
-        /// The two trailing `bool`s are the ones [`find_rows`] hard-codes to
-        /// `false`: `skip_total` is the one trailing bool —
-        /// `skip_total` returns `0` for the count instead of computing it —
-        /// pass `true` whenever you discard the total.
+        /// `skip_total` is the one trailing bool — it returns `None` for the
+        /// count instead of computing it — pass `true` whenever you discard
+        /// the total.
+        ///
+        /// Returns `(rows, total, has_more)`. `total` is `None` exactly when
+        /// `skip_total` was set; `has_more` is the store's own statement about
+        /// this page and is meaningful under either value, so a caller that
+        /// declined the count can still tell a full page from the end of the
+        /// listing.
         ///
         /// The canonical use is composite keyset pagination — AND-only
         /// filters can't express `(score < c) OR (score = c AND id < cursor)`:
@@ -1590,7 +2011,7 @@ macro_rules! wit_glue {
         /// ```ignore
         /// /// `c` / `cursor` are the (score, _id) of the previous page's last row.
         /// fn page_after(c: i64, cursor: i64) -> Result<Vec<Row>, ApiError> {
-        ///     let (page_rows, _total) = find_rows_grouped(
+        ///     let (page_rows, _total, _has_more) = __boogy_find_rows_grouped(
         ///         "posts",
         ///         vec![filter_eq("deleted_at", store::Value::Text(String::new()))], // AND-prefix
         ///         vec![
@@ -1601,37 +2022,78 @@ macro_rules! wit_glue {
         ///         vec![sort_desc("score"), sort_desc("_id")],
         ///         Some(page(20, 0)),
         ///         true,  // skip_total — the total is discarded here
+        ///         vec![],  // counters — no counter merge in this example
         ///     )?;
         ///     Ok(page_rows)
         /// }
         /// ```
-        fn find_rows_grouped(
+        fn __boogy_find_rows_grouped(
             table: &str,
             filters: ::std::vec::Vec<$bindings::boogy::platform::store::Filter>,
             or_groups: ::std::vec::Vec<::std::vec::Vec<$bindings::boogy::platform::store::Filter>>,
-            sort: ::std::vec::Vec<$bindings::boogy::platform::store::SortBy>,
+            sort: ::std::vec::Vec<$bindings::boogy::platform::store::OrderTerm>,
             page: ::core::option::Option<$bindings::boogy::platform::store::Page>,
             skip_total: bool,
-        ) -> ::core::result::Result<(::std::vec::Vec<$crate::store::Row>, u64), $crate::store::StoreError> {
+            counters: ::std::vec::Vec<::std::string::String>,
+        ) -> ::core::result::Result<
+            (::std::vec::Vec<$crate::store::Row>, ::core::option::Option<u64>, bool),
+            $crate::store::StoreError,
+        > {
+            __boogy_find_rows_ranked(table, filters, or_groups, sort, page, skip_total, counters)
+        }
+
+        /// The row read, with an optional ranking by a related total.
+        ///
+        /// `None` is every existing caller and costs one `Option` test — the
+        /// ordinary listing path is untouched.
+        ///
+        /// `counters` is `.with_counter(..)`'s ONLY path onto the wire —
+        /// empty (every free-function caller below) merges nothing; the
+        /// `Query` terminals (`fetch_one`/`fetch_all`/`fetch_all_with_total`/
+        /// `fetch_page`) are the only callers that ever pass a non-empty list,
+        /// sourced from `to_wit_args`.
+        fn __boogy_find_rows_ranked(
+            table: &str,
+            filters: ::std::vec::Vec<$bindings::boogy::platform::store::Filter>,
+            or_groups: ::std::vec::Vec<::std::vec::Vec<$bindings::boogy::platform::store::Filter>>,
+            order_by: ::std::vec::Vec<$bindings::boogy::platform::store::OrderTerm>,
+            page: ::core::option::Option<$bindings::boogy::platform::store::Page>,
+            skip_total: bool,
+            counters: ::std::vec::Vec<::std::string::String>,
+        ) -> ::core::result::Result<
+            (::std::vec::Vec<$crate::store::Row>, ::core::option::Option<u64>, bool),
+            $crate::store::StoreError,
+        > {
             match $bindings::boogy::platform::store::find(
                 table,
-                &$bindings::boogy::platform::store::FindOptions { filters, sort, page, or_groups, skip_total },
+                &$bindings::boogy::platform::store::FindOptions {
+                    filters, order_by, page, or_groups, skip_total,
+                    group_cursor: ::core::option::Option::None,
+                    counters,
+                },
             ) {
                 Ok(result) => {
                     let rows: ::std::vec::Vec<$crate::store::Row> =
                         result.rows.iter().map(|r| to_sdk_row(r)).collect();
-                    Ok((rows, result.total_count))
+                    Ok((rows, result.total_count, result.has_more))
                 }
                 Err(e) => Err($crate::store::StoreError::from_wit(e)),
             }
         }
 
-        /// General-purpose multi-row read with composite filters,
-        /// composite sort, and optional paging. Returns `(rows,
-        /// total_count)` — the count is the total matching rows
-        /// ignoring page limits (useful for showing "X total" in a
-        /// UI). For simpler call sites prefer [`find_rows_by`] or
-        /// [`find_all_rows`]; for an OR clause use [`find_rows_grouped`].
+        /// General-purpose multi-row read with composite filters, composite
+        /// sort, and a REQUIRED page. Returns `(rows, total_count)` — the count
+        /// is the total matching rows ignoring the page limit (useful for
+        /// showing "X total" in a UI).
+        ///
+        /// `page` is a [`page`](page) value, not an `Option`: there is no
+        /// "unpaged" spelling. The `None` this used to accept sent `page: None`
+        /// on the wire, whereupon the store substituted its own ceiling
+        /// (`BOOGY_STORE_MAX_PAGE_ROWS`) and answered with that many rows — the
+        /// same silent truncation the `Query` typestate exists to prevent,
+        /// reached through the free-function surface instead.
+        ///
+        /// For simpler call sites prefer [`find_rows_by`] or [`find_all_rows`].
         ///
         /// ```ignore
         /// // Top-N posts by score in a window, paginated by created_at:
@@ -1639,16 +2101,27 @@ macro_rules! wit_glue {
         ///     "posts",
         ///     vec![filter_eq("parent_post_id", store::Value::Integer(0))],
         ///     vec![sort_desc("score_1h"), sort_asc("_id")],
-        ///     Some(page(20, 0)),
+        ///     page(20, 0),
         /// )?;
         /// ```
         fn find_rows(
             table: &str,
             filters: ::std::vec::Vec<$bindings::boogy::platform::store::Filter>,
-            sort: ::std::vec::Vec<$bindings::boogy::platform::store::SortBy>,
-            page: ::core::option::Option<$bindings::boogy::platform::store::Page>,
+            sort: ::std::vec::Vec<$bindings::boogy::platform::store::OrderTerm>,
+            page: $bindings::boogy::platform::store::Page,
         ) -> ::core::result::Result<(::std::vec::Vec<$crate::store::Row>, u64), $crate::store::StoreError> {
-            find_rows_grouped(table, filters, ::std::vec::Vec::new(), sort, page, false)
+            let (rows, total, _has_more) = __boogy_find_rows_grouped(
+                table,
+                filters,
+                ::std::vec::Vec::new(),
+                sort,
+                Some(page),
+                SDK_WANT_TOTAL,
+                ::std::vec::Vec::new(),
+            )?;
+            // `skip_total` is `SDK_WANT_TOTAL` (false) two lines up, so the
+            // store owes a total.
+            ::core::result::Result::Ok((rows, $crate::store::required_total("find_rows", total)?))
         }
 
         /// Count rows matching `filters` in `table`. Delegates to the
@@ -1661,17 +2134,17 @@ macro_rules! wit_glue {
                 .map_err(|e| $crate::store::StoreError::from_wit(e))
         }
 
-        /// Find every row whose `column` equals `val`. Returns the full
-        /// matching set (no limit). Parallel to [`find_row_by`] but
-        /// returns `Vec<Row>` instead of `Option<Row>`.
+        /// The rows whose `column` equals `val` — **at most one page of them.**
+        /// Parallel to [`find_row_by`] but returns `Vec<Row>` instead of
+        /// `Option<Row>`.
         ///
-        /// Internally paginates across host pages (the host enforces a
-        /// hard per-call ceiling via `BOOGY_STORE_MAX_PAGE_ROWS`, default
-        /// 1000) so all matching rows are always returned, not just the
-        /// first 1000. Mirrors the loop semantics of [`find_all_rows`].
-        ///
-        /// For "all rows matching a filter, indexed query" — typical
-        /// for many-row joins, backer-list lookups, etc.
+        /// It does NOT return the full matching set, and it used to say it did.
+        /// This is the UNTYPED lookup: with only a table name there is no model
+        /// schema to read a declared `list_by` from, so there is no sort column
+        /// it could page along safely. If more rows match than one page holds,
+        /// this returns a named error carrying the remedy rather than a prefix
+        /// that looks complete. The typed equivalents that CAN page are
+        /// `db_find_by_page::<M>(..)` and `auth::find_owned::<M>(..)`.
         ///
         /// ```ignore
         /// fn backers_of(post_id: u64) -> Result<Vec<Row>, ApiError> {
@@ -1695,10 +2168,12 @@ macro_rules! wit_glue {
                         val: val.clone(),
                         in_values: None,
                     }],
-                    sort: vec![],
+                    order_by: vec![],
                     page: Some($bindings::boogy::platform::store::Page { limit: SDK_FIND_BATCH, offset: 0 }),
                     or_groups: vec![],
-                    skip_total: false,
+                    skip_total: SDK_SKIP_TOTAL,
+                    group_cursor: ::core::option::Option::None,
+                    counters: ::std::vec::Vec::new(),
                 },
             )
             .map_err($crate::store::StoreError::from_wit)?;
@@ -1712,6 +2187,7 @@ macro_rules! wit_glue {
                 "find_rows_by",
                 rows.len(),
                 res.total_count,
+                res.has_more,
                 "Use the typed db_find_by::<M>(..) with a model that declares \
                  list_by(filter = \"<this column>\", newest = \"<sort col>\"), or page it \
                  yourself with the Query DSL's keyset terminal.",
@@ -1749,6 +2225,33 @@ macro_rules! wit_glue {
                 in_values: f.in_values.as_ref().map(|vs| {
                     vs.iter().map(__boogy_val_to_wit).collect()
                 }),
+            }
+        }
+
+        /// The one `AggSpec` -> wire converter.
+        ///
+        /// This match used to be written out inline at the ranked-listing call
+        /// site, where it was the only copy and therefore invisible as a
+        /// duplicate. It is a function now because `to_wit_args` needs it too,
+        /// and two hand-written copies of a five-arm enum map is how an arm
+        /// goes missing.
+        fn __boogy_sdk_agg_to_wit(
+            a: &$crate::store::AggSpec,
+        ) -> $bindings::boogy::platform::store::AggSpec {
+            $bindings::boogy::platform::store::AggSpec {
+                kind: match a.kind {
+                    $crate::store::AggFunc::CountAll =>
+                        $bindings::boogy::platform::store::AggFunc::CountAll,
+                    $crate::store::AggFunc::Sum =>
+                        $bindings::boogy::platform::store::AggFunc::Sum,
+                    $crate::store::AggFunc::Avg =>
+                        $bindings::boogy::platform::store::AggFunc::Avg,
+                    $crate::store::AggFunc::Min =>
+                        $bindings::boogy::platform::store::AggFunc::Min,
+                    $crate::store::AggFunc::Max =>
+                        $bindings::boogy::platform::store::AggFunc::Max,
+                },
+                column: a.column.clone(),
             }
         }
 
@@ -1813,6 +2316,7 @@ macro_rules! wit_glue {
         ///         SortDir::Desc,
         ///         cursor,
         ///         limit,
+        ///         vec![],  // counters: no counter merge in this example
         ///         |row| {
         ///             let view = PostView { id: row.id(), title: row.text("title") };
         ///             let last_id    = row.id().to_string();
@@ -1831,6 +2335,7 @@ macro_rules! wit_glue {
             dir: $crate::store::SortDir,
             cursor: ::core::option::Option<$crate::pagination::Cursor>,
             limit: usize,
+            counters: ::std::vec::Vec<::std::string::String>,
             row_to_item_and_cursor: F,
         ) -> ::core::result::Result<$crate::pagination::CursorPage<T>, $crate::error::ApiError>
         where
@@ -1863,50 +2368,57 @@ macro_rules! wit_glue {
             // can't have two distinct _id values to tiebreak on, so the
             // second entry would be a no-op (same query plan, wasted bytes).
             let mut sort = ::std::vec![
-                $bindings::boogy::platform::store::SortBy {
-                    column: sort_col.to_string(),
-                    dir: wit_dir,
-                },
+                $bindings::boogy::platform::store::OrderTerm::Column(
+                    $bindings::boogy::platform::store::SortBy {
+                        column: sort_col.to_string(),
+                        dir: wit_dir,
+                    },
+                ),
             ];
             if sort_col != "_id" {
-                sort.push($bindings::boogy::platform::store::SortBy {
-                    column: "_id".to_string(),
-                    dir: wit_dir,
-                });
+                sort.push($bindings::boogy::platform::store::OrderTerm::Column(
+                    $bindings::boogy::platform::store::SortBy {
+                        column: "_id".to_string(),
+                        dir: wit_dir,
+                    },
+                ));
             }
 
-            // Overfetch by 1 to detect next-page existence.
+            // Ask for the page, not the page plus one.
+            //
+            // This DID overfetch by one and call a short result final. That is
+            // the guest doing the one thing a guest cannot do: the host clamps
+            // a page limit to its own per-call ceiling, so a request for
+            // `limit + 1` comes back holding `limit` whenever the ceiling sits
+            // there — and the listing then ended, silently, at the ceiling. The
+            // host answers the same question from the other side of the clamp,
+            // where the extra row is either present or the data ran out.
             let wit_page = Some($bindings::boogy::platform::store::Page {
-                limit: (limit + 1) as u32,
+                limit: limit as u32,
                 offset: 0,
             });
 
             // Execute the query (converts rows to SDK Row via to_sdk_row inside).
-            // Keyset pagination derives "has next page" from the limit+1 overfetch,
-            // never from the total — so skip the count entirely.
-            let (rows, _total) = find_rows_grouped(table, wit_filters, wit_or_groups, sort, wit_page, true)
+            // Keyset pagination derives "has next page" from `has_more`, never
+            // from the total — so skip the count entirely.
+            let (rows, _total, has_more) = __boogy_find_rows_grouped(table, wit_filters, wit_or_groups, sort, wit_page, true, counters)
                 .map_err($crate::error::ApiError::from)?;
 
             // Map each row to (T, Cursor) before slicing.
             let mapped: ::std::vec::Vec<(T, $crate::pagination::Cursor)> =
                 rows.iter().map(&row_to_item_and_cursor).collect();
 
-            // Slice and emit next_cursor.
-            let page = if mapped.len() > limit {
-                let kept: ::std::vec::Vec<(T, $crate::pagination::Cursor)> =
-                    mapped.into_iter().take(limit).collect();
-                let last_cursor = kept.last()
-                    .expect("limit > 0 and kept non-empty")
-                    .1
-                    .clone();
-                let items: ::std::vec::Vec<T> = kept.into_iter().map(|(t, _)| t).collect();
-                $crate::pagination::CursorPage {
+            // Emit next_cursor when — and only when — the store says more
+            // follows. Nothing is sliced off here any more: every row that came
+            // back is a row of this page.
+            let last_cursor = mapped.last().map(|(_, c)| c.clone());
+            let items: ::std::vec::Vec<T> = mapped.into_iter().map(|(t, _)| t).collect();
+            let page = match last_cursor {
+                Some(c) if has_more => $crate::pagination::CursorPage {
                     items,
-                    next_cursor: Some($crate::pagination::encode(&last_cursor)),
-                }
-            } else {
-                let items: ::std::vec::Vec<T> = mapped.into_iter().map(|(t, _)| t).collect();
-                $crate::pagination::CursorPage { items, next_cursor: None }
+                    next_cursor: Some($crate::pagination::encode(&c)),
+                },
+                _ => $crate::pagination::CursorPage { items, next_cursor: None },
             };
 
             Ok(page)
@@ -1916,7 +2428,7 @@ macro_rules! wit_glue {
         // Typed Query DSL (slice a). The QueryArgs data + builder methods
         // live in `boogy_sdk::query`; this Query newtype wraps them and
         // adds the four terminal methods that call the macro-emitted WIT
-        // primitives (find_rows_grouped, count_rows, keyset_paginate).
+        // primitives (__boogy_find_rows_grouped, count_rows, keyset_paginate).
         // ---------------------------------------------------------------
 
         /// Typed query-builder. Wraps [`boogy_sdk::query::QueryArgs`] and
@@ -1925,120 +2437,326 @@ macro_rules! wit_glue {
         /// the query against the WIT store.
         ///
         /// ```ignore
-        /// use boogy_sdk::pagination::{Cursor, CursorPage};
-        /// use boogy_sdk::store::SortDir;
+        /// use boogy_sdk::pagination::CursorPage;
         ///
         /// #[derive(Serialize)]
         /// struct PostView { id: u64, title: String }
         ///
-        /// fn list_replies(c: Option<Cursor>) -> Result<CursorPage<PostView>, ApiError> {
-        ///     let page = Query::on("posts")
-        ///         .where_eq("parent_post_id", 0)
-        ///         .where_eq("deleted_at", "")
-        ///         .keyset_by("created_at", SortDir::Desc).limit(20).cursor(c)
+        /// fn list_replies(cursor: Option<String>) -> Result<CursorPage<PostView>, ApiError> {
+        ///     let page = Query::on(Post::TABLE)
+        ///         .filter(Post::room_id.eq(7_i64))
+        ///         .filter(Post::deleted_at.is_null())
+        ///         .order(Post::created_at.desc())   // the ordering IS the cursor key
+        ///         .limit(20)
+        ///         .cursor(cursor)                   // the opaque token, no decode
         ///         .fetch_page(|row| PostView { id: row.id(), title: row.text("title") })?;
         ///     Ok(page)
         /// }
         /// ```
-        pub struct Query(pub $crate::query::QueryArgs);
+        /// The typestate parameter is the row ceiling. A query starts
+        /// [`Unbounded`](boogy_sdk::query::Unbounded) and `.limit(n)` moves it to
+        /// [`Bounded`](boogy_sdk::query::Bounded); the row-materializing terminals
+        /// (`fetch_all`, `fetch_all_with_total`) exist only on the latter, so
+        /// "read the whole table into the guest's heap" is a compile error rather
+        /// than a page the host silently truncates. `fetch_one`, `count`,
+        /// `fetch_page` and the aggregate terminals are bounded by their own
+        /// construction and stay available in both states.
+        pub struct Query<B = $crate::query::Unbounded>(
+            pub $crate::query::QueryArgs,
+            ::core::marker::PhantomData<B>,
+        );
 
-        impl Query {
+        /// Build and issue the WIT `aggregate` call for a query's aggregate
+        /// clauses. Separate from the terminals so both share one conversion.
+        fn __boogy_aggregate(
+            args: &$crate::query::QueryArgs,
+        ) -> ::core::result::Result<
+            $bindings::boogy::platform::store::AggregateResult,
+            $crate::error::ApiError,
+        > {
+            let to_spec = |s: &$crate::store::AggSpec| {
+                $bindings::boogy::platform::store::AggSpec {
+                    kind: match s.kind {
+                        $crate::store::AggFunc::CountAll =>
+                            $bindings::boogy::platform::store::AggFunc::CountAll,
+                        $crate::store::AggFunc::Sum =>
+                            $bindings::boogy::platform::store::AggFunc::Sum,
+                        $crate::store::AggFunc::Avg =>
+                            $bindings::boogy::platform::store::AggFunc::Avg,
+                        $crate::store::AggFunc::Min =>
+                            $bindings::boogy::platform::store::AggFunc::Min,
+                        $crate::store::AggFunc::Max =>
+                            $bindings::boogy::platform::store::AggFunc::Max,
+                    },
+                    column: s.column.clone(),
+                }
+            };
+            // Through the SAME lowering the row path uses. Reading
+            // `base_filters` directly here dropped every expression predicate,
+            // which on a principal-scoped aggregate returned other people's
+            // totals — caught by `checksums`, not by review.
+            let (__lowered_leaves, __lowered_groups) = args.lower_predicate()?;
+            let opts = $bindings::boogy::platform::store::AggregateOptions {
+                filters: __lowered_leaves.iter().map(__boogy_sdk_filter_to_wit).collect(),
+                or_groups: __lowered_groups
+                    .iter()
+                    .map(|g| g.iter().map(__boogy_sdk_filter_to_wit).collect())
+                    .collect(),
+                group_by: args.group_by.clone(),
+                aggregates: args.aggregates.iter().map(to_spec).collect(),
+                having: args
+                    .having
+                    .iter()
+                    .map(|h| $bindings::boogy::platform::store::AggFilter {
+                        agg: to_spec(&h.agg),
+                        op: __boogy_filter_op_to_wit(&h.op),
+                        val: __boogy_val_to_wit(&h.val),
+                    })
+                    .collect(),
+                // From `agg_sort()`, which reads BOTH the expression ordering
+                // and the older field. Reading only the latter silently dropped
+                // `.order(agg::count_all().desc())` and returned the ranking
+                // ASCENDING — an inversion that looks like a plausible list.
+                order_by: args
+                    .agg_sort()
+                    .map(|(a, dir)| $bindings::boogy::platform::store::OrderTerm::Aggregate(
+                        $bindings::boogy::platform::store::AggSort {
+                            agg: to_spec(&a),
+                            dir: __boogy_sdk_dir_to_wit(dir),
+                        },
+                    ))
+                    .into_iter()
+                    .collect(),
+                page: args.limit.map(|l| $bindings::boogy::platform::store::Page {
+                    limit: l as u32,
+                    offset: args.offset,
+                }),
+                group_cursor: args.cursor_token.clone(),
+                want_group_cursor: args.want_group_cursor,
+            };
+            $bindings::boogy::platform::store::aggregate(&args.table, &opts)
+                .map_err(|e| {
+                    use $crate::store::IntoStoreError;
+                    $crate::error::ApiError::from(e.into_store_error())
+                })
+        }
+
+        impl Query<$crate::query::Unbounded> {
             // -- Construction --
+            //
+            // A new query has stated no ceiling, so it starts unbounded. The
+            // only transition out is `.limit(n)`.
 
             pub fn on(table: &str) -> Self {
-                Self($crate::query::QueryArgs::on(table))
+                Self($crate::query::QueryArgs::on(table), ::core::marker::PhantomData)
             }
+        }
+
+        impl<B> Query<B> {
 
             // -- Filter chaining (thin wrappers) --
 
-            pub fn where_eq<V: $crate::query::IntoVal>(self, col: &str, val: V) -> Self {
-                Self(self.0.where_eq(col, val))
-            }
-            pub fn where_neq<V: $crate::query::IntoVal>(self, col: &str, val: V) -> Self {
-                Self(self.0.where_neq(col, val))
-            }
-            pub fn where_gt<V: $crate::query::IntoVal>(self, col: &str, val: V) -> Self {
-                Self(self.0.where_gt(col, val))
-            }
-            pub fn where_gte<V: $crate::query::IntoVal>(self, col: &str, val: V) -> Self {
-                Self(self.0.where_gte(col, val))
-            }
-            pub fn where_lt<V: $crate::query::IntoVal>(self, col: &str, val: V) -> Self {
-                Self(self.0.where_lt(col, val))
-            }
-            pub fn where_lte<V: $crate::query::IntoVal>(self, col: &str, val: V) -> Self {
-                Self(self.0.where_lte(col, val))
-            }
-            pub fn where_like<V: $crate::query::IntoVal>(self, col: &str, pattern: V) -> Self {
-                Self(self.0.where_like(col, pattern))
-            }
-            pub fn where_not_like<V: $crate::query::IntoVal>(self, col: &str, pattern: V) -> Self {
-                Self(self.0.where_not_like(col, pattern))
-            }
-            pub fn where_null(self, col: &str) -> Self { Self(self.0.where_null(col)) }
-            pub fn where_not_null(self, col: &str) -> Self { Self(self.0.where_not_null(col)) }
-            pub fn where_in<I, V>(self, col: &str, vals: I) -> Self
+            // -- Aggregates. `count_all`, not `count`: `count()` is already a
+            // terminal returning Result<u64>, and one name cannot be both that
+            // and a `-> Self` selector.
+            /// Group the aggregates by a column — and, in doing so, state that
+            /// this query's result size is now DATA-DEPENDENT.
+            ///
+            /// The return type is the enforcement: an ungrouped aggregate is one
+            /// group whatever the table holds, a grouped one is a group per
+            /// distinct value, and only the second needs a ceiling. So this moves
+            /// a query that stated no `.limit(n)` into
+            /// [`Grouped`](boogy_sdk::query::Grouped), where `fetch_groups` does
+            /// not exist. A query that already stated one stays bounded, so
+            /// `.limit(20).group_by(c)` and `.group_by(c).limit(20)` are the same
+            /// query in the same state.
+            pub fn group_by(self, column: &str) -> Query<<B as $crate::query::AfterGroupBy>::Out>
             where
-                I: ::core::iter::IntoIterator<Item = V>,
-                V: $crate::query::IntoVal,
+                B: $crate::query::AfterGroupBy,
             {
-                Self(self.0.where_in(col, vals))
+                Query(self.0.group_by(column), ::core::marker::PhantomData)
             }
-
-            // -- OR-of-AND --
-
-            pub fn or<F>(self, build: F) -> Self
-            where
-                F: ::core::ops::FnOnce(Self) -> Self,
-            {
-                // Wrap the user's closure to operate on QueryArgs internally,
-                // then re-wrap.
-                Self(self.0.or(|args| build(Self(args)).0))
+            pub fn sum(self, column: &str) -> Self { Self(self.0.sum(column), ::core::marker::PhantomData) }
+            pub fn avg(self, column: &str) -> Self { Self(self.0.avg(column), ::core::marker::PhantomData) }
+            pub fn min(self, column: &str) -> Self { Self(self.0.min(column), ::core::marker::PhantomData) }
+            pub fn max(self, column: &str) -> Self { Self(self.0.max(column), ::core::marker::PhantomData) }
+            pub fn count_all(self) -> Self { Self(self.0.count_all(), ::core::marker::PhantomData) }
+            pub fn having<V: $crate::query::IntoVal>(
+                self,
+                aggregate: $crate::store::AggSpec,
+                op: $crate::store::FilterOp,
+                val: V,
+            ) -> Self {
+                Self(self.0.having(aggregate, op, val), ::core::marker::PhantomData)
             }
 
             // -- Sort --
 
-            pub fn order_by(self, col: &str, dir: $crate::store::SortDir) -> Self {
-                Self(self.0.order_by(col, dir))
+            /// Keep the rows this expression matches. Repeated calls AND
+            /// together.
+            ///
+            /// ```ignore
+            /// let room_id = 7_i64;
+            /// Query::on(Post::TABLE)
+            ///     .filter(Post::room_id.eq(room_id))
+            ///     .filter(Post::deleted_at.is_null())
+            ///     .limit(50)          // `fetch_all` has no unbounded form
+            ///     .fetch_all()?;
+            /// ```
+            pub fn filter(self, e: $crate::expr::Expr) -> Self {
+                Self(self.0.filter(e), ::core::marker::PhantomData)
             }
-            pub fn order_by_asc(self, col: &str) -> Self { Self(self.0.order_by_asc(col)) }
-            pub fn order_by_desc(self, col: &str) -> Self { Self(self.0.order_by_desc(col)) }
 
+            /// Order the result — by a column, or by an aggregate over a
+            /// related table. The ordering is also what a cursor is built from.
+            ///
+            /// ```ignore
+            /// Query::on(Post::TABLE)
+            ///     .order(Post::created_at.desc())               // newest first
+            ///     .limit(20)
+            ///     .fetch_all()?;
+            /// Query::on(Post::TABLE)
+            ///     .order(agg::sum(PostVote::DIRECTION).desc())  // best first
+            ///     .limit(20)
+            ///     .fetch_all()?;
+            /// ```
+            pub fn order(self, o: $crate::expr::Order) -> Self {
+                Self(self.0.order(o), ::core::marker::PhantomData)
+            }
+
+            /// Order by a column, or by an aggregate over a related table.
+            /// One verb, because `ORDER BY` is one clause:
+            ///
+            /// ```ignore
+            /// Query::on(Post::TABLE)
+            ///     .order(Post::created_at.desc())               // newest first
+            ///     .limit(20)
+            ///     .fetch_all()?;
+            /// Query::on(Post::TABLE)
+            ///     .order(agg::sum(PostVote::DIRECTION).desc())  // best first
+            ///     .limit(20)
+            ///     .fetch_all()?;
+            /// ```
             // -- Pagination --
 
-            pub fn limit(self, n: usize) -> Self { Self(self.0.limit(n)) }
-            pub fn offset(self, n: u32) -> Self { Self(self.0.offset(n)) }
-            pub fn cursor(self, c: ::core::option::Option<$crate::pagination::Cursor>) -> Self {
-                Self(self.0.cursor(c))
+            /// State the ceiling on how many rows this listing may materialize.
+            ///
+            /// This is also the **state transition**: it is what makes
+            /// `fetch_all` / `fetch_all_with_total` exist on the query at all.
+            /// `n` is the number of rows the handler is prepared to hold in a
+            /// 32 MiB guest heap and to serialize into one response — it is not
+            /// a hint, and there is no value meaning "all of them".
+            ///
+            /// If the matching set is open-ended (it grows with the tenant),
+            /// this is the wrong verb: pair `.limit(..)` with `.cursor(..)` and
+            /// end on [`fetch_page`](Self::fetch_page), which hands the caller
+            /// the token that continues the listing instead of truncating it.
+            pub fn limit(self, n: usize) -> Query<$crate::query::Bounded> {
+                Query(self.0.limit(n), ::core::marker::PhantomData)
             }
-            pub fn keyset_by(self, col: &str, dir: $crate::store::SortDir) -> Self {
-                Self(self.0.keyset_by(col, dir))
+            pub fn offset(self, n: u32) -> Self { Self(self.0.offset(n), ::core::marker::PhantomData) }
+            /// Where this listing resumes — the opaque token from the previous
+            /// page's `next_cursor`, straight from the query string.
+            ///
+            /// One verb for both kinds of listing, and no `decode` at the call
+            /// site: a row page seeks from the position inside the token, a
+            /// ranked group page uses it to pin the generation of the ordering
+            /// it started in.
+            pub fn cursor(self, token: ::core::option::Option<::std::string::String>) -> Self {
+                Self(self.0.cursor(token), ::core::marker::PhantomData)
             }
 
-            // -- Internal: convert QueryArgs to the WIT-typed args find_rows_grouped expects --
+            // -- Counters --
 
-            fn to_wit_args(&self) -> (
+            /// Merge a counter's cells into this query's rows.
+            ///
+            /// A counter never arrives unasked: without this call the query
+            /// reads no counter cells at all, however many counter columns
+            /// the table declares. With it, the cells are read as ONE
+            /// batch inside the same transaction the page itself uses.
+            ///
+            /// `name` is the counter's declared name (`Counter::NAME` —
+            /// `"<table>.<column>"` for an `of = Model` counter). `key_cols`
+            /// names the columns whose PER-ROW values supply the counter's
+            /// key: pass `&[]` for a counter keyed by the row's own id, which
+            /// every row carries. Repeat for more than one counter.
+            ///
+            /// ```ignore
+            /// let page = Query::on(Room::TABLE)
+            ///     .filter(Room::visibility.eq("public".to_string()))
+            ///     .with_counter("rooms.post_count", &[])
+            ///     .fetch_page(|row| row.int("post_count"))?;
+            /// ```
+            pub fn with_counter(self, name: &str, key_cols: &[&str]) -> Self {
+                Self(self.0.with_counter(name, key_cols), ::core::marker::PhantomData)
+            }
+
+            // -- Internal: convert QueryArgs to the WIT-typed args __boogy_find_rows_grouped expects --
+
+            fn to_wit_args(&self) -> ::core::result::Result<(
                 ::std::vec::Vec<$bindings::boogy::platform::store::Filter>,
                 ::std::vec::Vec<::std::vec::Vec<$bindings::boogy::platform::store::Filter>>,
-                ::std::vec::Vec<$bindings::boogy::platform::store::SortBy>,
+                ::std::vec::Vec<$bindings::boogy::platform::store::OrderTerm>,
                 ::core::option::Option<$bindings::boogy::platform::store::Page>,
-            ) {
-                let wit_filters: ::std::vec::Vec<_> = self.0.base_filters.iter()
+                ::std::vec::Vec<::std::string::String>,
+            ), $crate::error::ApiError> {
+                // THE enforcement site for `counter_build_refusal` — every
+                // terminal (`fetch_one`/`fetch_all`/`fetch_all_with_total`/
+                // `fetch_page`/`find_many`) funnels through here, so a
+                // `.with_counter(..)` naming a key column this query never
+                // establishes is refused before ANY of them dispatch, not
+                // just some. Same enforcement shape `fetch_one_group` uses
+                // for `single_group_refusal` — checked inline, at the one
+                // place every caller passes through, not duplicated per
+                // terminal.
+                if let Some(msg) = self.0.counter_build_refusal() {
+                    return ::core::result::Result::Err($crate::error::ApiError::internal(msg));
+                }
+                // Expression predicates lower onto the wire's flat shape here.
+                // A shape it cannot carry is refused rather than dropped, so a
+                // clause never silently widens the query.
+                let (leaves, or_groups) = self.0.lower_predicate()
+                    .expect("predicate shape checked by the terminal");
+                let wit_filters: ::std::vec::Vec<_> = leaves.iter()
                     .map(__boogy_sdk_filter_to_wit).collect();
-                let wit_or_groups: ::std::vec::Vec<_> = self.0.or_groups.iter()
+                let wit_or_groups: ::std::vec::Vec<_> = or_groups.iter()
                     .map(|grp| grp.iter().map(__boogy_sdk_filter_to_wit).collect())
                     .collect();
-                let wit_sort: ::std::vec::Vec<_> = self.0.sort.iter()
-                    .map(|(col, dir)| $bindings::boogy::platform::store::SortBy {
-                        column: col.clone(),
-                        dir: __boogy_sdk_dir_to_wit(*dir),
+                // `ordering` maps 1:1 onto the wire's `order-term`, which is
+                // the whole reason the wire carries that type: one clause, one
+                // list, and no place for a column ordering and an aggregate
+                // ordering to be tracked separately and disagree.
+                let wit_sort: ::std::vec::Vec<_> = self.0.ordering.iter()
+                    .map(|o| match o {
+                        $crate::expr::Order::Column(col, dir) =>
+                            $bindings::boogy::platform::store::OrderTerm::Column(
+                                $bindings::boogy::platform::store::SortBy {
+                                    column: col.clone(),
+                                    dir: __boogy_sdk_dir_to_wit(*dir),
+                                },
+                            ),
+                        $crate::expr::Order::Aggregate(a, dir) =>
+                            $bindings::boogy::platform::store::OrderTerm::Aggregate(
+                                $bindings::boogy::platform::store::AggSort {
+                                    agg: __boogy_sdk_agg_to_wit(a),
+                                    dir: __boogy_sdk_dir_to_wit(*dir),
+                                },
+                            ),
                     })
                     .collect();
                 let wit_page = self.0.limit.map(|lim| $bindings::boogy::platform::store::Page {
                     limit: lim as u32,
                     offset: self.0.offset,
                 });
-                (wit_filters, wit_or_groups, wit_sort, wit_page)
+                // Every `.with_counter(..)` name, in call order. Per-table on
+                // the host (naming one merges every live counter column on
+                // the table, not just the named one — see the store's own
+                // opt-in read-merge doc), so this list only needs to be
+                // non-empty to opt in; duplicates across repeated calls cost
+                // nothing extra.
+                let wit_counters: ::std::vec::Vec<::std::string::String> =
+                    self.0.counters.iter().map(|c| c.name.clone()).collect();
+                ::core::result::Result::Ok((wit_filters, wit_or_groups, wit_sort, wit_page, wit_counters))
             }
 
             // -- Terminal methods --
@@ -2053,60 +2771,169 @@ macro_rules! wit_glue {
                 $crate::error::ApiError,
             > {
                 self.0 = self.0.for_fetch_one();
-                let (f, og, s, p) = self.to_wit_args();
+                let (f, og, s, p, counters) = self.to_wit_args()?;
                 // Discards the total → skip the count.
-                let (rows, _total) = find_rows_grouped(&self.0.table, f, og, s, p, true)
+                let (rows, _total, _has_more) = __boogy_find_rows_grouped(&self.0.table, f, og, s, p, true, counters)
                     .map_err($crate::error::ApiError::from)?;
                 Ok(rows.into_iter().next())
             }
 
-            /// Fetch all matching rows (subject to `limit` if set).
-            pub fn fetch_all(self) -> ::core::result::Result<
-                ::std::vec::Vec<$crate::store::Row>,
-                $crate::error::ApiError,
-            > {
-                // Discards the total → skip the count (don't route through
-                // `fetch_all_with_total`, which must compute it).
-                let (f, og, s, p) = self.to_wit_args();
-                let (rows, _total) = find_rows_grouped(&self.0.table, f, og, s, p, true)
-                    .map_err($crate::error::ApiError::from)?;
-                Ok(rows)
-            }
-
-            /// Fetch all matching rows + the total count (ignoring page).
-            pub fn fetch_all_with_total(self) -> ::core::result::Result<
-                (::std::vec::Vec<$crate::store::Row>, u64),
-                $crate::error::ApiError,
-            > {
-                let (f, og, s, p) = self.to_wit_args();
-                find_rows_grouped(&self.0.table, f, og, s, p, false)
-                    .map_err($crate::error::ApiError::from)
-            }
-
             /// Count matching rows. Does NOT materialize rows.
             ///
-            /// **NOTE:** ignores `.or(...)`, `.order_by(...)`, `.limit/.offset/.cursor` —
-            /// only the base AND-filters are sent to the host. The WIT `count`
-            /// op is filters-only. If your count needs OR semantics, fetch
-            /// the rows and count them, or restructure with an explicit
-            /// `where_in`/composite predicate.
+            /// Ordering and paging are ignored — they cannot change a count.
+            ///
+            /// An **OR predicate is REFUSED**, not dropped. The WIT `count` op
+            /// takes a conjunction only, and a count is the one terminal whose
+            /// answer carries no evidence of what it counted, so silently
+            /// ignoring a clause would return a number that looks right and is
+            /// not. Count the length of a fetch instead, or restructure the
+            /// predicate with `is_in`.
             pub fn count(self) -> ::core::result::Result<u64, $crate::error::ApiError> {
                 // count_filters() encodes the "WIT count is filters-only"
                 // contract — unit-tested in boogy_sdk::query::tests.
-                let wit_filters: ::std::vec::Vec<_> = self.0.count_filters().iter()
+                let wit_filters: ::std::vec::Vec<_> = self.0.count_filters()?.iter()
                     .map(__boogy_sdk_filter_to_wit).collect();
                 count_rows(&self.0.table, wit_filters)
                     .map_err($crate::error::ApiError::from)
             }
 
-            /// Keyset-paginated fetch. Auto-extracts the cursor value from
-            /// the row using the keyset column set by `.keyset_by(col, dir)`.
-            /// User closure just maps row → item.
+            /// One page of a ranked group listing, with the token that
+            /// continues it.
+            ///
+            /// The page type is [`CursorPage`], the same one row listings
+            /// return, so a client pages groups exactly as it pages rows: read
+            /// `next_cursor`, hand it back as `?cursor=…`, stop when it is
+            /// absent.
+            ///
+            /// What it adds over `fetch_groups` is that the pages agree with
+            /// each other. A ranked listing is ordered by a total, and totals
+            /// move while a client is reading; `next_cursor` names the version
+            /// of the ordering this page came from, so the following page
+            /// continues it rather than re-ranking against a newer one.
+            ///
+            /// Needs an `.order(agg::….desc())` and a `.limit(..)` — without an ordering
+            /// there is no traversal to continue, and the call errors rather
+            /// than returning a page whose cursor would mean nothing.
+            ///
+            /// ```ignore
+            /// let room_id = 7_i64;
+            /// let token: Option<String> = None;
+            /// let page = Query::on(PostVote::TABLE)
+            ///     .filter(PostVote::room_id.eq(room_id))
+            ///     .group_by(PostVote::POST_ID)
+            ///     .sum(PostVote::DIRECTION)
+            ///     .order(agg::sum(PostVote::DIRECTION).desc())
+            ///     .limit(20)
+            ///     .cursor(token)
+            ///     .fetch_group_page(|g| (
+            ///         g.key().map(Val::as_int).unwrap_or(0),
+            ///         g.sum(PostVote::DIRECTION),
+            ///     ))?;
+            /// ```
+            pub fn fetch_group_page<T, F>(self, group_to_item: F) -> ::core::result::Result<
+                $crate::pagination::CursorPage<T>,
+                $crate::error::ApiError,
+            >
+            where
+                T: ::serde::Serialize,
+                F: ::core::ops::Fn(&$crate::store::Group) -> T,
+            {
+                // Through `agg_sort()`, never the raw field: the aggregate
+                // ordering can arrive from `.order(agg::….desc())` (which lands
+                // in `ordering`) and the accessor is what knows that. Reading
+                // retired-spelling: `order_by_agg` was deleted
+                // 2026-08-17; ordering arrives as `order-term` values
+                // through `agg_sort()`. This records the bug that
+                // deletion caused.
+                // `order_by_agg` directly saw only the pre-expression verb, so
+                // once that verb was deleted this refused every ranked page —
+                // and it compiled clean, because a field that is merely never
+                // written is not a type error.
+                if self.0.agg_sort().is_none() || self.0.limit.is_none() {
+                    return ::core::result::Result::Err($crate::error::ApiError::internal(
+                        "fetch_group_page needs an aggregate ordering \
+                         (.order(agg::….desc())) and a .limit(..): a listing \
+                         with no ordering has no next page to continue to",
+                    ));
+                }
+                let specs = self.0.aggregates.clone();
+                if specs.is_empty() {
+                    return ::core::result::Result::Err($crate::error::ApiError::internal(
+                        "this query selects no aggregates; add .sum(..)/.count_all()/…                          before fetch_group_page",
+                    ));
+                }
+                let mut args = self.0;
+                // The terminal declares the intent, not the caller: asking for a
+                // page IS asking for something to continue from.
+                args.want_group_cursor = true;
+                let out = __boogy_aggregate(&args)?;
+                let items = out
+                    .groups
+                    .iter()
+                    .map(|g| {
+                        group_to_item(&$crate::store::Group::new(
+                            g.keys.iter().map(__boogy_wit_to_val).collect(),
+                            g.values
+                                .iter()
+                                .map(|v| v.as_ref().map(__boogy_wit_to_val))
+                                .collect(),
+                            specs.clone(),
+                        ))
+                    })
+                    .collect();
+                ::core::result::Result::Ok($crate::pagination::CursorPage {
+                    items,
+                    next_cursor: out.next_group_cursor,
+                })
+            }
+
+            /// The single group an ungrouped aggregate produces.
+            ///
+            /// Errors if the query has a `group_by`, rather than silently
+            /// returning whichever group happened to come first.
+            pub fn fetch_one_group(self) -> ::core::result::Result<
+                $crate::store::Group,
+                $crate::error::ApiError,
+            > {
+                if !self.0.group_by.is_empty() {
+                    return ::core::result::Result::Err($crate::error::ApiError::internal(
+                        "fetch_one_group is for a query with no group_by; use                          fetch_groups",
+                    ));
+                }
+                // Through the shared helper, NOT through `fetch_groups`: that
+                // terminal is gated on `BoundedGroups`, which `Grouped` does not
+                // satisfy, and this one is reachable from every state (it is the
+                // ungrouped shape, and its own check above is what refuses a
+                // grouped query).
+                let mut groups = __boogy_groups(self.0, |g: &$crate::store::Group| g.clone())?;
+                // The store returns exactly one row for an ungrouped
+                // aggregate. If that ever stops being true this is a platform
+                // bug, and reporting it beats handing back a default.
+                if groups.len() == 1 {
+                    ::core::result::Result::Ok(groups.remove(0))
+                } else {
+                    ::core::result::Result::Err($crate::error::ApiError::internal(::std::format!(
+                        "an ungrouped aggregate must return exactly one group; got {}",
+                        groups.len()
+                    )))
+                }
+            }
+
+            /// Cursor-paginated fetch. **The ordering is the cursor key** — the
+            /// resume value comes from the column `.order(..)` named, so there is
+            /// no second verb to state it with and nothing to keep in step. The
+            /// user closure just maps row → item.
+            ///
+            /// A ranked ordering (`.order(agg::….desc())`) pages through the
+            /// ranked path instead, whose cursor pins the GENERATION of the
+            /// ordering rather than a row key — same call, different mechanism,
+            /// which is the platform's choice to make.
             ///
             /// Defaults to `limit = 20` if `.limit()` was not chained.
             ///
-            /// Returns `ApiError::internal("fetch_page requires .keyset_by()")`
-            /// if called without an earlier `.keyset_by(...)` call.
+            /// Errors if the query carries no ordering at all: there is then
+            /// nothing to page by, and a cursor built from it would mean
+            /// nothing.
             pub fn fetch_page<T, F>(self, row_to_item: F) -> ::core::result::Result<
                 $crate::pagination::CursorPage<T>,
                 $crate::error::ApiError,
@@ -2115,28 +2942,273 @@ macro_rules! wit_glue {
                 T: ::serde::Serialize,
                 F: ::core::ops::Fn(&$crate::store::Row) -> T,
             {
-                let (keyset_col, dir) = match &self.0.keyset_mode {
+                // Checked ONCE, ahead of both branches below: neither goes
+                // through `to_wit_args` (the ranked branch builds its own
+                // `FindOptions`; the keyset branch lowers its predicate
+                // directly), so `to_wit_args`'s inline enforcement of
+                // `counter_build_refusal` does not cover this terminal on its
+                // own — this is `fetch_page`'s own copy of the SAME check,
+                // the same shape `fetch_one_group` keeps its own copy of
+                // `single_group_refusal`'s check rather than relying on a
+                // shared call site to reach it.
+                if let Some(msg) = self.0.counter_build_refusal() {
+                    return ::core::result::Result::Err($crate::error::ApiError::internal(msg));
+                }
+                let wit_counters: ::std::vec::Vec<::std::string::String> =
+                    self.0.counters.iter().map(|c| c.name.clone()).collect();
+
+                // A ranked listing has no column to key on — its order comes
+                // from a total the children carry — so it pages through the
+                // ranked path, whose cursor pins the generation of the ordering
+                // rather than a row key.
+                if let Some((a, dir)) = self.0.related_order() {
+                    let limit = self.0.limit.unwrap_or(20);
+                    let (f, og, s_, p, counters) = self.to_wit_args()?;
+                    let res = $bindings::boogy::platform::store::find(
+                        &self.0.table,
+                        &$bindings::boogy::platform::store::FindOptions {
+                            filters: f,
+                            // Already carries the aggregate term.
+                            order_by: s_,
+                            page: p.or(Some($bindings::boogy::platform::store::Page {
+                                limit: limit as u32,
+                                offset: 0,
+                            })),
+                            or_groups: og,
+                            skip_total: SDK_SKIP_TOTAL,
+                            group_cursor: self.0.cursor_token.clone(),
+                            counters,
+                        },
+                    )
+                    .map_err(|e| {
+                        use $crate::store::IntoStoreError;
+                        $crate::error::ApiError::from(e.into_store_error())
+                    })?;
+                    let items: ::std::vec::Vec<T> = res
+                        .rows
+                        .iter()
+                        .map(|r| row_to_item(&to_sdk_row(r)))
+                        .collect();
+                    return ::core::result::Result::Ok($crate::pagination::CursorPage {
+                        items,
+                        next_cursor: res.next_group_cursor,
+                    });
+                }
+
+                // The ORDERING is the cursor key. A query that says
+                // `.order(created_at.desc()).limit(20).cursor(c)` has already
+                // named the sort column, its direction and the page size, so
+                // asking for them again as `keyset_by(..)` would be asking the
+                // developer to state the mechanism and then keep it in step with
+                // the intent by hand — which nothing checks.
+                let (keyset_col, dir) = match self.0.column_sorts().first() {
                     Some((c, d)) => (c.clone(), *d),
                     None => return Err($crate::error::ApiError::internal(
-                        "fetch_page requires .keyset_by()".to_string(),
+                        "this listing has no ordering to page by: add \
+                         `.order(Model::column.desc())`, which is also what \
+                         the cursor is built from",
                     )),
                 };
                 let limit = self.0.limit.unwrap_or(20);
 
+                let (__page_leaves, __page_groups) = self.0.lower_predicate()?;
                 keyset_paginate::<T, _>(
                     &self.0.table,
-                    self.0.base_filters,
-                    self.0.or_groups,
+                    __page_leaves,
+                    __page_groups,
                     &keyset_col,
                     dir,
                     self.0.cursor,
                     limit,
+                    wit_counters,
                     |row| {
                         let item = row_to_item(row);
                         let cursor = $crate::query::build_keyset_cursor(row, &keyset_col);
                         (item, cursor)
                     },
                 )
+            }
+        }
+
+
+        /// The group mapping every aggregate terminal shares.
+        ///
+        /// A free fn rather than a method so `fetch_one_group` (reachable from
+        /// every state) and `fetch_groups` (reachable only from a state whose
+        /// group count is bounded) can both use it without the second's bound
+        /// leaking onto the first.
+        fn __boogy_groups<T, F>(
+            args: $crate::query::QueryArgs,
+            group_to_item: F,
+        ) -> ::core::result::Result<::std::vec::Vec<T>, $crate::error::ApiError>
+        where
+            F: ::core::ops::Fn(&$crate::store::Group) -> T,
+        {
+            let specs = args.aggregates.clone();
+            if specs.is_empty() {
+                return ::core::result::Result::Err($crate::error::ApiError::internal(
+                    "this query selects no aggregates; add .sum(..)/.count_all()/… before \
+                     fetch_groups",
+                ));
+            }
+            let out = __boogy_aggregate(&args)?;
+            ::core::result::Result::Ok(
+                out.groups
+                    .iter()
+                    .map(|g| {
+                        group_to_item(&$crate::store::Group::new(
+                            g.keys.iter().map(__boogy_wit_to_val).collect(),
+                            g.values.iter().map(|v| v.as_ref().map(__boogy_wit_to_val)).collect(),
+                            specs.clone(),
+                        ))
+                    })
+                    .collect(),
+            )
+        }
+
+        /// The aggregate terminal that materializes ONE ITEM PER GROUP.
+        ///
+        /// On a separate impl block, gated on
+        /// [`BoundedGroups`](boogy_sdk::query::BoundedGroups), for the reason
+        /// [`fetch_all`](Query::fetch_all) is gated on `BoundedRead` — and NOT
+        /// the same reason, which is why it is a second predicate rather than
+        /// the same one.
+        ///
+        /// **Group cardinality is a different quantity from row count.** A
+        /// grouped query over a million rows may return three groups; an
+        /// ungrouped one returns exactly one over any table at all. So the
+        /// unbounded quantity here does not exist until `.group_by(col)` is
+        /// called, and once it is, it is the number of DISTINCT VALUES of
+        /// `col` — data-dependent, invisible in the query text, and materialized
+        /// one item at a time into a 32 MiB guest heap.
+        ///
+        /// `Unbounded` (no `group_by`) and `Bounded` (a ceiling was stated) both
+        /// satisfy the predicate; `Grouped` does not.
+        impl<B: $crate::query::BoundedGroups> Query<B> {
+            /// Run the aggregates this query selected, one item per group.
+            ///
+            /// Whether the answer comes from stored per-group totals (a
+            /// declared `rollup(...)`) or is computed from the rows is the
+            /// platform's choice and does not change the result — so this is
+            /// the only terminal for either, and there is deliberately no way
+            /// to ask for one.
+            ///
+            /// An ungrouped query yields exactly ONE group, even over no rows:
+            /// `SELECT sum(x) FROM t` on an empty table is one row holding
+            /// NULL, not zero rows. Use `fetch_one_group` for that shape.
+            ///
+            /// **This truncates when a `.limit(n)` was stated**, by the caller's
+            /// own instruction — same as `fetch_all`. When the number of groups
+            /// grows with the tenant, use `fetch_group_page` instead, which
+            /// hands back the token that continues the ranked listing.
+            pub fn fetch_groups<T, F>(self, group_to_item: F) -> ::core::result::Result<
+                ::std::vec::Vec<T>,
+                $crate::error::ApiError,
+            >
+            where
+                F: ::core::ops::Fn(&$crate::store::Group) -> T,
+            {
+                __boogy_groups(self.0, group_to_item)
+            }
+        }
+
+        /// The terminals that materialize rows into the guest's heap.
+        ///
+        /// They are on a SEPARATE impl block, gated on
+        /// [`BoundedRead`](boogy_sdk::query::BoundedRead), because that is the
+        /// whole mechanism: a `Query` that never called `.limit(n)` is
+        /// `Query<Unbounded>`, `Unbounded` does not implement `BoundedRead`, and
+        /// so these two methods do not exist on it. Writing `fetch_all()` with
+        /// no bound is a compile error naming the missing `.limit(..)`, not a
+        /// request the host answers with a page of its own choosing.
+        ///
+        /// The previous shape said "subject to `limit` if set" in a doc comment
+        /// and sent `page: None` when it was not — whereupon the host
+        /// substituted `BOOGY_STORE_MAX_PAGE_ROWS` (default 1000) rows at offset
+        /// 0 and returned them with no cursor and no total. The guest could not
+        /// tell a complete answer from a truncated one, which is the failure
+        /// mode this replaces. `auth::find_owned` carried the same kind of doc
+        /// retired-spelling: the "small bounded sets" label is obsolete —
+        /// the helper returns a bounded `RowPage`. Quoted because the
+        /// label IS the defect being described.
+        /// comment ("small bounded sets ONLY") right up until it exhausted a
+        /// 32 MiB guest heap.
+        impl<B: $crate::query::BoundedRead> Query<B> {
+            /// The first `limit` matching rows, in this query's order.
+            ///
+            /// **This truncates, by the caller's own instruction.** It answers
+            /// "give me at most N" — a top-N ranking, an `is_in` over a list of
+            /// N ids, an existence probe at `.limit(1)`. It does NOT answer "give
+            /// me all of them": if more than `limit` rows match, the rest are
+            /// simply not returned and nothing here says so. When the matching
+            /// set grows with the tenant, use
+            /// [`fetch_page`](Self::fetch_page) instead — same `.limit(..)`, plus
+            /// the cursor that continues the listing.
+            pub fn fetch_all(self) -> ::core::result::Result<
+                ::std::vec::Vec<$crate::store::Row>,
+                $crate::error::ApiError,
+            > {
+                __boogy_refuse_unservable_limit("fetch_all", self.0.limit)?;
+                // Discards the total → skip the count (don't route through
+                // `fetch_all_with_total`, which must compute it).
+                let (f, og, s, p, counters) = self.to_wit_args()?;
+                let (rows, _total, _has_more) =
+                    // `s` already carries the aggregate term: it came from the
+                    // same `ordering` list, so there is nothing to pass beside it.
+                    __boogy_find_rows_ranked(&self.0.table, f, og, s, p, SDK_SKIP_TOTAL, counters)
+                        .map_err($crate::error::ApiError::from)?;
+                Ok(rows)
+            }
+
+            /// [`fetch_all`](Self::fetch_all) plus the total number of matching
+            /// rows, which is NOT limited by the page.
+            ///
+            /// The total is the one signal that tells a truncated page from a
+            /// complete one: `rows.len() < total` means this page is a prefix.
+            /// It costs a full count, so prefer `fetch_all` when the bound is
+            /// the answer and `fetch_page` when the listing is open-ended.
+            pub fn fetch_all_with_total(self) -> ::core::result::Result<
+                (::std::vec::Vec<$crate::store::Row>, u64),
+                $crate::error::ApiError,
+            > {
+                __boogy_refuse_unservable_limit("fetch_all_with_total", self.0.limit)?;
+                let (f, og, s, p, counters) = self.to_wit_args()?;
+                let (rows, total, _has_more) =
+                    __boogy_find_rows_grouped(&self.0.table, f, og, s, p, SDK_WANT_TOTAL, counters)
+                        .map_err($crate::error::ApiError::from)?;
+                // `skip_total` is `SDK_WANT_TOTAL` (false) one line up, so the
+                // store owes a total.
+                let total = $crate::store::required_total("fetch_all_with_total", total)
+                    .map_err($crate::error::ApiError::from)?;
+                ::core::result::Result::Ok((rows, total))
+            }
+        }
+
+        /// A stated bound the store cannot serve in one call is refused, not
+        /// clamped.
+        ///
+        /// The typestate closes "forgot a bound"; this closes the one keystroke
+        /// that reopens it, `.limit(usize::MAX)`. Above the host's per-call page
+        /// ceiling the store returns its own cap and the guest has no way to
+        /// know the answer was cut — the exact undetectable truncation the
+        /// typestate exists to prevent, reached by a different route. A page
+        /// this size is also not a thing to hold in a 32 MiB heap.
+        fn __boogy_refuse_unservable_limit(
+            terminal: &str,
+            limit: ::core::option::Option<usize>,
+        ) -> ::core::result::Result<(), $crate::error::ApiError> {
+            match limit {
+                ::core::option::Option::Some(n) if n > SDK_FIND_BATCH as usize => {
+                    ::core::result::Result::Err($crate::error::ApiError::internal(::std::format!(
+                        "{terminal} was asked for {n} rows; the store serves at most {} in one \
+                         call (BOOGY_STORE_MAX_PAGE_ROWS), so it would return that many and the \
+                         answer would be silently short. Page the listing instead: keep the \
+                         .limit(..) at or below {}, add .cursor(token), and end on fetch_page, \
+                         which returns the token that continues it.",
+                        SDK_FIND_BATCH, SDK_FIND_BATCH,
+                    )))
+                }
+                _ => ::core::result::Result::Ok(()),
             }
         }
 
@@ -2321,12 +3393,20 @@ macro_rules! wit_glue {
 
             /// Find rows matching `filters` in `table`. Returns
             /// `(rows, total_count)`. Delegates to the store `find` WIT fn.
+            ///
+            /// `page` is REQUIRED, for the reason the free-function
+            /// [`find_rows`] requires one: an absent page is not "no limit", it
+            /// is "the store picks", and the migration then reads a ceiling it
+            /// did not choose with no way to tell a complete answer from a
+            /// truncated one. A backfill that must visit every row walks it —
+            /// page by page on a declared order, comparing against
+            /// `total_count` — rather than asking for the table in one call.
             pub fn find_rows(
                 &self,
                 table: &str,
                 filters: ::std::vec::Vec<$bindings::boogy::platform::store::Filter>,
-                sort: ::std::vec::Vec<$bindings::boogy::platform::store::SortBy>,
-                page: ::core::option::Option<$bindings::boogy::platform::store::Page>,
+                sort: ::std::vec::Vec<$bindings::boogy::platform::store::OrderTerm>,
+                page: $bindings::boogy::platform::store::Page,
             ) -> ::core::result::Result<
                 (::std::vec::Vec<$crate::store::Row>, u64),
                 ::std::string::String,
@@ -2335,14 +3415,21 @@ macro_rules! wit_glue {
                     table,
                     &$bindings::boogy::platform::store::FindOptions {
                         filters,
-                        sort,
-                        page,
+                        order_by: sort,
+                        page: Some(page),
                         or_groups: vec![],
-                        skip_total: false,
+                        skip_total: SDK_WANT_TOTAL,
+                        group_cursor: ::core::option::Option::None,
+                        counters: ::std::vec::Vec::new(),
                     },
                 )?;
                 let rows = result.rows.iter().map(|r| to_sdk_row(r)).collect();
-                Ok((rows, result.total_count))
+                // `skip_total` is `false` above, so the store owes a total. A
+                // backfill compares its progress against it, and a `None`
+                // folded to `0` would read as "nothing left to do".
+                let total = $crate::store::required_total("MigrationOps::find_rows", result.total_count)
+                    .map_err(|e| e.to_string())?;
+                Ok((rows, total))
             }
 
             /// Count rows matching `filters` in `table`. Delegates to the
@@ -2519,13 +3606,17 @@ macro_rules! wit_glue {
                 "__boogy_schema_version",
                 &$bindings::boogy::platform::store::FindOptions {
                     filters: vec![],
-                    sort: vec![$bindings::boogy::platform::store::SortBy {
-                        column: "version".to_string(),
-                        dir: $bindings::boogy::platform::store::SortDir::Desc,
-                    }],
+                    order_by: vec![$bindings::boogy::platform::store::OrderTerm::Column(
+                        $bindings::boogy::platform::store::SortBy {
+                            column: "version".to_string(),
+                            dir: $bindings::boogy::platform::store::SortDir::Desc,
+                        },
+                    )],
                     page: Some($bindings::boogy::platform::store::Page { limit: 1, offset: 0 }),
                     or_groups: vec![],
-                    skip_total: false,
+                    skip_total: SDK_SKIP_TOTAL,
+                    group_cursor: ::core::option::Option::None,
+                    counters: ::std::vec::Vec::new(),
                 },
             )?;
             let max_applied: i64 = find_result
@@ -3115,129 +4206,222 @@ macro_rules! wit_glue {
                 }
             }
 
-            /// List rows owned by the current principal.
+            /// One BOUNDED page of the rows owned by the current principal,
+            /// plus the cursor the next page resumes from.
+            ///
+            /// This returns a page and not a `Vec` on purpose. It used to
+            /// return every row the principal owned, and on a table of a few
+            /// thousand rows that is not slow but FATAL: measured against
+            /// `memory_mb = 32`, `GET /api/notes` exhausted the guest heap and
+            /// trapped on `handle_alloc_error`. The helper carried a doc
+            /// retired-spelling: the "small bounded sets" label is
+            /// obsolete — the helper returns a bounded `RowPage`. Quoted
+            /// as the evidence that a doc comment is not an enforcement
+            /// site.
+            /// comment saying it was "for small bounded sets" at the time. A
+            /// comment is not an enforcement site, so the shape is gone
+            /// instead: [`PageRequest`](boogy_sdk::pagination::PageRequest)
+            /// clamps its limit and keeps it private, so "give me all of them"
+            /// cannot be written.
             ///
             /// Composes `current_principal()` with a `WHERE owner_col =
-            /// principal` filter. Returns `ApiError::unauthenticated()`
-            /// when the request is anonymous; store failures route through
-            /// `StoreError → ApiError` so unique-violation / FK
-            /// preservation works for any caller using `?` into a
-            /// Result-typed handler.
+            /// principal` filter. Returns `ApiError::unauthenticated()` when
+            /// the request is anonymous; store failures route through
+            /// `StoreError → ApiError` so unique-violation / FK preservation
+            /// works for any caller using `?` into a Result-typed handler.
+            ///
             /// TYPED so the model's declared access patterns are reachable:
             /// the table comes from `M::TABLE` and the paging order from
-            /// `M::schema()`. Untyped, there was nothing to read a safe order
-            /// from, which is why this used to page by OFFSET with no sort and
-            /// could return a principal's row twice or not at all.
+            /// `M::schema()`. A model that declares `list_by(filter = <owner
+            /// col>, …)` — or an index leading with the owner column — pages
+            /// by that order, keyset, `_id` as the tiebreak. A model that
+            /// declares NEITHER has no order to resume from, so it serves one
+            /// page with no cursor and errors if the set does not fit; the
+            /// remedy names the declaration to add.
             pub fn find_owned<M: $crate::model::Model>(
                 owner_col: &str,
-            ) -> ::core::result::Result<::std::vec::Vec<$crate::store::Row>, $crate::error::ApiError>
-            {
+                page: &$crate::pagination::PageRequest,
+            ) -> ::core::result::Result<
+                $crate::pagination::RowPage,
+                $crate::error::ApiError,
+            > {
                 let table = <M as $crate::model::Model>::TABLE;
                 // Blank principal → unauthenticated. Otherwise a blank
                 // `current_principal()` would issue `WHERE owner_col = ''` and
                 // return every un-owned row as if the anonymous caller owned it.
                 let principal = $crate::request_state::_request_principal_nonblank()
                     .ok_or_else($crate::error::ApiError::unauthenticated)?;
+                // A token we cannot read is REFUSED, never silently dropped:
+                // dropping it restarts the listing while the caller believes it
+                // is continuing one, so the walk re-serves page one forever.
+                if page.has_unreadable_token() {
+                    return ::core::result::Result::Err($crate::error::ApiError::bad_request(
+                        "cursor is not a listing position this service issued; omit it to start \
+                         the listing from the beginning",
+                    ));
+                }
                 let schema = <M as $crate::model::Model>::schema();
                 let order = match $crate::store::read_strategy(&schema, owner_col) {
-                    $crate::store::ReadStrategy::Keyset(o) => Some(o),
+                    $crate::store::ReadStrategy::Keyset(o) => ::core::option::Option::Some(o),
                     // Unique owner column (one row per principal) or no declared
                     // order: one page is correct either way, and only going past
                     // it would need the order this model never declared.
-                    _ => None,
+                    _ => ::core::option::Option::None,
                 };
 
-                let mut rows: ::std::vec::Vec<$crate::store::Row> = ::std::vec::Vec::new();
-                let mut cursor: ::core::option::Option<$crate::pagination::Cursor> = None;
-                loop {
-                    let (extra, kset_or) = match &order {
-                        Some(o) => {
-                            let dir = if o.desc {
-                                $crate::store::SortDir::Desc
-                            } else {
-                                $crate::store::SortDir::Asc
-                            };
-                            $crate::pagination::keyset_resume_filter(cursor.as_ref(), &o.column, dir)
+                let ::core::option::Option::Some(o) = order else {
+                    // No safe order to resume from, so this listing hands back
+                    // no cursor — and therefore must never have been given one.
+                    if page.cursor().is_some() {
+                        return ::core::result::Result::Err($crate::error::ApiError::bad_request(
+                            "this listing cannot be resumed: its model declares no order over the \
+                             owner column, so it never issues a cursor",
+                        ));
+                    }
+                    let filters = ::std::vec![
+                        super::$bindings::boogy::platform::store::Filter {
+                            column: owner_col.to_string(),
+                            op: super::$bindings::boogy::platform::store::FilterOp::Eq,
+                            val: super::$bindings::boogy::platform::store::Value::Text(
+                                principal.clone(),
+                            ),
+                            in_values: ::core::option::Option::None,
                         }
-                        None => (::std::vec![], ::std::vec![]),
-                    };
-                    let mut filters = ::std::vec![super::$bindings::boogy::platform::store::Filter {
-                        column: owner_col.to_string(),
-                        op: super::$bindings::boogy::platform::store::FilterOp::Eq,
-                        val: super::$bindings::boogy::platform::store::Value::Text(principal.clone()),
-                        in_values: None,
-                    }];
-                    filters.extend(extra.iter().map(super::__boogy_sdk_filter_to_wit));
-                    let or_groups: ::std::vec::Vec<::std::vec::Vec<_>> = kset_or
-                        .iter()
-                        .map(|g| g.iter().map(super::__boogy_sdk_filter_to_wit).collect())
-                        .collect();
-                    let sort = match &order {
-                        Some(o) => {
-                            let d = super::__boogy_sdk_dir_to_wit(if o.desc {
-                                $crate::store::SortDir::Desc
-                            } else {
-                                $crate::store::SortDir::Asc
-                            });
-                            ::std::vec![
-                                super::$bindings::boogy::platform::store::SortBy {
-                                    column: o.column.clone(),
-                                    dir: d,
-                                },
-                                super::$bindings::boogy::platform::store::SortBy {
-                                    column: "_id".to_string(),
-                                    dir: d,
-                                },
-                            ]
-                        }
-                        None => ::std::vec![],
-                    };
-
+                    ];
                     let res = super::$bindings::boogy::platform::store::find(
                         table,
                         &super::$bindings::boogy::platform::store::FindOptions {
                             filters,
-                            sort,
-                            page: Some(super::$bindings::boogy::platform::store::Page {
-                                limit: super::SDK_FIND_BATCH,
-                                offset: 0,
-                            }),
-                            or_groups,
-                            skip_total: order.is_some(),
+                            order_by: ::std::vec![],
+                            page: ::core::option::Option::Some(
+                                super::$bindings::boogy::platform::store::Page {
+                                    limit: page.limit() as u32,
+                                    offset: 0,
+                                },
+                            ),
+                            or_groups: ::std::vec![],
+                            skip_total: super::SDK_SKIP_TOTAL,
+                            group_cursor: ::core::option::Option::None,
+                            counters: ::std::vec::Vec::new(),
                         },
                     )
                     .map_err($crate::store::StoreError::from_wit)?;
+                    let rows: ::std::vec::Vec<$crate::store::Row> =
+                        res.rows.iter().map(super::to_sdk_row).collect();
+                    $crate::store::refuse_beyond_one_page(
+                        "find_owned",
+                        rows.len(),
+                        res.total_count,
+                        res.has_more,
+                        "Declare how this table is listed for its owner column so it can \
+                         page safely: add list_by(filter = \"<owner col>\", newest = \
+                         \"<a timestamp or sequence column>\") to the model.",
+                    )?;
+                    return ::core::result::Result::Ok($crate::pagination::RowPage {
+                        rows,
+                        next_cursor: ::core::option::Option::None,
+                    });
+                };
 
-                    let n = res.rows.len() as u32;
-                    let Some(o) = order.as_ref() else {
-                        // No safe order: serve this page, refuse to guess past it.
-                        rows.extend(res.rows.iter().map(super::to_sdk_row));
-                        $crate::store::refuse_beyond_one_page(
-                            "find_owned",
-                            rows.len(),
-                            res.total_count,
-                            "Declare how this table is listed for its owner column so it can \
-                             page safely: add list_by(filter = \"<owner col>\", newest = \
-                             \"<a timestamp or sequence column>\") to the model.",
-                        )?;
-                        break;
-                    };
-                    if n == 0 {
-                        break;
+                let dir = if o.desc {
+                    $crate::store::SortDir::Desc
+                } else {
+                    $crate::store::SortDir::Asc
+                };
+                let (extra, kset_or) =
+                    $crate::pagination::keyset_resume_filter(page.cursor(), &o.column, dir.clone());
+                let mut filters = ::std::vec![
+                    super::$bindings::boogy::platform::store::Filter {
+                        column: owner_col.to_string(),
+                        op: super::$bindings::boogy::platform::store::FilterOp::Eq,
+                        val: super::$bindings::boogy::platform::store::Value::Text(
+                            principal.clone(),
+                        ),
+                        in_values: ::core::option::Option::None,
                     }
-                    if let Some(last) = res.rows.last() {
-                        let row = super::to_sdk_row(last);
-                        cursor = Some($crate::pagination::Cursor {
-                            last_id: row.id().to_string(),
-                            last_value: row.get(&o.column).to_json(),
-                        });
+                ];
+                filters.extend(extra.iter().map(super::__boogy_sdk_filter_to_wit));
+                let or_groups: ::std::vec::Vec<::std::vec::Vec<_>> = kset_or
+                    .iter()
+                    .map(|g| g.iter().map(super::__boogy_sdk_filter_to_wit).collect())
+                    .collect();
+                let wit_dir = super::__boogy_sdk_dir_to_wit(dir);
+                let sort = ::std::vec![
+                    super::$bindings::boogy::platform::store::OrderTerm::Column(
+                        super::$bindings::boogy::platform::store::SortBy {
+                            column: o.column.clone(),
+                            dir: wit_dir.clone(),
+                        },
+                    ),
+                    super::$bindings::boogy::platform::store::OrderTerm::Column(
+                        super::$bindings::boogy::platform::store::SortBy {
+                            column: "_id".to_string(),
+                            dir: wit_dir,
+                        },
+                    ),
+                ];
+
+                // The HOST says where the listing ends (`has_more`), because
+                // the host is the only party that can.
+                //
+                // Neither thing a guest could measure answers the question. The
+                // host's own per-call row ceiling
+                // (`BOOGY_STORE_MAX_PAGE_ROWS`) can sit BELOW the page asked
+                // for, and it clamps silently — so a short page is not the end
+                // (it may be the ceiling), and a full page is not "more
+                // follows" (it may be the ceiling too). Overfetching by one
+                // does not escape it: the overfetched ask is clamped as well.
+                //
+                // That left exactly one safe rule for the guest — treat an
+                // EMPTY page as the only terminator — at the cost of one extra
+                // request per complete listing. `has-more` retires the cost
+                // rather than the safety: the answer now comes from the side of
+                // the clamp that knows, so the last page carrying rows is also
+                // the last request, and a truncation still has no way in.
+                let limit = page.limit();
+                let res = super::$bindings::boogy::platform::store::find(
+                    table,
+                    &super::$bindings::boogy::platform::store::FindOptions {
+                        filters,
+                        order_by: sort,
+                        page: ::core::option::Option::Some(
+                            super::$bindings::boogy::platform::store::Page {
+                                limit: limit as u32,
+                                offset: 0,
+                            },
+                        ),
+                        or_groups,
+                        skip_total: super::SDK_SKIP_TOTAL,
+                        group_cursor: ::core::option::Option::None,
+                        counters: ::std::vec::Vec::new(),
+                    },
+                )
+                .map_err($crate::store::StoreError::from_wit)?;
+
+                let rows: ::std::vec::Vec<$crate::store::Row> =
+                    res.rows.iter().map(super::to_sdk_row).collect();
+                let next_cursor = match rows.last() {
+                    ::core::option::Option::Some(last) if res.has_more => {
+                        let next = $crate::pagination::Cursor {
+                            last_id: last.id().to_string(),
+                            last_value: last.get(&o.column).to_json(),
+                        };
+                        // Same progress guarantee the batching loop carried: a
+                        // page that ends on the row the previous page ended on
+                        // would hand the caller a cursor that re-serves it
+                        // forever. It surfaces as an error rather than as a
+                        // silent stop, because a stop here returns a partial
+                        // listing that looks complete.
+                        $crate::pagination::keyset_advanced(
+                            table, &o.column, page.cursor(), &next,
+                        )
+                        .map_err($crate::error::ApiError::internal)?;
+                        ::core::option::Option::Some($crate::pagination::encode(&next))
                     }
-                    rows.extend(res.rows.iter().map(super::to_sdk_row));
-                    // Empty page is the ONLY reliable terminator — see
-                    // db_find_by: the host's page cap can be below
-                    // SDK_FIND_BATCH, so a short page does not mean the end.
-                }
-                Ok(rows)
+                    _ => ::core::option::Option::None,
+                };
+
+                ::core::result::Result::Ok($crate::pagination::RowPage { rows, next_cursor })
             }
 
             // Both helpers route through ApiError so every auth-rejection
@@ -4256,7 +5440,28 @@ macro_rules! wit_glue {
                     wit_identity.as_ref().map(|i| i.principal.clone()),
                 );
 
-                {
+                // What this invocation must do about the DECLARED schema.
+                //
+                // A declared schema belongs to a deployed VERSION, not to a
+                // request — it cannot change between two requests served by the
+                // same version. So the platform resolves it once, when the
+                // version is deployed, and every later invocation is told to
+                // SKIP the pass: no `list-tables`, no `list-indexes`, no
+                // `list-rollups`. Skipped, not cached — there is nothing to
+                // serve from memory because nothing is read.
+                //
+                // `apply-only` is the resolution pass itself: run the
+                // declaration and return WITHOUT dispatching a route, so the
+                // platform never has to guess whether a synthetic request hit
+                // a catch-all handler.
+                //
+                // The mode is host-attested; a caller cannot supply it.
+                let __schema_mode =
+                    $bindings::boogy::platform::runtime::current_schema_mode();
+                if !::core::matches!(
+                    __schema_mode,
+                    $bindings::boogy::platform::runtime::SchemaMode::Skip
+                ) {
                     // Phase order is load-bearing. Declaration completes before
                     // the reconcile, which decides what to drop from the FULL
                     // declared set; the reconcile completes before migrations,
@@ -4268,8 +5473,28 @@ macro_rules! wit_glue {
                         create_table_from(__t);
                     }
                     __boogy_reconcile_indexes();
+                    __boogy_reconcile_rollups();
                     <$api_struct as $crate::Api>::migrate();
                     <$api_struct as $crate::Api>::bootstrap();
+                }
+                if ::core::matches!(
+                    __schema_mode,
+                    $bindings::boogy::platform::runtime::SchemaMode::ApplyOnly
+                ) {
+                    // The response header is the PROOF the pass ran. Without it
+                    // a component built before this contract existed — which
+                    // ignores the mode and serves the synthetic request as an
+                    // ordinary route — would be indistinguishable from one that
+                    // resolved its schema, and the platform would mark a
+                    // deployment resolved on the strength of a 404.
+                    return $bindings::exports::boogy::platform::http_handler::HttpResponse {
+                        status: 204,
+                        headers: ::std::vec![(
+                            ::std::string::String::from("x-boogy-schema-applied"),
+                            ::std::string::String::from("1"),
+                        )],
+                        body: ::core::option::Option::None,
+                    };
                 }
                 let sdk_req = __boogy_to_sdk_request(&req);
 

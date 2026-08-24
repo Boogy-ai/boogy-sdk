@@ -1,13 +1,19 @@
-//! A `#[counter]` column cannot back an index, and the derive must say so at
-//! COMPILE time.
+//! retired-spelling: the field form was retired 2026-08-19; the replacement
+//! is `#[model(counter(name = ..))]` on the struct plus a companion
+//! `#[derive(Counter)]` marker type. This suite exists to prove the derive
+//! says so rather than accepting it silently.
+//! `#[counter]` is not supported as a struct FIELD, and the derive must say
+//! so at COMPILE time, naming the replacement.
 //!
-//! Why compile-time: index maintenance needs the previous value to remove the
-//! stale entry, and an atomic add never reads one. A runtime check would leave
-//! an index that *looks* maintained and silently is not — wrong answers rather
-//! than a failure. Refusing to build is strictly better.
+//! A counter column has no field of its own any more — it is declared on the
+//! STRUCT (`#[model(counter(name = "<column>"))]`) and read through a
+//! companion `#[derive(Counter)]` marker type. A runtime reinterpretation, or
+//! silently accepting and ignoring the field, would leave a model that looks
+//! like it declared a counter and does not. Refusing to build is strictly
+//! better.
 
 #[test]
-fn counter_columns_cannot_back_an_index() {
+fn counter_field_is_rejected_naming_the_replacement() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/counter_*.rs");
 }
@@ -17,10 +23,10 @@ fn counter_columns_cannot_back_an_index() {
 ///
 /// `attr.path().is_ident("x")` matches `#[x]`, `#[x(..)]` and `#[x = ..]`
 /// alike. Without an explicit check, an argument is silently dropped: the
-/// author writes `#[counter(index = true)]` or a field-level
-/// `#[index(cols = [..])]`, gets a clean build, and believes they asked for
-/// something the derive never saw. Silent misconfiguration of a storage
-/// attribute is exactly the class of bug that surfaces as wrong data later.
+/// author writes `#[pk(auto)]` or a field-level `#[index(cols = [..])]`,
+/// gets a clean build, and believes they asked for something the derive
+/// never saw. Silent misconfiguration of a storage attribute is exactly the
+/// class of bug that surfaces as wrong data later.
 #[test]
 fn bare_field_markers_reject_arguments() {
     let t = trybuild::TestCases::new();
@@ -37,8 +43,10 @@ fn bare_field_markers_reject_arguments() {
 /// attribute at all.
 ///
 /// Refusing to build follows the same reasoning as `deny_marker_args` and the
-/// `#[counter]`-cannot-back-an-index rejection: a storage declaration that is
-/// silently discarded surfaces later as wrong data with nothing to trace it
+/// retired-spelling: the field form is retired; `#[model(counter(name =
+/// ..))]` is the replacement this rejection names.
+/// unconditional `#[counter]`-as-a-field rejection: a storage declaration that
+/// is silently discarded surfaces later as wrong data with nothing to trace it
 /// back to. Quietly emitting an index instead would change the storage layout
 /// of every existing model for a guarantee nobody can currently rely on, and
 /// would be ineffective anyway on a table that already holds duplicates.
@@ -56,8 +64,10 @@ fn a_unique_field_marker_is_rejected() {
 /// spellings would be silently discarded: the author declares a column default,
 /// the build is clean, and the column reads back null forever with nothing to
 /// trace it to. The same applies to a literal whose kind does not match the
-/// field's column type, and to `#[default]` on `#[pk]` or `#[counter]`, where
-/// the value could never be observed.
+/// field's column type, and to `#[default]` on `#[pk]`, where the value could
+/// never be observed. (`#[default]` on a counter is covered by the
+/// unconditional field rejection above — a counter column has no field left
+/// to combine it with.)
 #[test]
 fn a_malformed_or_unusable_default_is_a_compile_error() {
     let t = trybuild::TestCases::new();
@@ -74,18 +84,22 @@ fn well_formed_defaults_compile() {
     t.pass("tests/ui/ok_default.rs");
 }
 
-/// The permitted shape: a counter no index or access pattern touches.
+/// The permitted shape: a struct-level counter, with no backing field.
 ///
-/// Without this, a derive that rejected EVERY `#[counter]` would pass the
-/// compile-fail suite above while making the feature unusable.
+/// retired-spelling: only the FIELD form is retired; `#[counter(...)]` on
+/// a `#[derive(Counter)]` marker type is live.
+/// Without this, a derive that rejected EVERY `#[counter]` — field or
+/// struct-level alike — would pass the compile-fail suite above while
+/// making the feature unusable in its only remaining form. This is the
+/// CONTROL for the field-form rejection: the new shape compiles clean.
 #[test]
-fn a_counter_that_backs_no_index_compiles() {
+fn a_struct_level_counter_compiles() {
     let t = trybuild::TestCases::new();
     t.pass("tests/ui/ok_counter.rs");
 }
 
 // ---------------------------------------------------------------------------
-// The write-side half: a counter field must not be in `to_columns()`
+// The write-side half: a counter column must not be in `to_columns()`
 // ---------------------------------------------------------------------------
 
 use boogy_sdk::model::{Id, Model};
@@ -93,40 +107,36 @@ use boogy_sdk::store::Val;
 use boogy_sdk::Model as ModelDerive;
 
 #[derive(ModelDerive)]
-#[model(table = "posts")]
+#[model(table = "posts", counter(name = "vote_score"))]
 struct Post {
     #[pk]
     id: Id<Post>,
     title: String,
-    #[counter]
-    vote_score: i64,
 }
 
-/// `to_columns()` feeds BOTH `db_insert` and `db_update`, so a counter field
+/// `to_columns()` feeds BOTH `db_insert` and `db_update`, so a counter column
 /// left in it would make `db_update(id, &Post { title, ..post })` write the
 /// counter value the author read earlier — discarding every atomic add since.
 ///
-/// The compile-fail suite above covers the index rejection; nothing covered this
-/// half, and it is the one that fails silently: the model still compiles, still
-/// reads its counter back correctly, and quietly loses increments on every
-/// unrelated update. Asserted structurally (the column is ABSENT), not by value —
-/// emitting the column with a placeholder value would still overwrite the cell.
+/// A struct-level counter has no field to accidentally reintroduce (there is
+/// nothing on `Post` a caller could even write `post.vote_score = 42` to), so
+/// this is really pinning `struct_counter_pushes` against `to_col_pushes`:
+/// the counter column must land in the SCHEMA (via the former) and never in
+/// `to_columns()`'s output (the latter never walks it at all). Asserted
+/// structurally (the column is ABSENT), not by value — emitting the column
+/// with a placeholder value would still overwrite the cell.
 #[test]
-fn to_columns_omits_a_counter_field() {
+fn to_columns_omits_a_struct_level_counter() {
     let post = Post {
         id: Id::new(7),
         title: "hello".into(),
-        vote_score: 42,
     };
-    // The field is still an ordinary struct field — it is the WRITE path that
-    // omits it, not the type.
-    assert_eq!(post.vote_score, 42);
     let cols = post.to_columns();
     let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
 
     assert!(
         !names.contains(&"vote_score"),
-        "a #[counter] column must never appear in to_columns(), got {names:?}"
+        "a counter column must never appear in to_columns(), got {names:?}"
     );
     // The ordinary column is still there — a derive that dropped every field
     // would also pass the assertion above.

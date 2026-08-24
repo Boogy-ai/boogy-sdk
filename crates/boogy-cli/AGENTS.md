@@ -221,6 +221,13 @@ owner = "alice"
 path = "/api/hello"
 methods = ["GET", "POST"]
 
+# Required. Exposure is stated, never inferred — a manifest with no [ingress]
+# is refused at publish. `public` = anyone on the internet may call these
+# routes with no credential; `authenticated` = any signed-in principal;
+# `internal` = only other services you name in `allowed_origins`.
+[ingress]
+mode = "authenticated"
+
 [capabilities]
 store   = true
 auth    = true

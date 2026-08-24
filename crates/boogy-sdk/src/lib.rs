@@ -48,6 +48,7 @@
 pub mod api_keys;
 pub mod ctx;
 pub mod error;
+pub mod expr;
 pub mod extract;
 pub mod glue;
 pub mod idempotency;
@@ -77,6 +78,7 @@ pub mod store;
 pub mod websockets;
 
 pub use boogy_sdk_macros::job;
+pub use boogy_sdk_macros::Counter;
 pub use boogy_sdk_macros::Model;
 pub use ctx::Ctx;
 pub use error::{parse_body, validate_body, ApiError};

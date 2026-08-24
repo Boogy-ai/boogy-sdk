@@ -1,5 +1,6 @@
-use boogy_sdk::model::{Id, Model, Timestamp};
+use boogy_sdk::model::{Counter, Id, Model, Timestamp};
 use boogy_sdk::store::{ColType, Row, Val};
+use boogy_sdk::Counter as CounterDerive;
 use boogy_sdk::Model as ModelDerive;
 
 // Access-pattern derive parity: struct-level list_by/ranked_by + field-level
@@ -278,3 +279,186 @@ fn from_row_roundtrip() {
     };
     assert_eq!(Widget::from_row(&row2).parent, None);
 }
+
+// ---------------------------------------------------------------------------
+// #[derive(Counter)] with `of = Model`
+// ---------------------------------------------------------------------------
+
+#[derive(ModelDerive)]
+#[model(table = "rooms", counter(name = "post_count"))]
+struct Room {
+    #[pk]
+    id: Id<Room>,
+}
+
+// A parent whose table name is NOT the snake_case of its struct name — the
+// case `#[belongs_to]` guards against for foreign keys, and `Counter::NAME`
+// must too: it is read from `<Post as Model>::TABLE`, not from `stringify!`.
+#[derive(ModelDerive)]
+#[model(table = "the_posts", counter(name = "vote_score"))]
+struct Post {
+    #[pk]
+    id: Id<Post>,
+}
+
+#[derive(CounterDerive)]
+#[counter(of = Room, name = "post_count")]
+struct RoomPostCount;
+
+#[derive(CounterDerive)]
+#[counter(of = Post, name = "vote_score")]
+struct PostVoteScore;
+
+#[test]
+fn counter_derive_name_is_table_dot_column() {
+    assert_eq!(RoomPostCount::NAME, "rooms.post_count");
+    // Proves NAME is read from the parent's ACTUAL table (a renamed one, in
+    // this case), not synthesized from the Rust struct identifier.
+    assert_eq!(PostVoteScore::NAME, "the_posts.vote_score");
+}
+
+#[test]
+fn counter_derive_key_is_the_parents_id() {
+    let k: <RoomPostCount as Counter>::Key = Id::<Room>::new(9);
+    assert_eq!(k.get(), 9);
+}
+
+// ---------------------------------------------------------------------------
+// `#[model(counter(...))]` — the counter column with no backing field.
+//
+// The store assigns a table's column ordinals once, when the table is first
+// created, and never revisits an already-created table's ordinals — so a
+// counter column has no PRIOR position to reproduce; it is always appended
+// after the real columns, deterministically, in declaration order.
+// ---------------------------------------------------------------------------
+
+// The struct-level shape — no field at all.
+#[derive(ModelDerive)]
+#[model(table = "rooms_ordinal_control", counter(name = "post_count"))]
+struct RoomNoFieldForm {
+    #[pk]
+    id: Id<RoomNoFieldForm>,
+    slug: String,
+    visibility: String,
+    last_post_at: Timestamp,
+}
+
+#[derive(CounterDerive)]
+#[counter(of = RoomNoFieldForm, name = "post_count")]
+struct RoomNoFieldFormPostCount;
+
+/// retired-spelling: `#[counter]` as a field was removed 2026-08-19;
+/// `#[model(counter(name = ..))]` is what this pins.
+/// The column a `#[model(counter(...))]` declaration emits, pinned against
+/// the literal expected shape — a 64-bit integer, non-nullable, flagged as
+/// a counter — rather than against a field form that no longer exists
+/// (Task 7 removed `#[counter]` as a struct field entirely).
+#[test]
+fn a_struct_level_counter_has_the_expected_column_shape() {
+    let schema = RoomNoFieldForm::schema();
+    let c = schema.columns.iter().find(|c| c.name == "post_count").unwrap();
+    assert_eq!(c.col_type as u8, ColType::Integer as u8, "a counter column is a 64-bit integer");
+    assert!(!c.nullable, "a counter column is never nullable");
+    assert!(c.counter, "and must be flagged as a counter column");
+}
+
+/// A struct-level counter always lands LAST, deterministically, after every
+/// real field column — in declaration order. The store assigns a table's
+/// column ordinals once, when the table is first created, and never
+/// revisits an already-created table's ordinals afterward, so there is no
+/// PRIOR position for a counter column to reproduce; "append after every
+/// real column" is the only definition of "where" that means anything.
+#[test]
+fn a_struct_level_counter_appends_after_every_field_column() {
+    let schema = RoomNoFieldForm::schema();
+    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+
+    assert_eq!(names, vec!["slug", "visibility", "last_post_at", "post_count"]);
+
+    // The companion `#[derive(Counter)]` marker resolves to the SAME
+    // "table.column" name the emitted column carries — the two derives must
+    // agree on the string, since nothing else checks that they do.
+    assert_eq!(RoomNoFieldFormPostCount::NAME, "rooms_ordinal_control.post_count");
+}
+
+/// Two struct-level counters on one model append in the order they are
+/// declared, each after the last — not, say, both racing for the same slot
+/// or landing in attribute-parse order regardless of what was written.
+#[derive(ModelDerive)]
+#[model(
+    table = "widgets_two_counters",
+    counter(name = "touches"),
+    counter(name = "shares")
+)]
+struct TwoCounterWidget {
+    #[pk]
+    id: Id<TwoCounterWidget>,
+    label: String,
+}
+
+#[test]
+fn two_struct_level_counters_append_in_declaration_order() {
+    let schema = TwoCounterWidget::schema();
+    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["label", "touches", "shares"]);
+}
+
+// ---------------------------------------------------------------------------
+// #[derive(Counter)] with `key = (..)` — arbitrary-key counters, no model.
+// ---------------------------------------------------------------------------
+
+#[derive(CounterDerive)]
+#[counter(key = (room_id, day))]
+struct RoomDailyPosts;
+
+// A single-column key, WITHOUT a trailing comma — real Rust tuple syntax
+// requires `(ip,)` for arity 1, but this derive parses a parenthesized
+// column list, not a tuple expression, so `(ip)` alone must also work.
+#[derive(CounterDerive)]
+#[counter(key = (ip))]
+struct RateLimit;
+
+// Same arity, WITH a trailing comma, to prove both spellings parse.
+#[derive(CounterDerive)]
+#[counter(key = (ip,))]
+struct RateLimitTrailingComma;
+
+/// An explicit `name = "..."` override for a `key = (..)` counter — the
+/// derive does not require the default (struct name in snake_case) to be
+/// the only spelling available.
+#[derive(CounterDerive)]
+#[counter(key = (ip, window), name = "rate_limit_bucket")]
+struct RateLimitRenamed;
+
+#[test]
+fn key_form_name_defaults_to_the_struct_names_snake_case() {
+    assert_eq!(RoomDailyPosts::NAME, "room_daily_posts");
+    assert_eq!(RateLimit::NAME, "rate_limit");
+}
+
+#[test]
+fn key_form_name_is_overridable() {
+    assert_eq!(RateLimitRenamed::NAME, "rate_limit_bucket");
+}
+
+#[test]
+fn key_form_key_is_a_val_array_sized_to_the_declared_columns() {
+    let k: <RoomDailyPosts as Counter>::Key =
+        [boogy_sdk::store::Val::Text("room-1".into()), boogy_sdk::store::Val::Integer(3)];
+    assert_eq!(k.len(), 2);
+
+    let k1: <RateLimit as Counter>::Key = [boogy_sdk::store::Val::Text("1.2.3.4".into())];
+    assert_eq!(k1.len(), 1);
+    let k2: <RateLimitTrailingComma as Counter>::Key =
+        [boogy_sdk::store::Val::Text("1.2.3.4".into())];
+    assert_eq!(k2.len(), 1);
+}
+
+#[test]
+fn key_form_key_cols_names_the_declared_columns_in_order() {
+    assert_eq!(RoomDailyPosts::KEY_COLS, &["room_id", "day"]);
+    assert_eq!(RateLimit::KEY_COLS, &["ip"]);
+    assert_eq!(RateLimitTrailingComma::KEY_COLS, &["ip"]);
+    assert_eq!(RateLimitRenamed::KEY_COLS, &["ip", "window"]);
+}
+

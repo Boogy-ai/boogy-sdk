@@ -184,3 +184,55 @@ fn a_field_without_the_attribute_carries_no_default() {
     let note = schema.columns.iter().find(|c| c.name == "note").expect("note column");
     assert_eq!(note.default, None, "an undeclared column must have no default");
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// #[belongs_to(Parent)] — the relation the platform ranks a parent by
+// ───────────────────────────────────────────────────────────────────────────
+
+#[derive(ModelDerive)]
+#[model(table = "posts")]
+struct Post {
+    #[pk]
+    id: Id<Post>,
+    room_id: i64,
+}
+
+#[derive(ModelDerive)]
+#[model(table = "post_votes")]
+struct PostVote {
+    #[pk]
+    id: Id<PostVote>,
+    /// ON post_votes.post_id = posts._id
+    #[belongs_to(Post)]
+    post_id: i64,
+    room_id: i64,
+    direction: i64,
+}
+
+/// The declaration a developer writes has to reach the store as a foreign key,
+/// because that is the only thing telling the platform which table a group key
+/// points at — and therefore the only thing that lets a parent with no children
+/// be given a group at all.
+///
+/// The parent is named by TYPE rather than by string, so its table name comes
+/// from `<Post as Model>::TABLE` and a renamed table cannot leave a stale
+/// relation behind.
+#[test]
+fn belongs_to_emits_a_foreign_key_to_the_parents_table() {
+    let cols = PostVote::schema().columns;
+    let post_id = cols.iter().find(|c| c.name == "post_id").expect("post_id column");
+
+    let fk = post_id
+        .references
+        .as_ref()
+        .expect("#[belongs_to(Post)] must emit a relation");
+    assert_eq!(fk.references_table, Post::TABLE);
+    assert_eq!(
+        fk.references_column, "_id",
+        "a relation targets the parent's key, which is the value the child holds"
+    );
+
+    // Control: an ordinary column must not acquire one.
+    let room_id = cols.iter().find(|c| c.name == "room_id").expect("room_id column");
+    assert!(room_id.references.is_none(), "only the declared column has a parent");
+}

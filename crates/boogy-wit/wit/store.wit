@@ -37,6 +37,13 @@ interface store {
         /// The transaction exhausted its retry attempts against a contended
         /// row. Transient: the caller should retry the request. → HTTP 503.
         too-contended(string),
+        /// What the request referred to is no longer there, and no retry or
+        /// adjustment will bring it back — today, a ranked listing whose
+        /// ordering has been rebuilt and reclaimed while the caller was paging
+        /// it. → HTTP 410. Distinct from `not-found`, which is about a thing
+        /// that never existed or is not yours: this one DID exist and the
+        /// caller was reading it.
+        gone(string),
         internal(string),
     }
 
@@ -86,6 +93,29 @@ interface store {
         dir: sort-dir,
     }
 
+    /// ONE ordering term: a column, or an aggregate over a related table.
+    ///
+    /// `ORDER BY` is one clause, so it travels as one list of one type. It used
+    /// retired-spelling: `find-options.sort` and
+    /// `find-options.order-by-agg` were both retired 2026-08-17 into this
+    /// one `order-term` list. Kept because the shape below is only
+    /// defensible against the shape it replaced.
+    /// to be three fields — `find-options.sort`, `find-options.order-by-agg`
+    /// and `aggregate-options.order-by` — with three names, two records and two
+    /// cardinalities for the same idea. Every construction site had to name
+    /// ordering fields it did not care about, and a reader of one could not
+    /// tell whether the other was consulted; the SDK's `fetch-group-page`
+    /// checked the aggregate field directly and silently refused every ranked
+    /// page once its only writer went away.
+    ///
+    /// What each side ACCEPTS is not the type's job and is stated where it is
+    /// enforced: a row query takes at most one aggregate term, a grouped query
+    /// takes aggregate terms only.
+    variant order-term {
+        column(sort-by),
+        aggregate(agg-sort),
+    }
+
     record page {
         limit: u32,
         offset: u32,
@@ -93,25 +123,76 @@ interface store {
 
     record find-options {
         filters: list<filter>,
-        sort: list<sort-by>,
         page: option<page>,
         /// OR-of-AND clause layered on top of `filters`. A row matches when
         /// ALL(filters) AND (or-groups is empty OR ANY(group: ALL(group))).
         /// Empty `or-groups` (the default) is exactly the filters-only
         /// behavior — fully backward compatible.
         or-groups: list<list<filter>>,
-        /// Skip computing `total-count` (the host returns 0). Set by callers
-        /// that discard the total — keyset/`fetch-page`, `fetch-all`,
+        /// Skip computing `total-count` (the host answers `none`). Set by
+        /// callers that discard the total — keyset/`fetch-page`, `fetch-all`,
         /// `fetch-one` — so the host can avoid the count entirely on the
         /// index-walk fast path, where it would otherwise be a separate count
         /// over the table for a value nobody reads. Defaults to `false` (the
         /// total is computed) — counts and total-bearing fetches leave it off.
+        ///
+        /// It does NOT decide whether a caller can tell a full page from the
+        /// end of a listing: `find-result.has-more` answers that under either
+        /// value, so declining the total never costs completeness.
         skip-total: bool,
+        /// How to order these rows: column terms, and at most ONE aggregate
+        /// term — "best first", where "best" is a total the children carry.
+        ///
+        /// The relation behind an aggregate term comes from the child's
+        /// declared foreign key, so nothing here names it. More than one
+        /// aggregate term is REFUSED at the boundary rather than made
+        /// unrepresentable by the type: the cardinality is a property of what
+        /// the engine can serve, and a reader should find it stated where it is
+        /// enforced instead of inferring it from an `option<>`.
+        order-by: list<order-term>,
+        // Continue a ranked listing. Opaque, and the same contract the group
+        // cursor has: it names the GENERATION of the ordering, not just a
+        // position, so a page taken after a refresh continues the list it
+        // started in.
+        group-cursor: option<string>,
+        /// Counters to merge into the returned rows — names of live
+        /// counter columns on this table. Empty (the default every
+        /// existing construction site keeps) merges NOTHING: a counter's
+        /// value never arrives in a row unless named here. Naming any one
+        /// counter merges every live counter column on the table (per-table
+        /// granularity, not per-column — accepted, see the SDK's
+        /// `QueryArgs::with_counter` doc).
+        counters: list<string>,
     }
 
     record find-result {
         rows: list<row>,
-        total-count: u64,
+        /// The number of rows matching the query, ignoring the page — `none`
+        /// when `skip-total` asked the host not to compute one.
+        ///
+        /// An `option` rather than a bare `u64` because the two states a bare
+        /// `u64` collapsed are different answers: `0` meant BOTH "no rows
+        /// matched" and "I did not count". Nothing at the call site could tell
+        /// them apart, so a declined total read as an empty table.
+        total-count: option<u64>,
+        /// Whether more matching rows follow this page.
+        ///
+        /// Set by the HOST, which is the only party that can know it. A page
+        /// limit is clamped to the host's own per-call row ceiling, and the
+        /// clamp is silent — so a caller comparing the rows it got against the
+        /// limit it asked for cannot distinguish "the ceiling cut this page"
+        /// from "the listing ended here", and a listing that guesses the second
+        /// stops early while reading as a complete answer.
+        ///
+        /// It is meaningful under `skip-total` too: it is the page's own
+        /// property, not a fact derived from a count.
+        ///
+        /// Direction of any inexactness is fixed: it may be `true` when the
+        /// next page turns out to be empty, never `false` while rows remain.
+        /// An extra request is a cost; a truncation is a wrong answer.
+        has-more: bool,
+        // The token that continues a ranked listing, when more follows.
+        next-group-cursor: option<string>,
     }
 
     // One independent query in a batch `find-many`: a table + the same
@@ -119,6 +200,103 @@ interface store {
     record find-query {
         table: string,
         options: find-options,
+    }
+
+    // -- Aggregates --
+
+    // The aggregate functions, with the meanings SQL gives them.
+    //
+    // `count-all` is `COUNT(*)`: it counts rows and needs no column. The others
+    // read one column and IGNORE rows whose value is null, so an aggregate over
+    // a column that is null everywhere is the same as one over no rows at all.
+    enum agg-func { count-all, sum, avg, min, max }
+
+    // One aggregate to compute. `column` is required for every function except
+    // `count-all`, where it is ignored. (`kind` rather than `func`, which is a
+    // reserved word here, and rather than `op`, which `agg-filter` already uses
+    // for its comparison operator.)
+    record agg-spec {
+        kind: agg-func,
+        column: option<string>,
+    }
+
+    // A predicate applied AFTER aggregation, against an aggregate's own value —
+    // SQL's `HAVING`. Distinct from `filter`, which selects the rows that go
+    // INTO the aggregate.
+    record agg-filter {
+        agg: agg-spec,
+        op: filter-op,
+        val: value,
+    }
+
+    // Ordering by an aggregate's value rather than by a column.
+    record agg-sort {
+        agg: agg-spec,
+        dir: sort-dir,
+    }
+
+    record aggregate-options {
+        // Selects the rows that feed the aggregates.
+        filters: list<filter>,
+        or-groups: list<list<filter>>,
+        // Empty = ungrouped, which returns exactly ONE group whose `keys` is
+        // empty — matching SQL, where `SELECT sum(x) FROM t` over an empty
+        // table still returns one row.
+        group-by: list<string>,
+        aggregates: list<agg-spec>,
+        having: list<agg-filter>,
+        /// How to order the GROUPS. Aggregate terms only — a grouped result has
+        /// no columns to order by beyond its keys, and ordering by a group key
+        /// is not served today, so a column term is refused at the boundary.
+        order-by: list<order-term>,
+        page: option<page>,
+        // Continue a ranked traversal an earlier page started, instead of
+        // re-reading whatever ordering is current now.
+        //
+        // Opaque: a token the platform minted and the caller hands back, the
+        // same contract row cursors have. It names the GENERATION of the
+        // ordering, which is the one thing an offset cannot — a ranked list is
+        // keyed on a value the rows keep changing, so `offset 10` against a
+        // rebuilt ordering repeats and skips entries.
+        //
+        // `none` starts a traversal. `some` pins it; if that generation has
+        // been reclaimed the read is refused rather than quietly answered from
+        // a different one.
+        group-cursor: option<string>,
+        // Whether the caller intends to WALK this ordering rather than take one
+        // look at the top of it.
+        //
+        // Both ask the same question; only one needs the answer to stay put.
+        // Pinning an ordering means publishing it, and publishing costs writes
+        // on a read path — so a plain "top 10" must not pay for a continuation
+        // nobody is going to use, and a listing that will be paged must not be
+        // handed pages that disagree. This is the caller saying which they are,
+        // and it is a statement of intent, not a choice of mechanism: the
+        // platform still decides whether anything is materialised and when.
+        want-group-cursor: bool,
+    }
+
+    // One group. `keys` is positional against `group-by`; `values` positional
+    // against `aggregates`.
+    //
+    // A `none` value is SQL NULL, and the distinction from `some(integer(0))`
+    // is load-bearing: `sum` over no rows is NULL, while `count-all` over no
+    // rows is 0. Collapsing the two would make "nothing matched" and "the total
+    // happens to be zero" the same answer.
+    record group-row {
+        keys: list<value>,
+        values: list<option<value>>,
+    }
+
+    record aggregate-result {
+        groups: list<group-row>,
+        // The token that continues THIS traversal, when more groups follow.
+        //
+        // Present only for a ranked, limited, grouped query — the shape that
+        // has an ordering to be coherent about. An ungrouped total has nothing
+        // to continue, so this is `none` rather than a token that means
+        // nothing.
+        next-group-cursor: option<string>,
     }
 
     // -- Schema management --
@@ -270,6 +448,195 @@ interface store {
     drop-index: func(table: string, name: string) -> result<_, store-error>;
     list-indexes: func(table: string) -> result<list<index-def>, store-error>;
 
+    /// A maintained rollup: per-group totals the platform keeps up to date as
+    /// rows change, so `count`/`sum` over a declared grouping answer without
+    /// reading the rows.
+    ///
+    /// Declared like an index — you state the access pattern, the platform
+    /// picks the mechanism — and read through the ordinary `aggregate` call.
+    /// There is no separate "read the rollup" verb and there deliberately is
+    /// not one: a query either qualifies for the rollup or is computed, and
+    /// which happened is not something the caller chooses or can observe in the
+    /// answer.
+    ///
+    /// ## What it costs and when it pays
+    ///
+    /// One stored total per distinct value-tuple of `group`, updated on every
+    /// insert, update and delete of the table. It pays when the same grouped
+    /// total is read far more often than it changes, and when `group` has
+    /// BOUNDED cardinality — grouping by a customer is bounded by customers,
+    /// grouping by a request id is not. A `group` a unique index already
+    /// declares distinct is rejected: one stored total per row can never cost
+    /// less than reading the rows.
+    ///
+    /// ## Grouping by more than one column
+    ///
+    /// `group` is a LIST, and its order works exactly as a composite index's
+    /// does — because it is the same mechanism, a tuple-ordered key:
+    ///
+    /// * a query may fix a leading PREFIX of the list by equality and group by
+    ///   any prefix of what remains;
+    /// * it may not fix a trailing column alone, because the matching totals are
+    ///   scattered under every value of the ones before it.
+    ///
+    /// So `group = ["room-id", "post-id"]` answers "the totals per post in this
+    /// room" and "the total for this room", and `["post-id", "room-id"]` answers
+    /// neither. Choose the order the same way you would for an index: the
+    /// column you filter on first.
+    ///
+    /// ## Reading a total inside a transaction
+    ///
+    /// Maintenance is conflict-free, but **reading** a total is an ordinary
+    /// transactional read and takes a read-conflict range over the cells it
+    /// touches — which are the cells every other writer is adding to. So a
+    /// handler that bumps a total and then reads it back in the SAME
+    /// transaction makes concurrent writers conflict, losing the property this
+    /// whole mechanism exists to provide.
+    ///
+    /// Read a total inside a transaction only when you will DECIDE something
+    /// with it, and then read it before you write. To report a total back to a
+    /// caller, read it after the transaction commits.
+    ///
+    /// ## Constraints, all checked when you declare it
+    ///
+    /// * every `sum` column must be an integer column, and NOT NULL
+    /// * every `group` and `sum` column must exist and not be a counter column
+    /// * `group` must be non-empty and name no column twice
+    /// * at least one of `sum`/`count` must be asked for
+    ///
+    /// The NOT NULL rule is the surprising one and it is a correctness rule,
+    /// not a mechanical one: one stored total cannot distinguish "every value
+    /// in this group was null", where `sum` is null, from "the values cancelled
+    /// to zero", where it is 0. Refusing the declaration is what stops the same
+    /// query answering differently depending on whether a rollup exists.
+    ///
+    /// Declaring one on a table that already holds rows counts them first, so
+    /// the totals are correct from the moment it exists.
+    record rollup-def {
+        /// Identifies the rollup for `drop-rollup`. Not visible in results.
+        name: string,
+        /// The columns whose distinct value-tuples are the groups, in order.
+        /// Order is the composite-index rule — see above.
+        group: list<string>,
+        /// Columns to total, by name.
+        sum: list<string>,
+        /// Also maintain the number of rows per group.
+        ///
+        /// Required in practice: a rollup that does not count cannot serve any
+        /// query, because a group whose rows have all gone still holds a total
+        /// of zero and only the count distinguishes that from a group that
+        /// genuinely sums to zero.
+        count: bool,
+    }
+
+    create-rollup: func(table: string, rollup: rollup-def) -> result<_, store-error>;
+    drop-rollup: func(table: string, name: string) -> result<_, store-error>;
+    list-rollups: func(table: string) -> result<list<rollup-def>, store-error>;
+
+    /// A counter declared independently of any table: a conflict-free integer
+    /// addressed by a key tuple the declaration names, rather than by a row.
+    /// Distinct from a `column-def` with `counter = true`, whose cells are
+    /// scoped by a column ordinal and a rowid — this one has no table, no
+    /// rowid, and no column to hang off, so the declaration is what gives its
+    /// cells a keyspace of their own.
+    ///
+    /// ## What it costs
+    ///
+    /// One cell per distinct value-tuple of `key-cols`, created lazily on
+    /// first write. Unlike `rollup-def`, declaring a counter never backfills:
+    /// a rollup counts a table's EXISTING rows so its totals are correct from
+    /// the moment it exists, but a standalone counter has no rows to count —
+    /// its cells are addressed by a key tuple the caller supplies on each
+    /// read or write, not derived from anything already stored. So every key
+    /// simply starts at zero, and declaring the counter is O(1) regardless of
+    /// how much data already exists elsewhere in the tenant.
+    ///
+    /// ## The key tuple
+    ///
+    /// `key-cols` names the parts of the tuple that addresses one cell, in
+    /// order — the caller supplies one value per name on every read or write,
+    /// and the platform packs them into a key the same way a composite
+    /// index's columns are packed. The names are labels for that tuple's
+    /// positions, not references to any table's columns: a standalone counter
+    /// has no table, so `key-cols = ["ip", "window"]` means "this counter's
+    /// cell address is a 2-tuple, and here is what each position means,"
+    /// nothing more.
+    ///
+    /// ## Constraints, all checked when you declare it
+    ///
+    /// * `name` must be a valid identifier, and must not already be declared
+    /// * `key-cols` must be non-empty — a counter with no key addresses no
+    ///   cell, which is never useful
+    /// * every entry in `key-cols` must be a valid identifier
+    record counter-def {
+        /// Identifies the counter for lookup and for `list-counters`. Must be
+        /// a valid identifier and unique among this tenant's counters.
+        name: string,
+        /// The columns whose value-tuple addresses one cell, in key order.
+        /// Order matters exactly as it does for a composite index: a query may
+        /// fix a leading prefix by equality, and cannot fix a trailing element
+        /// alone. Must be non-empty, and every entry must be a valid
+        /// identifier.
+        key-cols: list<string>,
+        /// Assigned by the store when declared. Monotonic per tenant, never
+        /// reused — a dropped counter's cells can never be read back as a
+        /// different counter's, because the next declaration always gets a
+        /// fresh id.
+        counter-id: u32,
+    }
+
+    /// Declare a counter and get back its allocated id. See `counter-def` for
+    /// the full cost model and the constraints checked here — in short, fails
+    /// with `constraint-violation` if `name` is already declared, is not a
+    /// valid identifier, if `key-cols` is empty, or if any `key-cols` entry is
+    /// not a valid identifier.
+    create-counter: func(name: string, key-cols: list<string>) -> result<u32, store-error>;
+    /// Every counter this tenant has declared.
+    list-counters: func() -> result<list<counter-def>, store-error>;
+
+    /// Add `delta` to a standalone counter's cell, addressed by `key` — one
+    /// value per the declaration's `key-cols`, in the same order. The cell is
+    /// created lazily at zero on first write; declaring the counter does not
+    /// seed it.
+    ///
+    /// ## What it costs
+    ///
+    /// One native atomic add on the cell — it never reads the cell's current
+    /// value, so it takes NO read-conflict range. Two concurrent
+    /// `counter-add` calls against the SAME key, or against different keys of
+    /// the same counter, never commit-conflict with each other: this is the
+    /// entire reason the verb exists, as distinct from an ordinary
+    /// read-modify-write increment.
+    ///
+    /// ## Constraints
+    ///
+    /// * `name` must already be declared via `create-counter` — otherwise
+    ///   `not-found`
+    /// * `key` must carry exactly as many values as the declaration's
+    ///   `key-cols` — otherwise `constraint-violation`, naming both the
+    ///   declared and the given arity
+    counter-add: func(name: string, key: list<value>, delta: s64) -> result<_, store-error>;
+
+    /// Read a standalone counter's current cell value. A cell nothing has
+    /// ever added to reads as zero — a miss is not an error.
+    ///
+    /// `snapshot = true` takes NO read-conflict range: the read is cheap, but
+    /// the value it returns is NOT safe to branch on inside a transaction —
+    /// a concurrent `counter-add` against the same key can land after this
+    /// read completes without the enclosing transaction ever finding out.
+    /// `snapshot = false` takes the read-conflict range, so it IS safe to
+    /// branch on: the enclosing transaction is forced to conflict (and
+    /// retry) if another writer adds to this cell before it commits — at the
+    /// cost of contending with concurrent `counter-add` calls the ordinary
+    /// way.
+    ///
+    /// ## Constraints
+    ///
+    /// Same as `counter-add`: `name` must be declared (`not-found` if not),
+    /// and `key`'s arity must match `key-cols` (`constraint-violation`,
+    /// naming both arities, if not).
+    counter-get: func(name: string, key: list<value>, snapshot: bool) -> result<s64, store-error>;
+
     /// Add a column, or set/update the `default` of one that already exists.
     ///
     /// On an existing column the call succeeds only when the name, column type
@@ -304,6 +671,19 @@ interface store {
     // One find-result per query, positional.
     find-many: func(queries: list<find-query>) -> result<list<find-result>, store-error>;
     count: func(table: string, filters: list<filter>) -> result<u64, store-error>;
+    // Aggregate over the rows `options.filters` selects, optionally grouped.
+    //
+    // How it is answered is the store's choice — seeking an index, folding the
+    // matched rows, or reading a maintained rollup — and that choice is
+    // deliberately not a parameter. Declare what you want to know; the store
+    // decides how to find it.
+    //
+    // Read from ONE consistent snapshot: the whole walk runs in a single
+    // transaction, so the answer reflects one state of the table rather than a
+    // blend of several. Inside an open transaction it JOINS that transaction,
+    // so a handler sees its own uncommitted writes.
+    aggregate: func(table: string, options: aggregate-options)
+        -> result<aggregate-result, store-error>;
 
     update: func(table: string, id: u64, fields: list<column>) -> result<bool, store-error>;
     update-where: func(table: string, filters: list<filter>, fields: list<column>) -> result<u64, store-error>;

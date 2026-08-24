@@ -1,0 +1,23 @@
+error[E0277]: this query groups by a column but states no ceiling on how many groups it may materialize
+  --> tests/ui/query_grouped_fetch_groups.rs:20:26
+   |
+20 |     materialize_groups::<Grouped>();
+   |                          ^^^^^^^ needs a `.limit(n)` after the `.group_by(..)`
+   |
+   = help: the trait `BoundedGroups` is not implemented for `Grouped`
+   = note: `group_by(col)` yields one item per DISTINCT VALUE of `col`. That count is a property of the data, not of the query: `group_by(status)` may be three and `group_by(user_id)` one per tenant user, and nothing in the query says which.
+   = note: If the number of groups is bounded by construction — a fixed status set, the options on one poll — say so with `.limit(n)`.
+   = note: If it grows with the tenant, add `.order(agg::..().desc()).limit(n).cursor(token)` and end on `.fetch_group_page(|g| ..)`, which returns the token that continues the ranked listing.
+   = note: An UNGROUPED aggregate needs none of this: it is one group whatever the table size — use `.fetch_one_group()`.
+help: the following other types implement trait `BoundedGroups`
+  --> src/query.rs
+   |
+   | impl BoundedGroups for Unbounded {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `boogy_sdk::query::Unbounded`
+   | impl BoundedGroups for Bounded {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Bounded`
+note: required by a bound in `materialize_groups`
+  --> tests/ui/query_grouped_fetch_groups.rs:17:26
+   |
+17 | fn materialize_groups<B: BoundedGroups>() {}
+   |                          ^^^^^^^^^^^^^ required by this bound in `materialize_groups`

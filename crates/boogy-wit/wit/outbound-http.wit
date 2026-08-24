@@ -74,9 +74,11 @@ interface outbound-http {
         /// Manifest egress allowlist did not admit the host.
         host-not-allowed(string),
         /// Resolved IP fell into a blocked range (RFC1918, loopback,
-        /// link-local, multicast, ::1, fc00::/7, etc.) and the
-        /// manifest did not opt out of the SSRF firewall via
-        /// `[outbound.allow_loopback] enabled = true`.
+        /// link-local, multicast, ::1, fc00::/7, etc.). Loopback
+        /// admission is operator-only (a `BOOGY_EGRESS_ALLOW_LOOPBACK`
+        /// env var on the host, for local dev / test harnesses only) —
+        /// there is no manifest field and no way for a guest to opt
+        /// out of this for a deployed service.
         blocked-address(string),
         /// HTTPS-only enforcement: scheme was http:// without
         /// `[outbound] allow_plaintext = true`.

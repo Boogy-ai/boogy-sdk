@@ -8,9 +8,38 @@
 //!   what the first page just showed. Cursors anchor on the last
 //!   row's id, so concurrent inserts don't smear into the page
 //!   boundary.
-//! - **Constant-cost.** `WHERE id > <last>` is an indexed lookup.
-//!   `OFFSET 10000` scans 10001 rows before returning the first
-//!   one — a scaling cliff that production APIs eventually hit.
+//! - **No deep-page cliff.** `OFFSET 10000` scans 10001 rows before
+//!   returning the first one. A cursor names where to resume, so page
+//!   *k* never pays for the *k-1* pages before it.
+//!
+//! ## Cost: the two cursor shapes are not equivalent
+//!
+//! **Only the composite shape is O(page).** A cursor carrying a sort
+//! value ([`Cursor::keyset`]) resumes on `(sort_col, _id)`, and when the
+//! table declares a matching access pattern — `list_by(filter = "…",
+//! newest = "…")` on the model, which derives the covering
+//! `[filter_col, sort_col]` index — the store recognises that boundary as
+//! a POSITION in the index and seeks straight to it. Cost is the page,
+//! whatever the table holds.
+//!
+//! **The id-only shape ([`Cursor::id_only`], `last_value` null) is not.**
+//! `_id` is the row's auto-assigned primary key, not a declared column, so
+//! it cannot be named as the sort column of an access pattern — which
+//! means `_id > <last>` reaches the store as an ordinary predicate rather
+//! than as a resume position. It is evaluated per row, so the walk starts
+//! where it started the first time and discards everything the earlier
+//! pages already returned. Measured on a 40,000-row table, one page cost
+//! ~40,000 key reads; with an equality filter over a composite index it
+//! cost ~80,000. The answers are correct, which is why only a cost
+//! measurement finds this.
+//!
+//! So: **declare an access pattern and page with [`Cursor::keyset`].**
+//! `auth::find_owned` enforces this — without a declared order column it
+//! returns a named error instead of serving any page. That check runs
+//! after the underlying read has already happened, so it stops a wrong
+//! page from reaching the caller; it does not bound the cost of getting
+//! there. Reach for [`Cursor::id_only`] only for sets that are small by
+//! construction.
 //!
 //! ## Shape
 //!
@@ -58,13 +87,15 @@
 //!     // a separate count query.
 //!     let result = store::find("items", &store::FindOptions {
 //!         filters,
-//!         sort: vec![store::SortBy {
+//!         order_by: vec![store::OrderTerm::Column(store::SortBy {
 //!             column: "_id".into(),
 //!             dir: store::SortDir::Asc,
-//!         }],
+//!         })],
 //!         page: Some(store::Page { limit: (q.limit + 1) as u32, offset: 0 }),
 //!         or_groups: vec![],
 //!         skip_total: true,
+//!         group_cursor: None,
+//!         counters: vec![],              // no counter merge in this example
 //!     })
 //!     .map_err(ApiError::internal)?;
 //!
@@ -271,6 +302,182 @@ pub fn keyset_resume_filter(
         ],
     ];
     (vec![], or_groups)
+}
+
+/// Confirm that a keyset page resumed strictly PAST the one before it.
+///
+/// A keyset loop that gathers every matching row terminates only when a page
+/// comes back empty, so it depends on each page starting after the last row of
+/// the previous one. `_id` is unique per row, so a page whose last row repeats
+/// the previous boundary is proof the resume boundary had no effect — and
+/// continuing would read that same page forever.
+///
+/// Returns `Err` with a message naming what to change, rather than spinning or
+/// stopping. Stopping would be worse than the spin: it hands back a partial
+/// listing that looks complete.
+///
+/// `previous` is `None` for the first page, which is always progress.
+pub fn keyset_advanced(
+    table: &str,
+    order_col: &str,
+    previous: Option<&Cursor>,
+    next: &Cursor,
+) -> Result<(), String> {
+    let Some(prev) = previous else { return Ok(()) };
+    if prev.last_id != next.last_id {
+        return Ok(());
+    }
+    Err(format!(
+        "listing '{table}' cannot make progress: a page ended on the same row (id {}) as the page \
+         before it, so paging by '{order_col}' would repeat that page forever. Give '{order_col}' \
+         a value that is set on every row and never changes after the row is written — a column \
+         left empty on some rows cannot order them.",
+        next.last_id,
+    ))
+}
+
+/// The largest page any bounded listing helper will serve in one call.
+///
+/// A ceiling, not a default: [`PageRequest::new`] CLAMPS to it rather than
+/// erroring, because a caller asking for more has not made a mistake it can
+/// correct — it has asked for something the platform will not do, and the
+/// answer is a page plus a cursor, not a failure.
+pub const MAX_PAGE_LIMIT: usize = 200;
+
+/// The page size a listing serves when the caller states none.
+pub const DEFAULT_PAGE_LIMIT: usize = 20;
+
+/// How much of a listing one call may read, and where it resumes.
+///
+/// **This type is why an unbounded listing has no representation.** `limit` is
+/// private and every constructor clamps it to [`MAX_PAGE_LIMIT`], so there is
+/// no value a caller can pass — no `0`, no `usize::MAX`, no "all" — that asks a
+/// helper for a whole table. The listing helpers take this instead of a limit
+/// number for exactly that reason: a check that a caller can be talked out of
+/// is a convention, and the conventions here were already written down (in a
+/// retired-spelling: the "small bounded sets" label is obsolete —
+/// listings return a bounded `RowPage`. Quoted because the label is the
+/// counter-example this type exists to answer.
+/// doc comment saying "for small bounded sets") when a listing exhausted a
+/// 32 MiB guest heap and trapped on `handle_alloc_error`.
+///
+/// The resume token is kept VERBATIM alongside its decoded form. A token that
+/// cannot be decoded is refused by the helper rather than dropped: dropping it
+/// silently restarts a listing the caller believes it is continuing, which
+/// re-serves page one forever.
+#[derive(Debug, Clone)]
+pub struct PageRequest {
+    limit: usize,
+    token: Option<String>,
+    cursor: Option<Cursor>,
+}
+
+impl PageRequest {
+    /// A page of `limit` rows resuming from `token`.
+    ///
+    /// `limit` is clamped into `1..=`[`MAX_PAGE_LIMIT`]. Zero clamps UP: a
+    /// page of nothing carries no cursor to continue from, so it would end a
+    /// walk that had not started.
+    pub fn new(limit: usize, token: Option<String>) -> Self {
+        let limit = limit.clamp(1, MAX_PAGE_LIMIT);
+        let cursor = token.as_deref().and_then(decode);
+        Self { limit, token, cursor }
+    }
+
+    /// The first page at the default size — the listing a handler serves when
+    /// its caller asked for no page in particular.
+    pub fn first() -> Self {
+        Self::new(DEFAULT_PAGE_LIMIT, None)
+    }
+
+    /// Rows this page may hold, already clamped.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// The decoded resume position, if this page continues a listing.
+    pub fn cursor(&self) -> Option<&Cursor> {
+        self.cursor.as_ref()
+    }
+
+    /// True when a token was supplied but could not be decoded — the case a
+    /// helper must refuse rather than treat as "start over".
+    pub fn has_unreadable_token(&self) -> bool {
+        self.token.is_some() && self.cursor.is_none()
+    }
+}
+
+/// A bounded page of store rows, plus where the next page resumes.
+///
+/// Returned by the principal-scoped listing helper instead of a `Vec<Row>`.
+/// The rows stay rows — a handler that must batch-load children off the page
+/// (the eager-load shape) needs them before it can build its response — but
+/// they arrive attached to the cursor that continues the listing, so a handler
+/// cannot serve a page without having been handed the means to expose the rest.
+pub struct RowPage {
+    pub rows: Vec<crate::store::Row>,
+    /// The token the next page resumes from. `None` means this was the last
+    /// page — the only end-of-listing marker.
+    pub next_cursor: Option<String>,
+}
+
+/// A bounded page of typed model rows, plus where the next page resumes.
+///
+/// What [`RowPage`] is to `Vec<Row>`, this is to `Vec<M>`: the return type of
+/// the typed listing verb, carrying the cursor that continues it so a handler
+/// cannot serve a page without having been handed the means to expose the rest.
+pub struct ModelPage<M> {
+    pub items: Vec<M>,
+    /// The token the next page resumes from. `None` means this was the last
+    /// page — the only end-of-listing marker.
+    pub next_cursor: Option<String>,
+}
+
+impl<M> ModelPage<M> {
+    /// Items on this page.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// True when this page carries no items at all.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// True when no page follows this one.
+    pub fn is_last(&self) -> bool {
+        self.next_cursor.is_none()
+    }
+}
+
+impl RowPage {
+    /// Rows on this page.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// True when no page follows this one.
+    pub fn is_last(&self) -> bool {
+        self.next_cursor.is_none()
+    }
+
+    /// Render this page as the SDK's wire envelope, carrying the cursor
+    /// through. One call, so a handler cannot map the rows and forget the
+    /// cursor — which would turn a bounded page back into a truncation.
+    pub fn map<T, F>(&self, row_to_item: F) -> CursorPage<T>
+    where
+        T: Serialize,
+        F: Fn(&crate::store::Row) -> T,
+    {
+        CursorPage {
+            items: self.rows.iter().map(row_to_item).collect(),
+            next_cursor: self.next_cursor.clone(),
+        }
+    }
 }
 
 /// Pagination response envelope. Serializes as
@@ -529,6 +736,43 @@ mod tests {
         assert!(base64_url_decode("ab=d").is_none());
     }
 
+    // -- keyset_advanced tests --
+
+    use serde_json::json;
+
+    fn cur(id: &str, v: serde_json::Value) -> Cursor {
+        Cursor { last_id: id.to_string(), last_value: v }
+    }
+
+    #[test]
+    fn first_page_always_advances() {
+        assert!(keyset_advanced("notes", "created_at", None, &cur("7", json!(1))).is_ok());
+    }
+
+    #[test]
+    fn a_page_ending_on_a_new_row_advances() {
+        let prev = cur("7", json!(1));
+        assert!(keyset_advanced("notes", "created_at", Some(&prev), &cur("8", json!(1))).is_ok());
+    }
+
+    #[test]
+    fn a_page_ending_on_the_same_row_is_refused_by_name() {
+        let prev = cur("7", json!(1));
+        let err = keyset_advanced("notes", "created_at", Some(&prev), &cur("7", json!(1)))
+            .expect_err("repeating the boundary row is not progress");
+        assert!(err.contains("cannot make progress"), "{err}");
+        assert!(err.contains("created_at"), "the message must name the order column: {err}");
+        assert!(err.contains("notes"), "the message must name the table: {err}");
+    }
+
+    /// The sort VALUE moving is not progress on its own — the row is the
+    /// boundary, and a repeated row means the same page comes back.
+    #[test]
+    fn a_moving_sort_value_on_the_same_row_is_still_refused() {
+        let prev = cur("7", json!(1));
+        assert!(keyset_advanced("notes", "created_at", Some(&prev), &cur("7", json!(99))).is_err());
+    }
+
     // -- keyset_resume_filter tests --
 
     #[test]
@@ -629,5 +873,91 @@ mod tests {
         assert!(matches!(id_val("42"), Val::Integer(42)));
         assert!(matches!(id_val("0"), Val::Integer(0)));
         assert!(matches!(id_val("not-a-number"), Val::Text(s) if s == "not-a-number"));
+    }
+
+    // -- PageRequest: the type that makes an unbounded ask unrepresentable --
+
+    #[test]
+    fn page_request_clamps_an_enormous_limit() {
+        // The shape this whole type exists to refuse. There is no `limit`
+        // value — and no absence of one — that yields a whole-table read.
+        assert_eq!(PageRequest::new(usize::MAX, None).limit(), MAX_PAGE_LIMIT);
+        assert_eq!(PageRequest::new(MAX_PAGE_LIMIT + 1, None).limit(), MAX_PAGE_LIMIT);
+        assert_eq!(PageRequest::new(1_000_000, None).limit(), MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn page_request_clamps_zero_upward() {
+        // A page of nothing carries no row to build a cursor from, so it would
+        // end a walk that never started — a silent empty listing.
+        assert_eq!(PageRequest::new(0, None).limit(), 1);
+    }
+
+    #[test]
+    fn page_request_keeps_a_limit_it_can_honour() {
+        assert_eq!(PageRequest::new(37, None).limit(), 37);
+        assert_eq!(PageRequest::new(MAX_PAGE_LIMIT, None).limit(), MAX_PAGE_LIMIT);
+        assert_eq!(PageRequest::first().limit(), DEFAULT_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn page_request_decodes_a_token_it_issued() {
+        let token = encode(&Cursor::keyset("42", serde_json::json!(1_700)));
+        let req = PageRequest::new(10, Some(token));
+        assert!(!req.has_unreadable_token());
+        let c = req.cursor().expect("a round-tripped token decodes");
+        assert_eq!(c.last_id, "42");
+        assert_eq!(c.last_value, serde_json::json!(1_700));
+    }
+
+    #[test]
+    fn page_request_flags_a_token_it_cannot_read() {
+        // Reported rather than dropped: a dropped token silently restarts a
+        // listing the caller believes it is continuing, so the walk re-serves
+        // page one forever and never terminates.
+        let req = PageRequest::new(10, Some("!!!not-a-cursor!!!".to_string()));
+        assert!(req.cursor().is_none());
+        assert!(req.has_unreadable_token());
+    }
+
+    #[test]
+    fn no_token_is_not_an_unreadable_token() {
+        assert!(!PageRequest::first().has_unreadable_token());
+    }
+
+    // -- RowPage --
+
+    fn row(id: i64, title: &str) -> crate::store::Row {
+        crate::store::Row {
+            columns: vec![
+                ("_id".to_string(), Val::Integer(id)),
+                ("title".to_string(), Val::Text(title.to_string())),
+            ],
+        }
+    }
+
+    #[test]
+    fn row_page_map_carries_the_cursor_with_the_items() {
+        // One call, so a handler cannot render the rows and drop the cursor —
+        // which is how a bounded page turns back into a silent truncation.
+        let page = RowPage {
+            rows: vec![row(1, "a"), row(2, "b")],
+            next_cursor: Some("tok".to_string()),
+        };
+        let out = page.map(|r| r.text("title"));
+        assert_eq!(out.items, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(out.next_cursor.as_deref(), Some("tok"));
+        assert!(!page.is_last());
+        assert_eq!(page.len(), 2);
+    }
+
+    #[test]
+    fn row_page_without_a_cursor_is_the_last_page() {
+        let page = RowPage { rows: vec![], next_cursor: None };
+        assert!(page.is_last());
+        assert!(page.is_empty());
+        let out = page.map(|r| r.id());
+        assert!(out.items.is_empty());
+        assert!(out.next_cursor.is_none());
     }
 }

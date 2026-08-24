@@ -1,0 +1,5 @@
+error: #[counter(...)] cannot combine `of = <Model>` with `key = (...)` — `of` is sugar for keying on that model's row id; use `#[counter(of = Room, name = "post_count")]` for a counter attached to a model's row, or `#[counter(key = (col_a, col_b))]` for a counter keyed by an arbitrary tuple attached to no model, not both
+  --> tests/ui/counter_marker_of_and_key_together.rs:17:12
+   |
+17 | pub struct RoomPostCount;
+   |            ^^^^^^^^^^^^^

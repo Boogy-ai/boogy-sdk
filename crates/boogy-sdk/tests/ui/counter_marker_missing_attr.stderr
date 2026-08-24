@@ -1,0 +1,5 @@
+error: #[derive(Counter)] requires either `#[counter(of = <Model>, name = "<column>")]` (a counter attached to a model's counter column) or `#[counter(key = (col_a, col_b))]` (a counter keyed by an arbitrary tuple, attached to no model) — e.g. `#[counter(of = Room, name = "post_count")]` or `#[counter(key = (ip, window))]`
+ --> tests/ui/counter_marker_missing_attr.rs:7:12
+  |
+7 | pub struct RoomPostCount;
+  |            ^^^^^^^^^^^^^

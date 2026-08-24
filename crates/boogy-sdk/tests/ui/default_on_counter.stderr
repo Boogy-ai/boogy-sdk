@@ -1,5 +1,0 @@
-error: #[counter] cannot be combined with #[default]: a counter's value is read from its own cell, so the default would never be observed. An absent counter already reads as 0.
-  --> tests/ui/default_on_counter.rs:11:9
-   |
-11 |     pub hits: i64,
-   |         ^^^^

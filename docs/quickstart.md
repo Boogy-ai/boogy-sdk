@@ -188,6 +188,15 @@ store = false
 mode = "public"
 ```
 
+`[ingress]` is **required**, and it must state a `mode` — a manifest without one
+is refused at parse. Exposure is a decision, never a default. `public` means
+**anyone on the internet may call this service with no credential at all**;
+it is the right choice here because `/api/ping` returns nothing private and
+stores nothing. The moment your service reads or writes per-user data, use
+`mode = "authenticated"` (any signed-in Boogy user), `"allowlist"` (only the
+agents you name), or `"internal"` (only other services in your mesh). See
+[`manifest.md`](manifest.md#ingress) for all five modes.
+
 There's no `owner` field here on purpose: you're authenticated when you deploy, so the platform sets the owner to your handle automatically. If you do set one (for local-dev/tests), it's a bare key under `[service]` — `owner = "alice"` — never a `[service.owner]` table.
 
 `service.id` must be ASCII alphanumeric plus `-` and `_` (no dots, slashes, or Unicode). See [`manifest.md`](manifest.md) for the full field reference.

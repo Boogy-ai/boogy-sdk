@@ -68,6 +68,13 @@ pub fn resolve(table: &str, patterns: &[AccessPattern], explicit: &[Index]) -> (
                 want(vec![column.clone()], true, false, true, false),
             AccessPattern::TaggedBy { tag, refs } =>
                 want(vec![tag.clone(), refs.clone()], false, true, false, false),
+            // A rollup needs no index. It is a different mechanism — stored
+            // per-group totals — rather than a different key order, so it
+            // contributes nothing here and is applied on its own pass. Left as
+            // an explicit arm rather than a `_`: a future pattern that DOES
+            // want an index should fail to compile here, not be silently
+            // ignored alongside this one.
+            AccessPattern::Rollup { .. } => {}
         }
     }
     for ix in explicit {

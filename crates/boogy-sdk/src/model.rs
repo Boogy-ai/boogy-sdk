@@ -7,7 +7,8 @@
 
 use core::marker::PhantomData;
 
-use crate::store::{ColDef, ColType, Row, Table, Val};
+use crate::error::ApiError;
+use crate::store::{ColDef, ColType, Row, StoreError, Table, Val};
 
 /// One column's worth of typing: how a Rust field maps to a stored
 /// column and how it round-trips through the portable [`Val`] enum.
@@ -117,6 +118,15 @@ impl<T> Field for Id<T> {
     fn col_type() -> ColType { ColType::Integer }
     fn to_val(&self) -> Val { Val::Integer(self.raw as i64) }
     fn from_val(v: &Val) -> Self { Id::new(v.as_int() as u64) }
+}
+
+/// Lets `Id<T>` serve as a [`Counter::Key`] for an `of = Model` counter: a
+/// single-element key-tuple wrapping the row's id, same encoding
+/// `Field::to_val` already gives it.
+impl<T> From<Id<T>> for Vec<Val> {
+    fn from(id: Id<T>) -> Vec<Val> {
+        vec![id.to_val()]
+    }
 }
 
 /// A fixed-point decimal — money, a score, a weight — exact to 6 decimal
@@ -355,6 +365,15 @@ impl Timestamp {
     pub fn get(&self) -> i64 { self.0 }
 }
 
+/// So a timestamp column can be compared against a plain millisecond value —
+/// `Poll::closed_at.eq(OPEN_SENTINEL)` — without the caller wrapping it. The
+/// column's type still rejects a string, which is the check that matters.
+impl From<i64> for Timestamp {
+    fn from(millis: i64) -> Self {
+        Timestamp(millis)
+    }
+}
+
 impl Field for Timestamp {
     fn col_type() -> ColType { ColType::Integer }
     fn to_val(&self) -> Val { Val::Integer(self.0) }
@@ -375,6 +394,139 @@ pub trait Model: Sized {
     fn to_columns(&self) -> Vec<(String, Val)>;
     /// The `#[pk]` field as a u64, or `None` if the model has no `#[pk]`.
     fn id(&self) -> Option<u64>;
+}
+
+/// A freestanding, typed counter — either the name for a counter column
+/// already declared on a `#[derive(Model)]` struct (with
+/// `#[model(counter(name = "..."))]`), or a counter keyed by an arbitrary
+/// tuple attached to no model at all. Implemented by `#[derive(Counter)]`:
+///
+/// ```ignore
+/// #[derive(Counter)]
+/// #[counter(of = Post, name = "vote_score")]
+/// pub struct PostVoteScore;          // keyed by the post's row id
+/// ```
+///
+/// ```ignore
+/// #[derive(Counter)]
+/// #[counter(key = (room_id, day))]
+/// pub struct RoomDailyPosts;         // keyed by an arbitrary tuple, no model
+/// ```
+///
+/// `of` and `key` are mutually exclusive: `of` is sugar for keying on that
+/// model's row id, so combining them — or giving neither — is a compile
+/// error naming the fix, not a derive that silently picks one.
+///
+/// For `of = Model`, this does **not** declare storage of its own: `Post`'s
+/// own `#[model(counter(name = "vote_score"))]` declaration is what
+/// `#[derive(Model)]` still turns into a column and a write path
+/// (`upsert_increment`) — unchanged by this derive. `Counter` only gives
+/// that existing cell a name and a typed key, so it can be addressed (read
+/// through the store's column-scoped counter path) without fetching or
+/// decoding the row it lives on. For `key = (..)`, there is no row, no
+/// rowid and no model at all — the counter's cells are its own storage, one
+/// per distinct key tuple ever added to.
+///
+/// `NAME` is `"<table>.<column>"` for `of = Model` (built at compile time
+/// from `<of as Model>::TABLE` and the declared column name — so a
+/// `#[model(table = "...")]` rename on the parent moves the identity with
+/// it, the same guarantee `#[belongs_to]` gives a foreign key), or the
+/// struct name in snake_case for `key = (..)` (override with
+/// `name = "..."`).
+///
+/// **Unbounded key cardinality is a new way to fill a keyspace.** A
+/// `key = (..)` counter allocates a cell for every DISTINCT key tuple it is
+/// ever added to and never reclaims one — declaring one keyed by something
+/// with no natural bound (a request id, a raw event id) grows storage
+/// without limit, the same risk `rollup-def`'s `group` documents: a grouping
+/// pays only when it has BOUNDED cardinality (a customer, a day, an IP),
+/// not an unbounded one (a request id). Size a counter's key the way you
+/// would size an index.
+///
+/// ## Reading: two verbs, one honest choice
+///
+/// [`Counter::add`] is a blind atomic increment: no read, never conflicts.
+/// Reading splits into two, mapping directly onto the store's snapshot vs.
+/// ordinary read:
+///
+/// - [`Counter::get`] — a **snapshot** read: cheap, takes no read-conflict
+///   range, and is therefore **not safe to branch on** inside a
+///   transaction — nothing guarantees the value is still current by the
+///   time that transaction commits.
+/// - [`Counter::get_for_update`] — an **ordinary** read: takes the
+///   conflict range, safe to branch on, and **contends by design** — that
+///   contention is the price of the guarantee, not a defect.
+///
+/// Today a counter used to be one number carrying a rule — *never gate a
+/// write on a counter read in the same transaction* — that failed silently
+/// when broken. Naming the two verbs makes the choice visible at the call
+/// site instead of leaving it to be discovered in production.
+pub trait Counter {
+    /// `"<table>.<column>"` for `of = Model`, or the counter's own name
+    /// (the struct name in snake_case, or an explicit `name = "..."`
+    /// override) for `key = (..)`.
+    const NAME: &'static str;
+    /// The key that addresses one cell of this counter. For `of = Model`
+    /// this is the parent row's id (`Id<of>`); for `key = (col_a, col_b)`
+    /// this is `[Val; N]`, one value per declared column, in the declared
+    /// order.
+    type Key: Into<Vec<Val>>;
+
+    /// Atomic increment. No read — never conflicts on this cell.
+    fn add<S: CounterStore>(store: &S, key: Self::Key, delta: i64) -> Result<(), ApiError> {
+        store.counter_add(Self::NAME, &key.into(), delta).map_err(ApiError::from)
+    }
+
+    /// Snapshot read: cheap, takes no read-conflict range, NOT safe to
+    /// branch on inside a transaction. See the trait docs.
+    fn get<S: CounterStore>(store: &S, key: Self::Key) -> Result<i64, ApiError> {
+        store.counter_get(Self::NAME, &key.into(), true).map_err(ApiError::from)
+    }
+
+    /// Ordinary read: takes the read-conflict range, safe to branch on,
+    /// contends by design. See the trait docs.
+    fn get_for_update<S: CounterStore>(store: &S, key: Self::Key) -> Result<i64, ApiError> {
+        store.counter_get(Self::NAME, &key.into(), false).map_err(ApiError::from)
+    }
+}
+
+/// The store operations [`Counter::add`]/[`Counter::get`]/
+/// [`Counter::get_for_update`] call through — binding-agnostic, the same
+/// seam [`IntoStoreError`](crate::store::IntoStoreError) uses to keep this
+/// crate free of any dependency on generated WIT bindings. A deployed
+/// service's generated glue supplies the live implementation (calling the
+/// store's `counter-add`/`counter-get`); nothing in this crate implements
+/// it, so tests exercise the default methods above with their own.
+pub trait CounterStore {
+    /// Atomic increment — a blind add, no read.
+    fn counter_add(&self, name: &str, key: &[Val], delta: i64) -> Result<(), StoreError>;
+    /// `snapshot = true` takes NO read-conflict range (cheap, not safe to
+    /// branch on inside a transaction); `false` takes the range (safe to
+    /// branch on, contends by design).
+    fn counter_get(&self, name: &str, key: &[Val], snapshot: bool) -> Result<i64, StoreError>;
+}
+
+/// Compile-time `"<table>.<column>"` builder for `#[derive(Counter)]`'s
+/// `Counter::NAME`. `N` must equal `table.len() + 1 + column.len()` — the
+/// derive computes it as a `const` expression at the call site. Not meant to
+/// be called directly.
+#[doc(hidden)]
+pub const fn concat_counter_name<const N: usize>(table: &str, column: &str) -> [u8; N] {
+    let t = table.as_bytes();
+    let c = column.as_bytes();
+    let mut buf = [0u8; N];
+    let mut i = 0;
+    while i < t.len() {
+        buf[i] = t[i];
+        i += 1;
+    }
+    buf[t.len()] = b'.';
+    let mut j = 0;
+    while j < c.len() {
+        buf[t.len() + 1 + j] = c[j];
+        j += 1;
+    }
+    buf
 }
 
 // Helper so the derive can build a ColDef without knowing the field's
@@ -586,5 +738,113 @@ mod tests {
         let t = Timestamp::new(1_716_000_000_000);
         assert_eq!(Timestamp::from_val(&t.to_val()), t);
         assert_eq!(Timestamp::col_type() as u8, ColType::Integer as u8);
+    }
+
+    // -----------------------------------------------------------------
+    // `Counter`'s read-verb split: `get` must read snapshot=true,
+    // `get_for_update` must read snapshot=false, and `add` must call the
+    // increment path — pinned against a fake `CounterStore` so this is a
+    // fast, host-only proof that the two verbs are genuinely different
+    // calls (not the same call under two names). The live-cluster proof
+    // that snapshot=true/false actually differ in the store's conflict behaviour
+    // lives in `crates/tests-integration/src/standalone_counters.rs`
+    // (`a_snapshot_read_takes_no_conflict_range_and_an_update_read_does`),
+    // which this test does not duplicate.
+    // -----------------------------------------------------------------
+
+    #[derive(Debug, PartialEq)]
+    enum RecordedCall {
+        Add { name: String, key: Vec<Val>, delta: i64 },
+        Get { name: String, key: Vec<Val>, snapshot: bool },
+    }
+
+    struct FakeCounterStore {
+        calls: std::cell::RefCell<Vec<RecordedCall>>,
+    }
+
+    impl CounterStore for FakeCounterStore {
+        fn counter_add(&self, name: &str, key: &[Val], delta: i64) -> Result<(), StoreError> {
+            self.calls.borrow_mut().push(RecordedCall::Add {
+                name: name.to_string(),
+                key: key.to_vec(),
+                delta,
+            });
+            Ok(())
+        }
+        fn counter_get(&self, name: &str, key: &[Val], snapshot: bool) -> Result<i64, StoreError> {
+            self.calls.borrow_mut().push(RecordedCall::Get {
+                name: name.to_string(),
+                key: key.to_vec(),
+                snapshot,
+            });
+            Ok(42)
+        }
+    }
+
+    struct Hits;
+    impl Counter for Hits {
+        const NAME: &'static str = "hits";
+        type Key = [Val; 1];
+    }
+
+    #[test]
+    fn get_reads_snapshot_true() {
+        let store = FakeCounterStore { calls: Default::default() };
+        let key = [Val::Text("1.2.3.4".to_string())];
+        assert_eq!(Hits::get(&store, key.clone()).unwrap(), 42);
+        assert_eq!(
+            store.calls.borrow()[0],
+            RecordedCall::Get { name: "hits".into(), key: key.to_vec(), snapshot: true },
+            "Counter::get must be a snapshot read (snapshot=true)"
+        );
+    }
+
+    #[test]
+    fn get_for_update_reads_snapshot_false() {
+        let store = FakeCounterStore { calls: Default::default() };
+        let key = [Val::Text("1.2.3.4".to_string())];
+        assert_eq!(Hits::get_for_update(&store, key.clone()).unwrap(), 42);
+        assert_eq!(
+            store.calls.borrow()[0],
+            RecordedCall::Get { name: "hits".into(), key: key.to_vec(), snapshot: false },
+            "Counter::get_for_update must take the conflict range (snapshot=false)"
+        );
+    }
+
+    /// The binding assertion at the SDK level: `get` and `get_for_update`
+    /// must issue DIFFERENT calls (different `snapshot` values) — if they
+    /// issued the same call, the two verbs would be lying about being
+    /// distinct.
+    #[test]
+    fn get_and_get_for_update_are_not_the_same_call() {
+        let store = FakeCounterStore { calls: Default::default() };
+        let key = [Val::Text("1.2.3.4".to_string())];
+        Hits::get(&store, key.clone()).unwrap();
+        Hits::get_for_update(&store, key.clone()).unwrap();
+        let calls = store.calls.borrow();
+        assert_ne!(calls[0], calls[1], "get and get_for_update must not be the same call");
+    }
+
+    #[test]
+    fn add_calls_the_increment_path_with_the_given_delta() {
+        let store = FakeCounterStore { calls: Default::default() };
+        let key = [Val::Text("1.2.3.4".to_string())];
+        Hits::add(&store, key.clone(), 5).unwrap();
+        assert_eq!(
+            store.calls.borrow()[0],
+            RecordedCall::Add { name: "hits".into(), key: key.to_vec(), delta: 5 },
+            "Counter::add must call the atomic-increment path with the given delta"
+        );
+    }
+
+    /// `Id<T>` (the `of = Model` key form) must also encode through the
+    /// same `Into<Vec<Val>>` seam — a single-element key-tuple wrapping the
+    /// row id, matching `Field::to_val`.
+    #[test]
+    fn id_key_encodes_as_a_single_element_key_tuple() {
+        struct Room;
+        let id: Id<Room> = Id::new(7);
+        let values: Vec<Val> = id.into();
+        assert_eq!(values, vec![Val::Integer(7)]);
     }
 }

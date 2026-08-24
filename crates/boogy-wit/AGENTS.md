@@ -92,7 +92,7 @@ Cross-service HTTP-style fetch. Target is another deployed workload. Call is in-
 
 **Gated by**: `[capabilities] outbound_http = true` (default: false).
 
-Outbound HTTP to arbitrary URLs. Request and response shapes are identical to `peer` but errors are distinct (URL validation, DNS, connection refused, SSRF firewall, rate limit, secret injection, etc.). Manifest gates include egress allowlist (`[outbound.allowed_hosts]`), SSRF firewall (`[outbound.allow_loopback]`), request/response size caps, timeout, and secret injection (`[secrets]`). Secrets are never visible to wasm — the host injects them as headers just before transmission.
+Outbound HTTP to arbitrary URLs. Request and response shapes are identical to `peer` but errors are distinct (URL validation, DNS, connection refused, SSRF firewall, rate limit, secret injection, etc.). Manifest gates include egress allowlist (`[outbound.allowed_hosts]`), request/response size caps, timeout, and secret injection (`[secrets]`). The SSRF firewall itself is always on and not manifest-configurable — its loopback exception is operator-only (`BOOGY_EGRESS_ALLOW_LOOPBACK` on the host), never a manifest setting. Secrets are never visible to wasm — the host injects them as headers just before transmission.
 
 | Function | Signature | Notes |
 |---|---|---|

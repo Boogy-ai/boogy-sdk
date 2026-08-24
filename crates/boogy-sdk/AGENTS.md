@@ -156,7 +156,7 @@ directly.
 | `auth::current_principal()` → `Option<String>` | Caller's principal id. `None` for anonymous requests. |
 | `auth::required()` → `Guard` | 401 guard for routes that require any authenticated caller (no specific resource). Pair with `auth::find_owned` or business logic that reads identity. |
 | `auth::owns_resource(table, owner_col, id_param)` → `OwnsResource` (impl `IntoGuard`) | Builder for a `Router::guard(...)`. Loads the row identified by `req.params[id_param]`, denies-by-existence-mask (404) if the row is missing **or** isn't owned by `current_principal()`, and stashes the loaded row in `req.ctx` at a slot keyed by `table` — read it back with `req.ctx.require_at::<Row>(table)`. Two guards over *different* tables on one route therefore can't collide even without `.slot()`; only override `.slot("name")` when two guards load the *same* table on one route (they'd otherwise target the same auto-derived slot, which fails loudly — see `Ctx::insert_at`). |
-| `auth::find_owned::<M>(owner_col)` → `Result<Vec<Row>, ApiError>` | Principal-scoped row list for index endpoints. The table comes from the model `M`, not a string — that is what lets the call read `M`'s declared access patterns and pick a safe read strategy. Returns 401-coded `ApiError` when anonymous. |
+| `auth::find_owned::<M>(owner_col, &PageRequest)` → `Result<RowPage, ApiError>` | Principal-scoped index endpoint: **one bounded page** plus the cursor the next page resumes from. The table comes from the model `M`, not a string — that is what lets the call read `M`'s declared access patterns and pick a safe read strategy. There is no unbounded form: `PageRequest`'s limit is private and clamped, so a whole-set read cannot be expressed. Returns 401-coded `ApiError` when anonymous. |
 | `auth::load_owned(table, owner_col, id)` → `Result<Option<Row>, ApiError>` | Single-row load with ownership check. `Ok(None)` for both "missing" and "not yours". Use in MCP / JSON-RPC handlers (where the resource id arrives in a body, not a path param). |
 | `DEFAULT_OWNER_COL: &str` | Convention column name (`"owner_principal"`). Use this constant in tables and auth helper calls. Do not invent alternatives like `"owner_id"` / `"created_by"`. |
 
@@ -201,21 +201,28 @@ fn get_room_post(req: &mut Req<'_>) -> Json<json::Value> {
 }
 ```
 
-REST list endpoint — `auth::find_owned` carries the auth check. It returns **every**
-row the principal owns, with no limit; that is right while a principal's set is small
-by construction. The moment it can grow with usage, switch to keyset (see
-"Filtering / sorting / paginating") — this recipe is the small-set case, not the
-default for lists in general.
+REST list endpoint — `auth::find_owned` carries the auth check and returns **one
+bounded page** plus the cursor to continue from. It cannot be asked for a whole
+set; `PageRequest` clamps its limit and keeps it private. Hand the cursor to your
+caller rather than looping over pages and concatenating — an endpoint that pages
+internally and rebuilds the full list has changed nothing. Reach for the `Query`
+DSL (see "Filtering / sorting / paginating") when the listing needs a predicate,
+order or projection this helper does not express.
 its `RpcError` converts to `ApiError` via `?`:
 ```rust
-#[derive(Serialize)]
-struct NotesList { items: Vec<json::Value>, count: usize }
+use boogy_sdk::pagination::{CursorPage, PageRequest};
 
-fn list_notes(_req: &mut Req<'_>) -> Result<Json<NotesList>, ApiError> {
-    let rows = auth::find_owned::<Note>(DEFAULT_OWNER_COL)?;
-    let items: Vec<_> = rows.iter().map(|r| r.to_json(&["title", "body"])).collect();
-    let count = items.len();
-    Ok(Json(NotesList { items, count }))
+fn list_notes(req: &mut Req<'_>) -> Result<Json<CursorPage<json::Value>>, ApiError> {
+    // The client's `?cursor=` token round-trips opaquely; `limit` is a hint the
+    // platform clamps. The listing ends when `next_cursor` is absent — the
+    // platform says where the end is, so page SIZE never means anything.
+    let page = auth::find_owned::<Note>(
+        DEFAULT_OWNER_COL,
+        &PageRequest::new(20, req.query("cursor").map(str::to_string)),
+    )?;
+    // `map` renders the items AND carries `next_cursor`, in one call, so the
+    // page cannot be served without the means to reach the rest of the set.
+    Ok(Json(page.map(|r| r.to_json(&["title", "body"]))))
 }
 ```
 
@@ -378,9 +385,8 @@ Three ways out, and they are not equivalent:
   first-write test and only shows up under accumulation, so reach for a
   default or `on_insert` first.
 
-Exempt from the rule entirely: columns with a `default`, and `#[counter]`
-columns (their value lives in a separate cell, so the row slot is empty by
-design).
+Exempt from the rule entirely: columns with a `default`, and counter columns
+(their value lives in a separate cell, so the row slot is empty by design).
 
 The error names the column: `NotNullViolation: column <name> is required and was
 omitted from the write`.
@@ -396,6 +402,18 @@ not** — and you do not hand-write a `cols` module either. `#[derive(Model)]`
 and `init_tables` reference those, so a rename is one edit and a typo is a
 compile error, not a silent 500. A hand-written `cols` module duplicates the
 derive and drifts from it.
+
+**Two handles per field, and they are for different jobs.** The derive also
+emits a *typed* column handle under the field's own (lower-case) name:
+
+| handle | type | use it for |
+|---|---|---|
+| `Thing::NAME` | `&'static str` | anywhere a column is genuinely just a name — row accessors (`r.text(Thing::NAME)`), `agg::sum(..)`, migrations' new-column declarations |
+| `Thing::name` | `Col<String>` | building query expressions — `.filter(Thing::name.eq("x"))`, `.order(Thing::created_at.desc())` |
+
+The typed one is what makes a comparison checkable: `Thing::priority.eq("high")`
+does not compile, because `priority` is `Col<i64>`. See
+[Filtering / sorting / paginating](#filtering--sorting--paginating).
 
 ```rust
 use boogy_sdk::model::{Id, Model as _, Timestamp};
@@ -477,15 +495,14 @@ difference matters, use `row.get(name)` and match `Val::Null`.
 | Helper | Returns | Use for |
 |---|---|---|
 | `get_row(table, id)` | `Result<Option<Row>, StoreError>` | Single row by `_id`. |
-| `find_all_rows(table)` | `Result<(Vec<Row>, u64), StoreError>` | Unfiltered list + total count. Use only when you specifically need all rows; for principal-scoping prefer `auth::find_owned`. |
+| `find_all_rows(table)` | `Result<(Vec<Row>, u64), StoreError>` | **One page** of an unfiltered list, plus the total. If more rows match than one page holds it returns an error naming the fix — it never hands back a prefix that looks complete. For principal-scoping use `auth::find_owned`, which pages; to visit a whole table use `for_each_batch`. |
 | `find_row_by(table, column, store::Value)` | `Result<Option<Row>, StoreError>` | First row matching `column = val`. Takes the WIT `store::Value` directly (e.g. `store::Value::Text("alice".into())`), same value type used by `store::insert` / `store::update`. |
-| `find_rows_by(table, column, store::Value)` | `Result<Vec<Row>, StoreError>` | **All** rows matching `column = val` — **no limit, and the index does not bound it**: an indexed seek is bounded by MATCH COUNT, not table size, so a match set that grows is materialized in full. Correct for sets that are small **by construction** (one owner's own resources, a lookup by unique key). For anything a client pages through, or any set that grows with usage, **keyset pagination is the default** — see "Filtering / sorting / paginating". |
-| `find_rows(table, filters, sort, page)` | `Result<(Vec<Row>, u64), StoreError>` | General-purpose composite query: multi-filter, composite sort, optional page. `filters` is `Vec<store::Filter>`, `sort` is `Vec<store::SortBy>`. Composite sort lets you tiebreak (e.g. `created_at DESC, _id ASC`). For one-filter cases prefer `find_rows_by`; for an OR clause use `find_rows_grouped`. |
-| `find_rows_grouped(table, filters, or_groups, sort, page, skip_total)` | `Result<(Vec<Row>, u64), StoreError>` | Like `find_rows` but with an OR-of-AND clause: a row matches when `ALL(filters) AND (or_groups empty OR ANY(group: ALL(group)))`. `or_groups` is `Vec<Vec<store::Filter>>` — each inner `Vec` is one AND-group, groups are ORed. Use for composite keyset pagination (see below). The trailing `bool` is the one `find_rows` hard-codes to `false`: `skip_total` returns `0` for the count instead of computing it — pass `true` whenever you discard the total. Empty `or_groups` + `skip_total = false` == `find_rows`. |
-| `upsert_increment(table, key, counter, delta, columns)` | `Result<u64, StoreError>` | Atomic keyed counter: inserts the row (counter = delta, plus `columns.always ∪ columns.on_insert`) if it doesn't exist, or increments the counter and overwrites `columns.always` if it does. `key` is `&[store::Column]` identifying the unique key. `counter` is the column name. `delta` must be `store::Value::Integer` or `store::Value::Real` — the host rejects other types. **On a `#[counter]` column only `Integer` is accepted**: that column is a 64-bit signed integer cell mutated by an atomic add, so a `Real` delta is an error (and the add wraps on overflow rather than saturating). `columns` is a `store::UpsertColumns { always, on_insert }` (SDK: `UpsertColumns<'_>`) — `always` is `&[store::Column]` written on **every** call; `on_insert` is `&[store::Column]` written **only** by the call that creates the row. **A non-empty `always` is NOT conflict-free even on a `#[counter]` column**: those columns go through an ordinary row read-modify-write, so the call still conflicts under contention inside `tx(...)` — retried automatically, then 503 (see the `#[counter]` rules below). `on_insert` does not carry this cost on the insert arm, but the counter's own read-modify-write arm (a plain, non-`#[counter]` target column) still rewrites the row through the ordinary update regardless — `on_insert` narrows *which* columns get written, not whether that arm contends. Returns the row id. **Requires a UNIQUE index covering the key columns** — the call is refused with `ConstraintViolation` without one; there is no scan fallback. Use for per-key aggregations (e.g. view counts, score accumulators, per-tag event counts). **The first call for a key INSERTS, so `key ∪ always ∪ on_insert ∪ {counter}` must cover every non-nullable column that has no default** — otherwise that call is refused with `ConstraintViolation` naming the missing column (see *NOT NULL is enforced* above; prefer a `default` for a static value, `on_insert` for a computed one, over padding `always`, which is rewritten on every call). A column named in both `always` and `on_insert` is refused with `ConstraintViolation` naming it. |
-| `for_each_batch(table, filters, or_groups, order_col, dir, batch_size, f)` | `Result<(), StoreError>` | Bounded-memory ordered streaming over a table. Opens a stateless `row-cursor`, calls `f(&[Row])` once per batch of up to `batch_size` rows, and loops until the table is exhausted. Walks in `order_col` / `dir` order — **on the built-in engine `order_col` is an *index name*, not a column name**: pass a declared index's name, or `None` for primary-key order (a bare column name errors with `NotFound`) — with no offset re-scan. **Exactly-once holds in PRIMARY-KEY order only.** There the cursor resumes from the row key, which never moves. In INDEX order the resume bound is the index entry, which embeds the indexed VALUE: a row whose indexed column is updated during the walk relocates, and is visited TWICE if it moves backward past the cursor or SKIPPED if it moves forward. So if `f` does anything non-idempotent — charging, sending, incrementing — walk in primary-key order, or make `f` safe to repeat. **Read-committed, not snapshot-isolated**: rows inserted or modified after the cursor opens may or may not appear depending on timing. **Cannot be called inside `tx(...)`** — the transaction view has no cursor, so it returns `Unsupported` (501); gather the ids you need before opening the tx, or use `find_rows` inside it. This is the bounded-memory alternative to `find_all_rows` / offset pagination for large-table batch jobs (e.g. decay sweeps, export pipelines, fan-out tasks): only `batch_size` rows are ever in memory at a time. If `f` returns `Err`, iteration stops and the error propagates. |
+| `find_rows_by(table, column, store::Value)` | `Result<Vec<Row>, StoreError>` | **At most one page** of the rows matching `column = val`; beyond that, a named error with the remedy. This is the UNTYPED lookup — with only a table name there is no model schema to read a declared `list_by` from, so there is no sort column it could page along. Correct for sets that are small **by construction** (a lookup by unique key). For anything a client pages through, use the typed `db_find_by_page::<M>(col, val, &page)` or the Query DSL's `fetch_page` — see "Filtering / sorting / paginating". |
+| `find_rows(table, filters, sort, page)` | `Result<(Vec<Row>, u64), StoreError>` | General-purpose composite query: multi-filter, composite sort, **required** page. `filters` is `Vec<store::Filter>`, `sort` is `Vec<store::OrderTerm>`, `page` is a `store::Page` (build it with `page(limit, offset)`) — there is no "unpaged" spelling, because an absent page is not "no limit", it is "the store picks the limit and does not say so". Composite sort lets you tiebreak (e.g. `created_at DESC, _id ASC`). For one-filter cases prefer `find_rows_by`. |
+| `upsert_increment(table, key, counter, delta, columns)` | `Result<u64, StoreError>` | Atomic keyed counter: inserts the row (counter = delta, plus `columns.always ∪ columns.on_insert`) if it doesn't exist, or increments the counter and overwrites `columns.always` if it does. `key` is `&[store::Column]` identifying the unique key. `counter` is the column name. `delta` must be `store::Value::Integer` or `store::Value::Real` — the host rejects other types. **On a counter column only `Integer` is accepted**: that column is a 64-bit signed integer cell mutated by an atomic add, so a `Real` delta is an error (and the add wraps on overflow rather than saturating). `columns` is a `store::UpsertColumns { always, on_insert }` (SDK: `UpsertColumns<'_>`) — `always` is `&[store::Column]` written on **every** call; `on_insert` is `&[store::Column]` written **only** by the call that creates the row. **A non-empty `always` is NOT conflict-free even on a counter column**: those columns go through an ordinary row read-modify-write, so the call still conflicts under contention inside `tx(...)` — retried automatically, then 503 (see the counter-column rules below). `on_insert` does not carry this cost on the insert arm, but the counter's own read-modify-write arm (a plain, non-counter target column) still rewrites the row through the ordinary update regardless — `on_insert` narrows *which* columns get written, not whether that arm contends. Returns the row id. **Requires a UNIQUE index covering the key columns** — the call is refused with `ConstraintViolation` without one; there is no scan fallback. Use for per-key aggregations (e.g. view counts, score accumulators, per-tag event counts). **The first call for a key INSERTS, so `key ∪ always ∪ on_insert ∪ {counter}` must cover every non-nullable column that has no default** — otherwise that call is refused with `ConstraintViolation` naming the missing column (see *NOT NULL is enforced* above; prefer a `default` for a static value, `on_insert` for a computed one, over padding `always`, which is rewritten on every call). A column named in both `always` and `on_insert` is refused with `ConstraintViolation` naming it. |
+| `for_each_batch(table, filters, or_groups, order_col, dir, batch_size, counters, f)` | `Result<(), StoreError>` | Bounded-memory ordered streaming over a table. `counters` is `&[&str]` — counter column names to merge into every streamed row; `&[]` merges nothing (same opt-in `Query::with_counter` gives row listings, per-table granularity). Opens a stateless `row-cursor`, calls `f(&[Row])` once per batch of up to `batch_size` rows, and loops until the table is exhausted. Walks in `order_col` / `dir` order — **on the built-in engine `order_col` is an *index name*, not a column name**: pass a declared index's name, or `None` for primary-key order (a bare column name errors with `NotFound`) — with no offset re-scan. **Exactly-once holds in PRIMARY-KEY order only.** There the cursor resumes from the row key, which never moves. In INDEX order the resume bound is the index entry, which embeds the indexed VALUE: a row whose indexed column is updated during the walk relocates, and is visited TWICE if it moves backward past the cursor or SKIPPED if it moves forward. So if `f` does anything non-idempotent — charging, sending, incrementing — walk in primary-key order, or make `f` safe to repeat. **Read-committed, not snapshot-isolated**: rows inserted or modified after the cursor opens may or may not appear depending on timing. **Cannot be called inside `tx(...)`** — the transaction view has no cursor, so it returns `Unsupported` (501); gather the ids you need before opening the tx, or use a bounded `Query`/`find_rows` page inside it. This is the bounded-memory alternative to `find_all_rows` / offset pagination for large-table batch jobs (e.g. decay sweeps, export pipelines, fan-out tasks): only `batch_size` rows are ever in memory at a time. If `f` returns `Err`, iteration stops and the error propagates. |
 | `filter_eq(column, val)` | `store::Filter` | One-liner builder for `column = val`. One of a family (see below) — never hand-write the `Filter { column, op, val, in_values }` literal. |
-| `sort_asc(col)` / `sort_desc(col)` | `store::SortBy` | Build a sort key without spelling out `SortBy { column, dir }`. Compose into the `Vec<SortBy>` for `find_rows`. |
+| `sort_asc(col)` / `sort_desc(col)` | `store::OrderTerm` | Build a column ordering term without spelling out `store::OrderTerm::Column(store::SortBy { column, dir })`. Compose into the `Vec<store::OrderTerm>` for `find_rows`. |
 | `page(limit, offset)` | `store::Page` | Build a `Page`; wrap in `Some(...)`. First page = `page(n, 0)`. |
 | `now_millis()` | `u64` | Unix-millis time. Wraps `runtime::now_millis()` so submodules don't need to spell out the full bindings path. |
 
@@ -503,12 +520,17 @@ difference matters, use `row.get(name)` and match `Val::Null`.
 
 All return `store::Filter`; compose them in the `Vec<store::Filter>` you pass to `find_rows` / `count`. Prefer these over building `Filter { column, op, val, in_values }` by hand — the literal is verbose and the `in_values` field is a footgun (only `filter_in` sets it).
 
-**OR clauses + composite keyset pagination.** `find_rows`'s `filters` are AND-only. When you need OR — most commonly *correct* keyset pagination over a composite sort — use `find_rows_grouped`. The page after `(score, _id) = (c, cursor)` ordered `score DESC, _id DESC` is `score < c OR (score = c AND _id < cursor)`:
+**OR clauses + composite keyset pagination.** `find_rows`'s `filters` are AND-only, and the OR-capable form (`__boogy_find_rows_grouped`) is emitted PLUMBING, not the authoring surface — the `__boogy_` prefix says so. **Reach for the Query DSL instead:** `Query::on(T::TABLE).filter(..).order(T::col.desc()).limit(n).cursor(token).fetch_page(|row| ..)` builds exactly the shape below and hands back the token that continues it, so the sort column, its direction and the resume bound cannot drift apart. What follows is what the DSL emits, kept because the cost discussion after it is about that shape. The page after `(score, _id) = (c, cursor)` ordered `score DESC, _id DESC` is `score < c OR (score = c AND _id < cursor)`:
 
 ```rust
 /// `c` / `cursor` are the (score, _id) of the previous page's last row.
-fn page_after(c: i64, cursor: i64, limit: u32) -> Result<Vec<Row>, ApiError> {
-    let (page_rows, _total) = find_rows_grouped(
+fn page_after(c: i64, cursor: i64, limit: u32) -> Result<(Vec<Row>, bool), ApiError> {
+    // `_total` is `Option<u64>` — `None` under `skip_total`, never `Some(0)`.
+    // `has_more` is the store saying whether another page follows: the ONLY
+    // sound end-of-listing signal, because the store clamps `limit` to its own
+    // per-call ceiling and so neither a short page nor a full one means
+    // anything. Asking for `limit + 1` here would be clamped too.
+    let (page_rows, _total, has_more) = __boogy_find_rows_grouped(
         "posts",
         vec![filter_eq("deleted_at", store::Value::Text(String::new()))],   // AND-prefix
         vec![
@@ -519,8 +541,9 @@ fn page_after(c: i64, cursor: i64, limit: u32) -> Result<Vec<Row>, ApiError> {
         vec![sort_desc("score"), sort_desc("_id")],
         Some(page(limit, 0)),
         true,                                                           // skip_total — the total is discarded here
+        vec![],                                                         // counters — no counter-column merge here
     )?;
-    Ok(page_rows)
+    Ok((page_rows, has_more))
 }
 ```
 
@@ -530,7 +553,11 @@ The built-in store applies the OR-of-AND natively. An OR is seeked only when *ev
 
 **The rule: at least one AND-filter must be on a column that LEADS an index** — `filter_eq`, `filter_in`, `filter_is_null` and the range ops all seek, each becoming one bounded index sub-range or a fan-out of them. Failing that, an OR seeks when every arm carries such an equality. A filter on a column that appears only *later* in a composite is applied per row, so it narrows the result and not the conflict range. The keyset example above is index-served in a `tx` by `[deleted_at]` or `[deleted_at, score]` — the `deleted_at` equality leads both — but `deleted_at` is a low-selectivity column, so that sub-range is most of the table and conflicts accordingly. The composite buys a narrower footprint only because the call passes `skip_total` **and** a page, which is what lets the walk stop at `offset + limit`; drop either and it drains its whole `deleted_at = ""` sub-range, covering exactly the row set the single-column index's does — a different index subspace, the same rows, so no narrower in effect. Being index-served is not the same as being narrow.
 
-One thing is stricter inside a `tx`: a read whose only narrowing is its SORT (no filter on any leading index column) takes the whole table unless it also passes `skip_total` with a page. `find_rows` passes `skip_total = false`, so that route is closed to it — use `find_rows_grouped`'s `skip_total` argument when you don't need the count.
+One thing is stricter inside a `tx`: a read whose only narrowing is its SORT (no filter on any leading index column) takes the whole table unless it also passes `skip_total` with a page. `find_rows` passes `skip_total = false`, so that route is closed to it — use `Query…fetch_page` (which discards the total and so passes `skip_total = true`) when you don't need the count. This is the same distinction the one-page helpers pay — but only the two that still ask for a count. An exact total has to see every match, so `find_rows` and `find_all_rows`, which RETURN a total, are bounded in the ROWS they return and not in the keys they read. `find_rows_by`, `db_find_by` and `load_has_many` return no total and no longer ask for one: they pass `skip_total` with a page exactly as the paged terminals do. What that buys them is **decided by the plan, not by the verb** — on a walk or seek that can stop at `offset + limit` they are bounded in both; on a plan that must materialise the whole matching set before it can order or filter it (a fan-out of `IN` seeks, an equality seek on a composite's leading column with no sort, a scan) nothing stops at the page and declining the count saves nothing, because the count comes free with the drain. The paged terminals sit in exactly the same position for exactly the same reason.
+
+**And what declining does depends on the PATH as well as the plan** — the two halves of this paragraph are not the same statement. *Outside* a transaction a bounded walk can pull `offset + limit` and count the rest in a separate pass, so `skip_total` removes that second pass rather than creating a bound. *Inside* a transaction there is no second pass to remove: a counting pass would be another read in the same transaction, and a whole-table one, so a read that wants an exact total has to drain. There, `skip_total` **plus a page** is exactly what creates the bound — it is what lets the planner offer the walk at all and what stops it at `offset + limit` — which is the same thing said at the top of this section, and the reason `find_rows` cannot take that route. The one exception is the plan that owes a re-sort: it gives up the early stop on either path, because it cannot know the first `offset + limit` rows of the answer until it has seen them all.
+
+The one thing those three give up by declining is the refusal's MESSAGE. Past one page they still return a named error with the remedy — that is unchanged — but it can no longer say how many rows matched, only that more matched than one page holds. If you want the number in order to size the fix, read it with `find_all_rows` (unfiltered) or a `Query…count()`.
 
 `update_where` / `delete_where` scan on every path — the largest whole-table read a closure can still perform; prefer a keyed `update` / `delete`. `_id` leads no index, so a `filter_in` over a list of ids scans too: hydrate by primary key with `get_many` (point gets, which conflict only on the rows they fetch).
 
@@ -572,8 +599,8 @@ fn record_view(post_id: &str, region: &str) -> Result<u64, ApiError> {
 }
 ```
 
-**`#[counter]` columns — two rules that are silent if you get them wrong.**
-A `#[counter]` column is stored in its own cell and incremented with an atomic
+**counter columns — what they cost, what they cannot do, and the one rule that is silent if you get it wrong.**
+A counter column is stored in its own cell and incremented with an atomic
 add, so concurrent increments compose instead of conflicting. Two consequences:
 
 1. **Only an empty `always` is conflict-free — on the UPDATE arm.**
@@ -593,7 +620,17 @@ add, so concurrent increments compose instead of conflicting. Two consequences:
    also keep changing after creation, do the increment with an empty `always`
    and write that column where its contention is acceptable — don't smuggle
    it into `always` on the increment and assume it stayed conflict-free.
-2. **Never gate a write on anything derived from a counter you read in the same
+2. **You can ORDER BY a counter even though you cannot index one.**
+   `Query::on(T::TABLE).order(T::hits.desc()).limit(20)` — "the twenty
+   most-clicked" — is served from the counter's own cells, which are contiguous
+   under a column prefix, so the cost is bounded by the page and not by the
+   table. It needs a `limit`; an unbounded ordering falls back to a scan.
+
+   The ordering is **as of a recent snapshot**, not live: an increment does not
+   reorder the list instantly. For "most popular" that is the honest trade, and
+   it is what keeps the increment itself conflict-free.
+
+3. **Never gate a write on anything derived from a counter you read in the same
    transaction.** Reading a counter is deliberately NOT serialized against
    concurrent increments (that is what keeps reads from re-introducing the
    conflict the feature removes). The rule covers the counter's **value**, and
@@ -603,18 +640,26 @@ add, so concurrent increments compose instead of conflicting. Two consequences:
    and all of it loses increments silently:
 
    ```rust
-   tx(|| {
-       let post = db_get::<Post>(id)?;          // counter read: may already be stale
-       if post.vote_score < -10 { db_delete::<Post>(id)?; }   // WRONG
+   tx::<_, _, ApiError>(|| {
+       // A counter column has no field of its own — reading one is always
+       // an explicit `.with_counter(..)` opt-in, never a struct member.
+       let row = Query::on(Post::TABLE)
+           .filter(Post::slug.eq(post.slug.clone()))
+           .with_counter(FxPostVoteScore::NAME, &[])
+           .fetch_one()?;
+       if let Some(row) = row {   // counter read: may already be stale
+           if row.int("vote_score") < -10 { db_delete::<Post>(row.id())?; }   // WRONG
+       }
        Ok(())
-   })
+   })?;
 
-   tx(|| {
+   let alert = Event { id: Id::new(0), external_id: "score-floor".into(), kind: "alert".into() };
+   tx::<_, _, ApiError>(|| {
        let n = count_rows(Post::TABLE,
                           vec![filter_lt(Post::VOTE_SCORE, store::Value::Integer(-10))])?;
        if n > 5 { db_insert(&alert)?; }                            // WRONG — same problem
        Ok(())
-   })
+   })?;
    ```
 
    An increment that commits between the read and the commit does not conflict,
@@ -653,6 +698,7 @@ for_each_batch(
     Some("count"),  // order by count; None = primary-key order
     store::SortDir::Desc,
     100,
+    &[],            // counters — no counter-column merge in this example
     |batch| {
         for row in batch {
             // row is a &Row; process it here.
@@ -703,7 +749,7 @@ does, which is exactly the bug the separate variants exist to prevent.
 
 | Function returns | Idiom |
 |---|---|
-| `Result<_, StoreError>` (the typed helpers: `get_row`, `find_all_rows`, `find_row_by`, `find_rows`, `find_rows_by`) | Use bare `?` — the `From<StoreError> for ApiError` conversion preserves the semantic class (404 / 409 / 500). |
+| `Result<_, StoreError>` (the typed helpers: `get_row`, `find_all_rows`, `find_row_by`, `find_rows`, `find_rows_by`, `db_find_by`, `db_find_by_page`) | Use bare `?` — the `From<StoreError> for ApiError` conversion preserves the semantic class (404 / 409 / 500). |
 | `Result<_, store::StoreError>` (raw WIT calls: `store::insert`, `store::update`, `store::delete`, plus everything on the `Transaction` resource) | The host carries a typed `store-error` variant; bare `?` into an `ApiError`-returning handler preserves the semantic class (quota → 507, conflict → 409, …) via the macro-emitted `From<store::StoreError> for ApiError`. `.map_err(ApiError::internal)` still works (flattens to 500) if you want that. Inside a tx closure the error type is `String`; bare `?` lifts WIT errors to it lossily. |
 | `Result<_, PeerError>` (`peer_fetch`) | Bare `?` — `From<PeerError> for ApiError` lifts a dependency failure (`TargetNotFound`/`Denied`/`Timeout`/`DepthExceeded`/`Internal`/**`Rejected`** — the callee responded with a non-2xx status, which `peer_fetch` treats as failure by default) to **502 `/errors/upstream`**, and a *this-service* misconfig (`CapabilityDenied`/`InvalidTarget`) to **500**. Match the variant before `?` if you want a different status (e.g. treat the callee's 404 as your own resource's 404), or use `peer_fetch_raw` if you need the raw status itself (a relay/proxy route). The wire `detail` carries only the failure class; the full error (target URI, policy text) is logged request-correlated to your service's log stream — debug there. |
 | `Result<_, serde_json::Error>` (`PeerRequest::body_json`, `resp.json()`, `serde_json::to_*` on bodies you construct) | Bare `?` — `From<serde_json::Error> for ApiError` lifts to **500** (framing failure: a body the service itself built/parsed). Client-supplied bodies should go through `parse_body`/`validate_body` instead, which map malformed input to 400/422. |
@@ -981,7 +1027,7 @@ sibling of `ResourceExhausted`: identical on the wire, different cause.
 transactions; `TooContended` means *this transaction's own footprint* is
 contended — a hot row it writes, or a whole table a search inside it took as its
 read set because no index served that search. The fix is the data model (a finer
-key, or a `#[counter]` column) or narrowing the read, not more capacity.
+key, or a counter column) or narrowing the read, not more capacity.
 
 Retry applies to `Conflict` and nothing else. An `Err` returned by the closure
 propagates unchanged (deterministic); `ConstraintViolation` is deterministic;
@@ -1059,10 +1105,69 @@ above.
 
 ### Filtering / sorting / paginating
 
+**The query surface is expressions on columns, not a verb per operator.** Two
+verbs carry the whole predicate and the whole ordering:
+
+```rust
+fn posts_in_room(room_id: i64) -> Result<(), ApiError> {
+    let _rows = Query::on(Post::TABLE)
+        .filter(Post::room_id.eq(room_id))
+        .filter(Post::title.like("%rust%"))
+        .order(Post::created_at.desc())
+        .limit(20)
+        .fetch_all()?;
+    Ok(())
+}
+```
+
+The `.limit(20)` above is **not optional**. `fetch_all` / `fetch_all_with_total`
+exist only on a query that has stated a row ceiling — the builder tracks that in
+its type — so dropping the `.limit(..)` is a compile error, not a listing the
+store silently cuts short at its own page cap. `fetch_one`, `count`,
+`fetch_page` and the aggregate terminals bound themselves and need no `.limit`.
+
+* **`.limit(n)`** — the number of rows this handler is prepared to hold in a
+  32 MiB heap and serialize into one response. There is no value meaning "all of
+  them". `fetch_all` returns the first `n` in the query's order and tells you
+  nothing about the rest, so use it when `n` IS the answer (a top-N, an `is_in`
+  over `n` ids, `.limit(1)` as an existence probe). When the set grows with the
+  tenant, add `.cursor(token)` and end on `.fetch_page(..)` instead.
+* **`.filter(expr)`** — repeated calls AND together, so `.filter(a).filter(b)`
+  and `.filter(a.and(b))` are the same query. Compose with `.and(..)` / `.or(..)`
+  when you need boolean structure.
+* **`.order(order)`** — one verb, because `ORDER BY` is one clause. It takes a
+  column ordering (`Post::created_at.desc()`) **or** an aggregate ordering
+  (`agg::sum(PostVote::DIRECTION).desc()`), because both are `ORDER BY` and
+  which one you meant is not something you should have to look up a second verb
+  for.
+
+Operators live on the typed column handle, so the comparison is checked against
+the schema:
+
+| on any `Col<T>` | `eq` `ne` `gt` `gte` `lt` `lte` `between` `is_in` `asc` `desc` |
+|---|---|
+| on `Col<String>` only | `like` `not_like` |
+| on a nullable column only | `is_null` `is_not_null` |
+
+`Post::room_id.eq("nope")` does not compile — `room_id` is `Col<i64>`. Nor does
+`Post::room_id.is_null()`: the schema says the column cannot hold one, so asking
+is a question with a constant answer. Both are proven by compile-fail cases in
+the SDK, not asserted in a comment.
+
+**An empty `is_in` matches NOTHING**, as SQL says. The dangerous reading is "no
+filter", which silently turns a scoped query into an unscoped one — usually over
+someone else's rows.
+
 **Keyset pagination is THE default for any list a client pages through — reach
-for it first.** This governs the list recipes earlier in this document:
-`auth::find_owned`, `find_rows_by` and `find_all_rows` are unbounded reads, and
-are the right tool only for sets that are small by construction. It is O(page) regardless of depth (no offset re-scan), stable
+for it first.** This governs the list recipes earlier in this document.
+**No read helper in the SDK returns an unbounded row set any more**, so the
+question is never "is this one safe" but "which bounded shape do I want".
+`auth::find_owned` and `db_find_by_page` take a `PageRequest` and hand back the
+cursor that continues the listing; `find_rows_by`, `find_all_rows`,
+`load_has_many` and `db_find_by` read at most ONE page and return a named error
+past it, so they are the right tool only for sets that are small by
+construction; `Query::fetch_all` does not exist without a `.limit(n)`. Keyset is
+O(page) regardless of depth (no offset re-scan), stable
 under concurrent inserts (no skipped/repeated rows), and the SDK makes it a
 one-liner. Offset/`find` is a fallback for tiny, fixed, non-paged sets only.
 
@@ -1074,47 +1179,68 @@ Keyset is **two halves that must match**:
    - `#[model(list_by(filter = "owner_id", newest = "created_at"))]` — a filtered
      newest-first list. Resolves to a covering composite index
      `(owner_id, created_at DESC, _id)`; its prefix also serves a plain
-     `where_eq(owner_id)` equality seek, so you usually DON'T also need
+     `.filter(T::owner_id.eq(..))` equality seek, so you usually DON'T also need
      `#[index]` on that column.
    - `#[model(ranked_by(highest = "created_at"))]` — an UNfiltered newest-first
      feed (or any score column, e.g. `highest = "score"`).
    Repeat `list_by` once per filter axis a list endpoint exposes.
 
-2. **Page it with the Query DSL terminal** — `keyset_by` + `.cursor` + `.limit`
-   + `.fetch_page`, returning a `CursorPage<T>` (serializes `{ items,
-   next_cursor }`):
+2. **Page it with `.order(..)` + `.cursor(..)` + `.limit(..)` + `.fetch_page`**,
+   returning a `CursorPage<T>` (serializes `{ items, next_cursor }`):
 
    ```rust
-   use boogy_sdk::pagination::{decode, CursorPage};
-   use boogy_sdk::store::SortDir;
+   use boogy_sdk::pagination::CursorPage;
 
-   fn list_orders(req: &mut Req<'_>) -> Result<Json<CursorPage<OrderOut>>, ApiError> {
-       let limit  = req.query("limit").and_then(|s| s.parse().ok()).unwrap_or(50).clamp(1, 200);
-       let cursor = req.query("cursor").and_then(decode);
-       let page = Query::on(Order::TABLE)
-           .where_eq(Order::OWNER_ID, owner.as_str())     // optional filter(s)
-           .keyset_by(Order::CREATED_AT, SortDir::Desc)   // MUST match a list_by/ranked_by
+   fn list_receipts(req: &mut Req<'_>, owner: &str) -> Result<Json<CursorPage<ReceiptOut>>, ApiError> {
+       let limit = req.query("limit").and_then(|s| s.parse().ok()).unwrap_or(50).clamp(1, 200);
+       let page = Query::on(Receipt::TABLE)
+           .filter(Receipt::owner_principal.eq(owner))   // optional filter(s)
+           .order(Receipt::created_at.desc())            // MUST match a list_by/ranked_by
            .limit(limit)
-           .cursor(cursor)
-           .fetch_page(|r| order_out(r))?;                // over-fetch+1, builds next_cursor
+           .cursor(req.query("cursor").map(str::to_string))
+           .fetch_page(|r| {                             // over-fetch+1, builds next_cursor
+               let r = Receipt::from_row(r);
+               ReceiptOut { id: r.id.get(), subject: r.subject }
+           })?;
        Ok(Json(page))
    }
    ```
 
+   **The ordering IS the cursor key — there is no second verb.** A query that
+   states its sort key, direction and page size has already said everything a
+   cursor needs, so restating it would be asking you to keep two declarations in
+   step by hand, which nothing checks. Which physical strategy answers it —
+   keyset seek, offset, or an epoch-pinned ranked projection — is the platform's
+   decision, not a semantic you opt into.
+
+   `.cursor(..)` takes the **opaque token the client round-trips**, straight from
+   the query string. There is no `decode` at the call site: the SDK decodes for a
+   row page and keeps the token whole for a ranked one, because those two resume
+   from different things. A token it cannot read is KEPT rather than discarded —
+   dropping it would silently restart the listing while the caller believed it
+   was continuing one.
+
    `fetch_page` over-fetches by one to detect the next page and builds the opaque
    `next_cursor` for you — no manual cursor arithmetic. The client passes the
-   returned `next_cursor` straight back as `?cursor=`. Extra
-   `where_eq`/`where_gte`/… filters compose on the same walk (residual-filtered
-   when not the indexed axis), so multi-axis admin filters Just Work.
-   `next_cursor` is absent on the last page. Reference: `chat` (`list_by`),
+   returned `next_cursor` straight back as `?cursor=`. Extra `.filter(..)` calls
+   compose on the same walk (residual-filtered when not the indexed axis), so
+   multi-axis admin filters Just Work. `next_cursor` is absent on the last page.
+   Reference: `board` (`list_by` + a ranked ordering), `chat` (`list_by`),
    `notes-api` (`ranked_by`), `stripe-base` / `resend-base` (multi-axis admin).
 
 **Bounded-memory batch jobs** (sweeps, exports — not a client page): use
 `for_each_batch` (above), not keyset.
 
 **Offset/`find` (fallback ONLY).** `store::find` takes a `FindOptions` with
-**five** fields — `filters`, `sort`, `page`, `or_groups`,
-`skip_total` — all of them required by the record, none defaulted. Offset
+**seven** fields — `filters`, `page`, `or_groups`, `skip_total`, `order_by`,
+`group_cursor`, `counters` — all of them required by the record, none
+defaulted. `counters` names counter columns to merge into the returned
+rows — empty (the common case, and every example below) merges nothing.
+`order_by` is a `Vec<store::OrderTerm>`: column terms
+(`store::OrderTerm::Column(store::SortBy { column, dir })`) and at most ONE
+aggregate term (`store::OrderTerm::Aggregate(store::AggSort { .. })`) share
+the one list, because `ORDER BY` is one clause — see "Aggregates and
+maintained rollups" below for the aggregate case. Offset
 re-scans `offset` rows every page and can skip/repeat rows under concurrent
 writes — use ONLY for a tiny, fixed, non-paged set where keyset would be
 overkill.
@@ -1127,18 +1253,230 @@ let result = store::find("notes", &store::FindOptions {
         val: store::Value::Boolean(false),
         in_values: None,                  // Some(vec![…]) only for FilterOp::In
     }],
-    sort: vec![store::SortBy { column: "priority".into(), dir: store::SortDir::Desc }],
+    order_by: vec![store::OrderTerm::Column(
+        store::SortBy { column: "priority".into(), dir: store::SortDir::Desc },
+    )],
     page: Some(store::Page { limit: 20, offset: 0 }),
     or_groups: vec![],                    // OR-of-AND; empty = filters-only
-    skip_total: true,                     // `result.total_count` is 0 when set
+    skip_total: true,                     // `result.total_count` is None when set
+    group_cursor: None,                   // resume a ranked listing
+    counters: vec![],                     // name counter columns to merge them
 })?;
-// result.rows: Vec<store::Row>   result.total_count: u64
+// result.rows: Vec<store::Row>
+// result.total_count: Option<u64> — None means "not computed", NOT zero
+// result.has_more: bool — whether more rows follow this page. Set by the
+//   platform, which is the only party that can: it clamps `page.limit` to its
+//   own per-call ceiling, so neither a short page nor a full one tells you
+//   anything. Meaningful under `skip_total` too. Never derive it from the
+//   row count.
 ```
 
 Filter ops, all eleven of them: `Eq`, `Neq`, `Gt`, `Gte`, `Lt`, `Lte`, `Like`,
 `NotLike`, `IsNull`, `IsNotNull`, `In`. There is **no** `NotEq` (it is `Neq`)
 and **no** `NotIn` — a "not in this set" predicate has to be expressed some
 other way, or filtered in the handler.
+
+### Aggregates and maintained rollups
+
+Ask for totals with the query builder; the platform decides how to answer.
+Needs `use boogy_sdk::query::agg;` and `use boogy_sdk::store::FilterOp;`.
+
+```rust
+fn sales_by_customer() -> Result<(), ApiError> {
+    let _by_customer = Query::on(Sale::TABLE)
+        .group_by(Sale::CUSTOMER)
+        .sum(Sale::AMOUNT)
+        .count_all()
+        .having(agg::sum(Sale::AMOUNT), FilterOp::Gt, 100)
+        .order(agg::sum(Sale::AMOUNT).desc())
+        // `.limit(n)` is REQUIRED after a `.group_by(..)` and this will not
+        // compile without it: one item comes back per DISTINCT CUSTOMER, and
+        // that count is a property of the data, not of the query.
+        .limit(50)
+        .fetch_groups(|g| (g.key().cloned(), g.sum(Sale::AMOUNT), g.count_all()))?;
+
+    // No grouping: exactly one row back, even over an empty table.
+    let total = Query::on(Sale::TABLE).sum(Sale::AMOUNT).fetch_one_group()?;
+    let _ = total.sum(Sale::AMOUNT);
+    Ok(())
+}
+```
+
+**A `.group_by(..)` needs a `.limit(n)`; an ungrouped aggregate does not.** This
+is a compile-time bound and a different one from `fetch_all`'s: `fetch_all` is
+bounded on ROW COUNT, `fetch_groups` on GROUP CARDINALITY, and those are not the
+same quantity. `SELECT sum(x) FROM t` is one group over an empty table and one
+over a billion rows, so `fetch_one_group` (and `fetch_groups` on an ungrouped
+query) needs no ceiling at all. `group_by(status)` may be three groups and
+`group_by(user_id)` one per tenant user, and nothing in the query text says
+which — so the moment you group, you state the ceiling. When the number of
+groups grows with the tenant, that is a listing: add
+`.order(agg::…().desc()).limit(n).cursor(token)` and end on `fetch_group_page`,
+which returns the token that continues it.
+
+Stating the ceiling bounds what YOUR component holds. It does not bound the
+fold: a computed `GROUP BY` has to visit every matching row to know what the
+groups are. That work is the platform's, and it is metered — a declared
+`rollup(...)` is how you stop paying for it on every read.
+
+Selectors are `sum` / `avg` / `min` / `max` / `count_all`. It is **`count_all()`,
+not `count()`** — `count()` is already a terminal returning the row count, and
+one name cannot be both that and a selector.
+
+Read values back by naming the same aggregate you selected — `g.sum("amount")`
+for a query built with `.sum("amount")` — so adding an aggregate to a query
+cannot shift what an existing accessor reads. `sum`/`avg`/`min`/`max` return
+`Option`, where `None` is SQL NULL: no non-null value contributed. `count_all()`
+returns a bare `i64`, because counting is the one aggregate defined on the empty
+set. **Do not flatten NULL to zero** — "no refunds recorded" and "refunds
+totalling zero" are different facts and nothing downstream can separate them
+afterwards.
+
+`having(...)` filters the groups that come OUT of the aggregation; `.filter(..)`
+selects the rows that go IN. Name the aggregate with the matching `agg::` helper
+(`agg::sum("amount")`), which builds the identical spec the selector registered.
+
+#### Declare a rollup when a total is read far more often than it changes
+
+```rust
+#[derive(Model)]
+#[model(table = "purchases", rollup(group = "customer", sum = "amount"))]
+pub struct Purchase {
+    #[pk]
+    pub id: Id<Purchase>,
+    #[index]
+    pub customer: String,
+    pub amount: i64,
+}
+```
+
+The platform then keeps one total per customer up to date as rows change, and a
+grouped query answers from those totals instead of reading the rows. Updates are
+conflict-free: concurrent writers to the same group do not conflict at commit,
+which is what makes this the right shape for a counter many requests bump.
+
+Constraints, all checked when you deploy:
+
+* every summed column must be an **integer** and **NOT NULL** — one stored total
+  cannot distinguish "every value was null" from "the values cancelled to zero";
+* the group must have **bounded cardinality**. Group by a customer, not by a
+  request id. A group a unique index already declares distinct is rejected
+  outright: one stored total per row can never cost less than reading the rows;
+* at least one of `sum` / `count` must be asked for (`count` defaults on).
+
+#### Group by more than one column when you filter and rank within something
+
+```rust ignore-snippet: the declaration is the point here; PostVote is declared in full in the fixture prelude and the fence below compiles a query against it
+#[derive(Model)]
+#[model(
+    table = "post_votes",
+    rollup(group = ["room_id", "post_id"], sum = "direction"),
+)]
+pub struct PostVote { /* … */ }
+```
+
+`group` is a list, and **its order is the composite-index rule, because it is
+the same mechanism**: a query may fix a leading *prefix* by equality and group
+by what remains.
+
+```rust
+fn top_posts_in_room(room_id: i64) -> Result<(), ApiError> {
+    let _top = Query::on(PostVote::TABLE)
+        .filter(PostVote::room_id.eq(room_id))         // binds the prefix
+        .group_by(PostVote::POST_ID)                   // groups the rest
+        .sum(PostVote::DIRECTION)
+        .order(agg::sum(PostVote::DIRECTION).desc())
+        .limit(20)
+        .fetch_groups(|g| (g.key().cloned(), g.sum(PostVote::DIRECTION)))?;
+    Ok(())
+}
+```
+
+`["room_id", "post_id"]` answers "the totals per post in this room" *and* "the
+total for this room". `["post_id", "room_id"]` answers neither. Choose the order
+the way you would for an index: the column you filter on first.
+
+Grouping by fewer columns than the key folds the rest, so one declaration serves
+both depths. Filtering a *trailing* column alone does not work, for the same
+reason a `(a, b)` index cannot serve a lookup on `b`.
+
+#### Do not read a total inside the transaction that changed it
+
+**This is refused, and it is the one mistake worth naming.**
+
+```rust
+// REFUSED at run time — and the refusal is the point. It compiles, which is
+// exactly why it needs to be refused somewhere.
+fn record_and_report_wrongly(sale: Sale) -> Result<i64, ApiError> {
+    let customer = sale.customer.clone();
+    tx::<_, _, ApiError>(move || {
+        db_insert(&sale)?;
+        // Reads the total this transaction just moved.
+        Ok(Query::on(Sale::TABLE)
+            .filter(Sale::customer.eq(customer.as_str()))
+            .sum(Sale::AMOUNT)
+            .fetch_one_group()?
+            .sum(Sale::AMOUNT)
+            .unwrap_or(0))
+    })
+}
+```
+
+Maintaining a total is conflict-free: the update is an atomic add that takes no
+read-conflict range, which is why concurrent writers to one group never
+conflict. **Reading** a total is an ordinary transactional read and takes a
+read-conflict range over exactly those cells — so bumping a total and reading it
+back in the same transaction makes every concurrent writer conflict with you.
+The answer is right, the totals are right, and the only symptom is `503`s under
+load. Measured before this was refused: 16 concurrent voters on one poll, and
+the first got a 503.
+
+**This is the opposite of how a counter column behaves, deliberately.** A counter
+read is a snapshot read: it never contends, and it is never safe to branch on
+(see the counter-column rules above, which is why that rule has to be remembered
+rather than enforced). A rollup read is an ordinary transactional read: safe to
+branch on, and refused in the one place where it would cost contention and buy
+nothing. Same primitive underneath, different answers — do not carry a habit
+from one to the other.
+
+Two shapes are correct, and which you want depends on what the number is for:
+
+```rust
+fn record_sale(sale: Sale, limit: i64) -> Result<(), ApiError> {
+    let customer = sale.customer.clone();
+
+    // DECIDING on a total — read BEFORE you write. This still serializes with
+    // other writers to that group, which is correct: you depend on the value.
+    let amount = sale.amount;
+    tx::<_, _, ApiError>(move || {
+        let spent = Query::on(Sale::TABLE)
+            .filter(Sale::customer.eq(sale.customer.as_str()))
+            .sum(Sale::AMOUNT)
+            .fetch_one_group()?
+            .sum(Sale::AMOUNT)
+            .unwrap_or(0);
+        if spent + amount > limit {
+            return Err(ApiError::unprocessable("over the credit limit"));
+        }
+        db_insert(&sale)?;
+        Ok(())
+    })?;
+
+    // REPORTING a total to the caller — read AFTER the transaction commits.
+    let _total = Query::on(Sale::TABLE)
+        .filter(Sale::customer.eq(customer.as_str()))
+        .sum(Sale::AMOUNT)
+        .fetch_one_group()?
+        .sum(Sale::AMOUNT)
+        .unwrap_or(0);
+    Ok(())
+}
+```
+
+**An aggregate that would read the whole table is a build failure.** Either
+declare a rollup for the grouping, or filter on an indexed column so the read is
+bounded. An index on the *grouping* column does not count — it makes the groups
+contiguous, not fewer.
 
 ## Responses
 
@@ -1187,19 +1525,27 @@ per request (for dispatch). Method handlers:
 use boogy_sdk::rpc::RpcError;
 
 #[derive(Deserialize, schemars::JsonSchema)]
-struct SearchParams { query: String }
+struct SearchParams { query: String, cursor: Option<String> }
 #[derive(Serialize, schemars::JsonSchema)]
-struct SearchResult { items: Vec<json::Value> }
+struct SearchResult { items: Vec<json::Value>, next_cursor: Option<String> }
 
 fn search_notes(p: SearchParams) -> Result<SearchResult, RpcError> {
-    // auth::find_owned / auth::load_owned are available here.
-    let rows = auth::find_owned::<Note>(DEFAULT_OWNER_COL)?;
-    let items = rows
+    // auth::find_owned / auth::load_owned are available here. A JSON-RPC
+    // method has no `Req`, so the cursor rides in the params — it is still a
+    // page, and the caller still gets the token to continue from.
+    let page = auth::find_owned::<Note>(
+        DEFAULT_OWNER_COL,
+        &boogy_sdk::pagination::PageRequest::new(20, p.cursor),
+    )?;
+    let items = page
+        .rows
         .iter()
         .filter(|r| r.text("title").contains(&p.query))
         .map(|r| r.to_json(&["title", "body"]))
         .collect();
-    Ok(SearchResult { items })
+    // NOTE the filter is applied WITHIN the page, so a page can come back
+    // with fewer matches than rows. Keep walking while `next_cursor` is set.
+    Ok(SearchResult { items, next_cursor: page.next_cursor })
 }
 ```
 
@@ -1588,7 +1934,7 @@ use crate::bindings;  // if you need to reach into raw WIT bindings
 | Serde derives | `Serialize`, `Deserialize` — **in scope already; no `use serde::…`** |
 | Constants | `DEFAULT_OWNER_COL` |
 | Schema | `create_table_from`, `migration`, `migrations` |
-| Row reads | `to_sdk_row`, `get_row`, `find_all_rows`, `find_row_by`, `find_rows_by`, `find_rows`, `find_rows_grouped`, `upsert_increment`, `for_each_batch` |
+| Row reads | `to_sdk_row`, `get_row`, `find_all_rows`, `find_row_by`, `find_rows_by`, `find_rows`, `upsert_increment`, `for_each_batch` |
 | Transactions | `tx` (no-arg closure, generic over error type; call the same `store::*`/`db_*`/`find_row_by` fns inside) |
 | Helpers | `filter_eq` (+ `filter_neq`/`filter_gt`/`filter_gte`/`filter_lt`/`filter_lte`/`filter_like`/`filter_not_like`/`filter_is_null`/`filter_is_not_null`/`filter_in`), `sort_asc`/`sort_desc`, `page`, `now_millis`, `peer_fetch` (checked default — `Err` on non-2xx), `peer_fetch_raw` (opt-in — always `Ok` on any status) |
 
@@ -1684,6 +2030,6 @@ crypto in isolation.
   the read-side typed enum — qualify it as
   `boogy_sdk::store::Val` at the (rare) callsite that needs it.
 - The raw WIT `store::find` for principal-scoped lists — use
-  `auth::find_owned`. Only fall back to raw `store::find` when you
-  need filtering / sorting / pagination beyond what `find_owned`
-  provides.
+  `auth::find_owned`, which is paginated. Only fall back to the
+  `Query` DSL (never raw `store::find`) when you need a predicate,
+  order or projection beyond what `find_owned` provides.

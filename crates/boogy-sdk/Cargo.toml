@@ -33,7 +33,7 @@ base64 = "0.22"
 boogy-sdk-macros = { path = "../boogy-sdk-macros" }
 
 [dev-dependencies]
-# Compile-fail harness for the #[counter] index rejection. A plain version
+# Compile-fail harness for the counter-column index rejection. A plain version
 # rather than `workspace = true` so the assembled public workspace resolves it
 # from crates.io without needing a matching workspace entry.
 trybuild = "1"

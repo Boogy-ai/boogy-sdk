@@ -38,111 +38,66 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, LitStr};
 ///   `[tag, refs]` index.
 /// - `#[lookup_by]` (field) — declares a unique point-lookup access pattern on
 ///   the field's column; resolves to a UNIQUE single-column index.
-/// - `#[counter]` (field) — conflict-free counter column. The value is kept in
-///   its own cell rather than inside the row, and an increment is an atomic add
-///   that takes no read-conflict range, so concurrent increments compose instead
-///   of conflicting.
+/// - `#[model(counter(name = "<column>"))]` (struct, repeatable) — a
+///   conflict-free counter column, with **no backing field at all**: the
+///   value is kept in its own cell rather than inside the row, and an
+///   increment is an atomic add that takes no read-conflict range, so
+///   concurrent increments compose instead of conflicting. There is no
+///   struct field to read it back through — a caller reads or adds it via
+///   the companion `#[derive(Counter)] #[counter(of = <Self>, name =
+///   "<column>")]` marker type instead (see that derive's own docs).
 ///
-///   **The field is read-only.** Reads merge the real value in, but writes go
-///   ONLY through the increment path: the field is excluded from `to_columns`,
-///   so `db_insert` starts it at zero and `db_update` does not mention the
-///   column at all. That exclusion is the point — a counter field still
-///   round-trips as an ordinary struct field, so
-///   `db_update(id, &Row { title, ..row })` to change something else would
-///   otherwise write back the counter value read earlier and discard every
-///   increment made since.
+///   The column is a **64-bit signed integer** and the delta must be an
+///   integer too. The add **wraps** on overflow rather than erroring or
+///   saturating: pushing the value past `i64::MAX` rolls it over to
+///   `i64::MIN`.
 ///
-///   The column is a **64-bit signed integer** and the delta must be an integer
-///   too — a fractional delta is rejected by the store, because the atomic add
-///   operates on the integer cell directly. The add **wraps** on overflow rather
-///   than erroring or saturating: pushing the value past `i64::MAX` rolls it
-///   over to `i64::MIN`. That is 9.2 quintillion increments away for a counting
-///   workload, but it is a real edge for a counter accumulating large deltas
-///   (byte totals, currency in minor units) — clamp the delta on the way in if
-///   your values can approach the limit.
+///   **A counter read is not serialized against concurrent increments** —
+///   deliberately, since a read-conflict range on the cell would
+///   re-introduce the very conflict the atomic add removes. Never gate a
+///   write — or anything derived from a counter, like a `count_rows` whose
+///   filter names one — on a counter value read in the same transaction; an
+///   increment that commits between that read and the commit is simply
+///   discarded, not a retry trigger. When the decision must hold, express it
+///   as a predicate instead (`store::delete_where` / `store::update_where`
+///   with the counter in the filters), which serializes against the rows it
+///   actually matches.
 ///
-///   **A counter read is not serialized against concurrent increments.** Reads
-///   merge the real value in, but they deliberately take no read-conflict range
-///   on the counter's cell — that is what keeps reading a counter from
-///   re-introducing the very conflict the atomic add removes. The consequence is
-///   a rule, and breaking it fails silently:
+///   Increments stay conflict-free only with an EMPTY `always` on
+///   `upsert_increment`'s UPDATE arm — a non-empty `always` rewrites the
+///   whole row on every call, an ordinary read-modify-write that conflicts
+///   like any other. `on_insert_only` columns do not cost this: they are
+///   written only by the row-creating call.
 ///
-///   > Never gate a write on a counter — or on anything derived from one — read
-///   > in the same transaction.
+///   A counter column **cannot back an index** (the derive rejects it as an
+///   `#[index]`, `#[lookup_by]`, `#[covering_index]`, struct-level index
+///   column, or `list_by`/`ranked_by`/`tagged_by` column, at compile time):
+///   index maintenance needs the previous value to clear the stale entry,
+///   and an atomic add never reads one.
 ///
-///   "Derived from one" is the part that is easy to miss: a `count_rows` whose
-///   filter names a counter, a `find` that filters or sorts on one, "how many
-///   rows are below the threshold" — none of those is a *value*, and all of them
-///   are a snapshot reading you can branch on.
+///   Always appended after every field column — in declaration order, when
+///   more than one is declared. That is not a placeholder for "the position
+///   it would have had as a field": the store assigns a table's column
+///   ordinals once, when the table is first created, and never revisits an
+///   already-created table's ordinals afterward (a later redeploy that adds
+///   or reorders a `counter(...)` declaration, or reorders the struct's
+///   fields, cannot move an existing table's ordinals no matter what it
+///   says). There is therefore no prior position for a counter column to
+///   reproduce, ever, and appending it is the only definition of "where"
+///   that means anything.
 ///
 ///   ```ignore
-///   tx(|| {
-///       let post = db_get::<Post>(id)?;      // may already be stale
-///       if post.vote_score < -10 { db_delete::<Post>(id)?; }   // WRONG
-///       Ok(())
-///   })
+///   #[derive(Model)]
+///   #[model(table = "articles", counter(name = "reads"))]
+///   pub struct Article {
+///       #[pk] pub id: Id<Article>,
+///       pub title: String,
+///   }
 ///
-///   tx(|| {
-///       let n = count_rows(Post::TABLE, vec![filter_lt(Post::VOTE_SCORE, v)])?;
-///       if n > 5 { db_insert(&alert)?; }     // WRONG — a count is derived too
-///       Ok(())
-///   })
+///   #[derive(Counter)]
+///   #[counter(of = Article, name = "reads")]
+///   pub struct ArticleReads;
 ///   ```
-///
-///   An increment that commits between that read and the commit does not make
-///   the transaction retry — it is simply discarded. When the decision must
-///   hold, express it as a predicate instead (`store::delete_where` /
-///   `store::update_where` with the counter in the filters): those serialize the
-///   rows they actually MATCH against concurrent increments, so an increment
-///   that lifts a matched row out of the predicate becomes a retryable conflict
-///   rather than a row acted on with a value that no longer matches.
-///
-///   That serialization stops at the matched rows, by design: an increment on a
-///   row the sweep did NOT match does not conflict with it (the outcome equals
-///   running the sweep first and the increment after). Conflict-checking every
-///   row the sweep scanned instead would make a full-table sweep lose to any
-///   increment anywhere in the table — on the workload `#[counter]` exists for,
-///   a sweep that never lands.
-///
-///   Reads that only report a value (get, list, count) need none of this — they
-///   hand the reading to the caller and stop. It is the branch-then-write that
-///   the rule is about.
-///
-///   Increments themselves stay conflict-free only with an EMPTY `always` on
-///   the UPDATE arm. Three ways to carry a companion column on
-///   `upsert_increment`, and they are not equivalent:
-///
-///   - **hot and standalone** — `UpsertColumns::none()`: neither arm writes
-///     anything but the counter cell, so concurrent increments compose;
-///   - **needed once, at creation** — `UpsertColumns::on_insert_only(&[...])`:
-///     a value computed at call time (a timestamp, a derived id), so it has
-///     nowhere to live as a static `default`. Written only by the row-creating
-///     call and never touched again, so it costs a later increment nothing;
-///   - **must change on every call** — `UpsertColumns::always(&[...])`: the
-///     right choice only for a value that genuinely needs to keep changing.
-///     An `upsert_increment` carrying a non-empty `always` rewrites the whole
-///     row on every call, an ordinary read-modify-write that conflicts like
-///     any other.
-///
-///   `on_insert` does not buy conflict-freedom everywhere, though: on the
-///   read-modify-write arm — incrementing a plain, non-`#[counter]` column —
-///   the counter's own new value is written through the ordinary row update
-///   regardless of `on_insert`. Only a `#[counter]` column's atomic add is
-///   conflict-free; `on_insert` only narrows which OTHER columns ride along.
-///
-///   A counter column **cannot back an index** (the derive rejects `#[index]`,
-///   `#[lookup_by]`, `#[covering_index]`, struct-level index `cols`, and any
-///   `list_by`/`ranked_by`/`tagged_by` column at compile time): index
-///   maintenance needs the previous value to clear the stale entry, and an
-///   atomic add never reads one.
-///
-///   `#[counter]` takes **no arguments** — in particular there is no
-///   `index` option, and `#[counter(index = true)]` is a compile error rather
-///   than a silently-discarded one. Every field marker below is bare for the
-///   same reason: `attr.path().is_ident(..)` matches `#[x]`, `#[x(..)]` and
-///   `#[x = ..]` alike, so an unchecked argument would vanish without a
-///   diagnostic and leave the author believing a storage attribute was
-///   configured when it never was.
 ///
 /// - `#[default = <literal>]` — the column's default, the equivalent of
 ///   `status TEXT DEFAULT 'pending'`:
@@ -174,7 +129,17 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, LitStr};
 /// single column, or `#[model(unique_index(cols = [..]))]` for a composite. The
 /// attribute is still *registered* below purely so the derive can reject it with
 /// that explanation rather than leaving rustc to say "cannot find attribute".
-#[proc_macro_derive(Model, attributes(model, pk, unique, index, covering_index, lookup_by, counter, default))]
+///
+/// retired-spelling: the field form was removed 2026-08-19;
+/// `#[model(counter(name = "<column>"))]` replaces it. Named here because
+/// this doc explains why the attribute is still registered.
+/// There is no field-level `#[counter]` either. It used to declare a counter
+/// column backed by a struct field; a counter column now has no field of its
+/// own at all, declared instead with `#[model(counter(name = "<column>"))]`
+/// above. `#[counter]` is still *registered* below purely so the derive can
+/// reject it with that explanation rather than leaving rustc to say "cannot
+/// find attribute".
+#[proc_macro_derive(Model, attributes(model, pk, unique, index, covering_index, lookup_by, counter, default, belongs_to))]
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand(input) {
@@ -190,9 +155,23 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let mut table_name = to_snake_case(&struct_ident.to_string());
     // (index name, cols, unique, covering)
     let mut struct_indexes: Vec<(String, Vec<String>, bool, bool)> = Vec::new();
+    // retired-spelling: the field form is gone — this is the
+    // `#[model(counter(name = ..))]` path that replaced it.
+    // A counter column declared on the STRUCT rather than as a `#[counter]`
+    // field — the companion `#[derive(Counter)] #[counter(of = Self, name =
+    // "...")]` marker type is what a caller reads/adds it through. Always
+    // appended after every field's column: the store assigns a table's
+    // column ordinals once, at first creation, from whatever order this
+    // list has THEN — a later redeploy that changes this declaration (or
+    // the struct's field order) never revisits an already-created table's
+    // ordinals, so there is no "correct" position to reproduce and no
+    // reason to expose one. (column name)
+    let mut struct_counters: Vec<String> = Vec::new();
     // (column, pattern name) for every column an access pattern sorts or
     // filters on. Collected in parallel because the patterns below are quoted
     // into token streams immediately, after which their column names cannot be
+    // retired-spelling: `#[counter]` on a field is refused, not honoured;
+    // the live form is `#[model(counter(name = ..))]`.
     // recovered — and the `#[counter]` rejection needs them.
     let mut pattern_cols: Vec<(String, &'static str)> = Vec::new();
     // Accumulated `__t.access_patterns.push(...)` token streams from the
@@ -237,6 +216,73 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                     __t.access_patterns.push(::boogy_sdk::store::AccessPattern::ListBy {
                         filter: #filter.into(),
                         order: ::boogy_sdk::store::Order { column: #order_col.into(), desc: #desc },
+                    });
+                });
+                Ok(())
+            } else if meta.path.is_ident("rollup") {
+                // rollup(group = "...", sum = "...", count = true)
+                //
+                // `sum` may be repeated to total more than one column. `count`
+                // defaults to true because a rollup without it can serve no
+                // query at all — a group whose rows have all gone still holds a
+                // total of zero, and only the count separates that from a group
+                // that genuinely sums to zero. Making the developer discover
+                // that by declaring a rollup nothing ever uses would be a poor
+                // trade for the one keystroke it saves.
+                let (mut group, mut sums, mut count) = (Vec::<String>::new(), Vec::new(), true);
+                meta.parse_nested_meta(|m| {
+                    if m.path.is_ident("group") {
+                        // `group = "customer"` and `group = ["room_id",
+                        // "post_id"]` are both accepted: one grouping column is
+                        // by far the common case and should not have to be
+                        // written as a list, and the list is the same thing with
+                        // more of it. Composite order is the composite-INDEX
+                        // rule — bind a leading prefix, group by the rest.
+                        let v = m.value()?;
+                        if v.peek(syn::token::Bracket) {
+                            let content;
+                            syn::bracketed!(content in v);
+                            let cols: syn::punctuated::Punctuated<LitStr, syn::Token![,]> =
+                                content.parse_terminated(|p| p.parse::<LitStr>(), syn::Token![,])?;
+                            group = cols.into_iter().map(|c| c.value()).collect();
+                        } else {
+                            group = vec![v.parse::<LitStr>()?.value()];
+                        }
+                    } else if m.path.is_ident("sum") {
+                        sums.push(m.value()?.parse::<LitStr>()?.value());
+                    } else if m.path.is_ident("count") {
+                        count = m.value()?.parse::<syn::LitBool>()?.value();
+                    } else {
+                        return Err(m.error("rollup expects group + sum (repeatable) + count"));
+                    }
+                    Ok(())
+                })?;
+                if group.is_empty() {
+                    return Err(meta.error(
+                        "rollup requires a `group = \"...\"` (or `group = [\"a\", \"b\"]` \
+                         to group by more than one column)",
+                    ));
+                }
+                if sums.is_empty() && !count {
+                    return Err(meta.error(
+                        "rollup maintains nothing: give it at least one `sum = \"...\"` \
+                         or leave `count` at its default of true",
+                    ));
+                }
+                // Registered like every other pattern column, so naming a
+                // column the struct does not have is a compile error rather
+                // than a runtime refusal at deploy time.
+                for c in &group {
+                    pattern_cols.push((c.clone(), "rollup(group)"));
+                }
+                for c in &sums {
+                    pattern_cols.push((c.clone(), "rollup(sum)"));
+                }
+                access_patterns.push(quote! {
+                    __t.access_patterns.push(::boogy_sdk::store::AccessPattern::Rollup {
+                        group: ::std::vec![#(#group.into()),*],
+                        sum: ::std::vec![#(#sums.into()),*],
+                        count: #count,
                     });
                 });
                 Ok(())
@@ -321,6 +367,37 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 })?;
                 struct_indexes.push((name, cols, unique, covering));
                 Ok(())
+            } else if meta.path.is_ident("counter") {
+                // counter(name = "post_count")
+                //
+                // Emits a counter column with no backing field, matching what
+                // retired-spelling: the field form is gone;
+                // `#[model(counter(name = ..))]` emits the same column
+                // with no field.
+                // a `#[counter]` field used to push into `__t.columns` — a
+                // 64-bit integer column, not nullable, no default (a counter's
+                // value lives in its own cell; a default would never be
+                // observed, exactly as the field form's rejection explains).
+                // Always appended after every field's column; see the comment
+                // on `struct_counters` above for why there is no way to (and
+                // no reason to want to) choose a different position.
+                let mut name = String::new();
+                meta.parse_nested_meta(|m| {
+                    if m.path.is_ident("name") {
+                        name = m.value()?.parse::<LitStr>()?.value();
+                        Ok(())
+                    } else {
+                        Err(m.error("counter(...) takes only `name = \"...\"` (required)"))
+                    }
+                })?;
+                if name.is_empty() {
+                    return Err(meta.error(
+                        "#[model(counter(...))] requires a `name = \"...\"` naming the \
+                         counter column, e.g. `counter(name = \"post_count\")`",
+                    ));
+                }
+                struct_counters.push(name);
+                Ok(())
             } else {
                 Err(meta.error("unknown model attribute"))
             }
@@ -350,12 +427,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     ///
     /// `attr.path().is_ident("x")` matches `#[x]`, `#[x(..)]` and `#[x = ..]`
     /// alike, so without this check an argument is **silently discarded**: the
-    /// author writes `#[counter(index = true)]` or a field-level
+    /// author writes `#[pk(auto)]` or a field-level
     /// `#[index(cols = [..])]`, gets a clean build, and believes the derive
     /// saw something it never did. For storage attributes that surfaces later
     /// as wrong data or a missing index, with nothing to trace it back to —
     /// so refusing to build is strictly better, the same reasoning as the
-    /// counter/index rejections below.
+    /// retired-spelling: both field forms are rejected outright; a
+    /// counter column is `#[model(counter(name = ..))]`.
+    /// unconditional `#[unique]`/`#[counter]` field rejections below.
     ///
     /// `hint` adds a marker-specific sentence when the wrong argument is a
     /// predictable one worth naming outright.
@@ -607,8 +686,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         is_pk: bool,
         index: bool,
         covering: bool,
-        counter: bool,
         default: Option<proc_macro2::TokenStream>,
+        /// `#[belongs_to(Parent)]` — the parent type this column's value keys.
+        belongs_to: Option<syn::Path>,
     }
 
     let mut field_infos: Vec<FieldInfo> = Vec::new();
@@ -622,8 +702,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         let mut index = false;
         let mut covering = false;
         let mut lookup_by = false;
-        let mut counter = false;
         let mut default: Option<proc_macro2::TokenStream> = None;
+        let mut belongs_to: Option<syn::Path> = None;
         for attr in &f.attrs {
             if attr.path().is_ident("pk") {
                 deny_marker_args(attr, "pk", "")?;
@@ -638,13 +718,16 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 // column the model declared unique succeeded silently.
                 //
                 // Rejecting rather than quietly emitting an index is the same
-                // call as `deny_marker_args` above and the #[counter]/index
-                // rejection below: a storage declaration that is silently
-                // discarded surfaces later as wrong data, with nothing to trace
-                // it back to. And emitting one would change the storage layout
-                // of every model carrying the attribute for a guarantee nobody
-                // can currently rely on — while still being ineffective on a
-                // table that already holds duplicates.
+                // retired-spelling: the `#[counter]` named here is the
+                // rejected FIELD form; the live declaration is
+                // `#[model(counter(name = ..))]`.
+                // call as `deny_marker_args` above and the #[counter] rejection
+                // below: a storage declaration that is silently discarded
+                // surfaces later as wrong data, with nothing to trace it back
+                // to. And emitting one would change the storage layout of every
+                // model carrying the attribute for a guarantee nobody can
+                // currently rely on — while still being ineffective on a table
+                // that already holds duplicates.
                 return Err(syn::Error::new_spanned(
                     attr,
                     "#[unique] is not supported: it enforces nothing. The derive set a \
@@ -682,18 +765,48 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                      nothing to configure.",
                 )?;
                 lookup_by = true;
+            } else if attr.path().is_ident("belongs_to") {
+                // `#[belongs_to(Post)]` — a TYPE, not a table name string. The
+                // table comes from `<Post as Model>::TABLE`, so renaming the
+                // parent's table cannot leave a relation pointing at a name
+                // nothing answers to.
+                let parent: syn::Path = attr.parse_args().map_err(|_| {
+                    syn::Error::new_spanned(
+                        attr,
+                        "#[belongs_to] names the parent MODEL, e.g. \
+                         `#[belongs_to(Post)]`. It takes a type, not a table \
+                         name — the table is read from the model so a rename \
+                         cannot leave the relation behind.",
+                    )
+                })?;
+                belongs_to = Some(parent);
             } else if attr.path().is_ident("counter") {
-                deny_marker_args(
+                // retired-spelling: this whole arm exists to reject the
+                // retired field form and name `#[model(counter(name =
+                // ..))]` as the replacement.
+                // --- #[counter] is not supported as a field -------------------
+                //
+                // A counter column has no field of its own any more: it is
+                // declared on the STRUCT, as `#[model(counter(name =
+                // "<column>"))]`, and read or added through the companion
+                // `#[derive(Counter)] #[counter(of = <Self>, name =
+                // "<column>")]` marker type. Rejecting outright (rather than
+                // discarding the attribute or reinterpreting it) follows the
+                // same reasoning as `#[unique]` above: a storage declaration
+                // that is silently accepted-and-ignored surfaces later as
+                // wrong data, with nothing to trace it back to.
+                // retired-spelling: the message quotes the RETIRED field
+                // form back at the author and names the replacement,
+                // `#[model(counter(name = ..))]`. Both spellings must stay
+                // literal here — the diagnostic is the routing.
+                return Err(syn::Error::new_spanned(
                     attr,
-                    "counter",
-                    " In particular there is no `index` option: a counter column \
-                     cannot back an index at all, because an atomic add never reads \
-                     the previous value and the stale entry could never be removed. \
-                     To rank or filter on this value, scope the ranking to a bounded \
-                     sub-range and sort in memory, or materialize it into a separate \
-                     plain column refreshed by a background job.",
-                )?;
-                counter = true;
+                    "#[counter] is not supported as a field: a counter column has \
+                     no field of its own. Declare it on the struct instead — \
+                     #[model(counter(name = \"<column>\"))] — and read or add its \
+                     value through a companion #[derive(Counter)] #[counter(of = \
+                     Self, name = \"<column>\")] marker type.",
+                ));
             } else if attr.path().is_ident("default") {
                 let (val, kind) = parse_default_attr(attr, &f.ty)?;
                 if let Some(expected) = expected_default_kind(&f.ty) {
@@ -741,19 +854,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                  assigned by the store, so a default for it would never be used",
             ));
         }
-        // A counter column's value is read from its own cell and merged over the
-        // decoded row AFTER defaults are resolved, so a default on one could
-        // never be observed. (An absent counter already reads as 0.) The store
-        // rejects this too; the derive catches it at compile time.
-        if counter && default.is_some() {
-            return Err(syn::Error::new_spanned(
-                &ident,
-                "#[counter] cannot be combined with #[default]: a counter's value is read \
-                 from its own cell, so the default would never be observed. An absent \
-                 counter already reads as 0.",
-            ));
-        }
-        field_infos.push(FieldInfo { ident, ty: f.ty.clone(), column, is_pk, index, covering, counter, default });
+        field_infos.push(FieldInfo {
+            ident, ty: f.ty.clone(), column, is_pk, index, covering, default, belongs_to,
+        });
     }
 
     // Emit a LookupBy access pattern per `#[lookup_by]` field.
@@ -773,13 +876,94 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         ));
     }
 
+    // --- #[model(counter(...))] validation --------------------------------
+    //
+    // A struct-level counter has no field, so it cannot collide with a field's
+    // NAME the way a #[belongs_to]/#[default] mistake would — but it can still
+    // collide with another column's STORED name, or with itself. Both are
+    // compile errors naming the fix, matching every other malformed-
+    // declaration path in this derive.
+    {
+        let field_cols: Vec<&str> = field_infos
+            .iter()
+            .filter(|f| !f.is_pk)
+            .map(|f| f.column.as_str())
+            .collect();
+        for (i, name) in struct_counters.iter().enumerate() {
+            if field_cols.contains(&name.as_str()) {
+                return Err(syn::Error::new_spanned(
+                    &struct_ident,
+                    format!(
+                        "#[model(counter(name = \"{name}\"))] collides with a field \
+                         already declaring column `{name}` — a counter column has no \
+                         field of its own, so its name must not be reused by one."
+                    ),
+                ));
+            }
+            if struct_counters[..i].iter().any(|n| n == name) {
+                return Err(syn::Error::new_spanned(
+                    &struct_ident,
+                    format!("counter column `{name}` is declared more than once"),
+                ));
+            }
+            // The name becomes a Rust const identifier below (`Room::POST_COUNT`,
+            // `Room::post_count`) — `format_ident!` panics on a string that is
+            // not a valid identifier, and a raw macro panic is not this
+            // derive's error style (every other malformed declaration here is
+            // a spanned, named compile error). Catching it here, once, keeps
+            // that true for this path too.
+            if syn::parse_str::<syn::Ident>(name).is_err() {
+                return Err(syn::Error::new_spanned(
+                    &struct_ident,
+                    format!(
+                        "#[model(counter(name = \"{name}\"))] is not a valid Rust \
+                         identifier — it becomes a column-name const \
+                         (`{}`) and a typed column handle (`{name}`), so it must \
+                         parse as one, e.g. \"post_count\" rather than \"post-count\" \
+                         or \"2fast\".",
+                        name.to_uppercase()
+                    ),
+                ));
+            }
+        }
+        // A counter column cannot back an index: an atomic add never reads
+        // the previous value, so a stale index entry could never be removed.
+        for name in &struct_counters {
+            for (col, pattern) in &pattern_cols {
+                if col == name {
+                    return Err(syn::Error::new_spanned(
+                        &struct_ident,
+                        format!(
+                            "counter column `{name}` is used by `{pattern}`, which is \
+                             backed by an index, and a counter column cannot back one. \
+                             Scope the ranking to a bounded sub-range and sort in \
+                             memory, or materialize it into a plain column refreshed by \
+                             a background job."
+                        ),
+                    ));
+                }
+            }
+            for (idx_name, cols, _, _) in &struct_indexes {
+                if cols.contains(name) {
+                    return Err(syn::Error::new_spanned(
+                        &struct_ident,
+                        format!(
+                            "counter column `{name}` is used by index `{idx_name}`: a \
+                             counter column cannot back an index, because an atomic add \
+                             never reads the previous value and the old entry could \
+                             never be removed."
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     // --- every access-pattern / index column must name a declared column ----
     //
     // Without this the derive happily emits an index over a column that does
-    // not exist — and worse, it makes the #[counter] rejection below bypassable:
-    // the patterns carry AUTHOR-written names while a field's stored name can be
-    // changed with #[model(column = "...")], so a renamed counter never matches
-    // and silently ends up backing an index.
+    // not exist, from a typo or a stale rename in a `list_by`/`ranked_by`/
+    // `tagged_by`/struct-level `index` declaration.
     {
         let declared: Vec<&str> = field_infos
             .iter()
@@ -822,80 +1006,6 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     }
 
-    // --- #[counter] may not back an index -----------------------------------
-    //
-    // A counter column is mutated by an atomic add, which never reads the
-    // previous value — and index maintenance needs exactly that value to remove
-    // the stale entry. So an indexed counter cannot be kept correct.
-    //
-    // This is a COMPILE error rather than a runtime one on purpose. The runtime
-    // alternative is an index that looks maintained and silently is not, which
-    // returns wrong answers instead of failing; refusing to build is strictly
-    // better than that.
-    for f in field_infos.iter().filter(|f| f.counter) {
-        if f.is_pk {
-            return Err(syn::Error::new_spanned(
-                &f.ident,
-                "#[counter] cannot be applied to the #[pk] field — the primary key \
-                 identifies the row and cannot be an atomically-added value",
-            ));
-        }
-        // `#[unique]` is deliberately absent from this list. It used to appear
-        // here on the premise that it backed an index; it never did, and it is
-        // now rejected outright at the attribute-parsing site above, so a
-        // `#[counter] #[unique]` field can no longer reach this check. Listing
-        // it would be an arm that can never fire.
-        let offender = if f.covering {
-            Some("#[covering_index]")
-        } else if f.index {
-            Some("#[index]")
-        } else if lookup_by_cols.contains(&f.column) {
-            Some("#[lookup_by]")
-        } else {
-            None
-        };
-        if let Some(attr) = offender {
-            return Err(syn::Error::new_spanned(
-                &f.ident,
-                format!(
-                    "#[counter] cannot be combined with {attr}: a counter column cannot \
-                     back an index. An atomic add never reads the previous value, so the \
-                     old index entry could never be removed. To rank or filter on this \
-                     value, either scope the ranking to a bounded sub-range and sort in \
-                     memory, or materialize it into a separate plain column refreshed by \
-                     a background job."
-                ),
-            ));
-        }
-        for (name, cols, _, _) in &struct_indexes {
-            if cols.contains(&f.column) {
-                return Err(syn::Error::new_spanned(
-                    &f.ident,
-                    format!(
-                        "#[counter] column `{}` is used by index `{}`: a counter column \
-                         cannot back an index, because an atomic add never reads the \
-                         previous value and the old entry could never be removed.",
-                        f.column, name
-                    ),
-                ));
-            }
-        }
-        for (col, pattern) in &pattern_cols {
-            if col == &f.column {
-                return Err(syn::Error::new_spanned(
-                    &f.ident,
-                    format!(
-                        "#[counter] column `{}` is used by `{}`, which is backed by an \
-                         index, and a counter column cannot back one. Scope the ranking \
-                         to a bounded sub-range and sort in memory, or materialize it \
-                         into a plain column refreshed by a background job.",
-                        f.column, pattern
-                    ),
-                ));
-            }
-        }
-    }
-
     // --- column-name consts: `pub const FIELD: &str = "column";` ---
     // pk fields are excluded: their store column is `_id`, not the field name.
     let const_defs = field_infos.iter().filter(|f| !f.is_pk).map(|f| {
@@ -904,24 +1014,99 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         quote! { pub const #cname: &'static str = #col; }
     });
 
-    // --- schema(): push a ColDef per non-pk field, plus indexes ---
-    let col_pushes = field_infos.iter().filter(|f| !f.is_pk).map(|f| {
+    // --- typed column handles: `pub const field: Col<FieldType>` ---
+    //
+    // Lower-case on purpose: `Post::room_id.eq(5)` reads as the column it is,
+    // and the SCREAMING form stays for the places a column genuinely is just a
+    // name (row accessors, schema attributes). Same name, two shapes, so this
+    // does not become a second vocabulary.
+    let typed_cols = field_infos.iter().filter(|f| !f.is_pk).map(|f| {
+        let ident = &f.ident;
         let ty = &f.ty;
         let col = &f.column;
-        let counter = f.counter;
+        quote! {
+            #[allow(non_upper_case_globals)]
+            pub const #ident: ::boogy_sdk::expr::Col<#ty> =
+                ::boogy_sdk::expr::Col::new(#col);
+        }
+    });
+
+    // A `#[model(counter(...))]` column has no field to hang `Post::room_id`
+    // -style consts off, but the same two shapes are still what callers need:
+    // the SCREAMING name for `upsert_increment`'s `counter` argument, and a
+    // typed `Col<i64>` for the one thing sorting BY a counter's value is
+    // still allowed to do — `.order(Link::clicks.desc())` (spec §9's
+    // narrower exception: ranking by a counter's cells, not reading them).
+    let struct_counter_const_defs = struct_counters.iter().map(|name| {
+        let cname = format_ident!("{}", name.to_uppercase());
+        quote! { pub const #cname: &'static str = #name; }
+    });
+    let struct_counter_typed_cols = struct_counters.iter().map(|name| {
+        let ident = format_ident!("{}", name);
+        quote! {
+            #[allow(non_upper_case_globals)]
+            pub const #ident: ::boogy_sdk::expr::Col<i64> =
+                ::boogy_sdk::expr::Col::new(#name);
+        }
+    });
+
+    // --- schema(): push a ColDef per non-pk field, then every
+    // `#[model(counter(...))]` declaration, in declaration order ---
+    //
+    // The store assigns a table's column ordinals once, at `create_table`
+    // time, from whatever order this pushes them in THEN — and never
+    // revisits them afterward (`add_column` only appends; a later redeploy
+    // that changes this declaration, or the struct's field order, cannot
+    // touch an already-created table's ordinals at all, because
+    // `create_table_from` skips creation outright when the table already
+    // exists). So there is no historical position for a counter column to
+    // reproduce, ever, and appending it after the real columns is not a
+    // placeholder for something more precise — it is the only definition of
+    // "where" that means anything here.
+    let field_pushes = field_infos.iter().filter(|f| !f.is_pk).map(|f| {
+        let ty = &f.ty;
+        let col = &f.column;
         // `unique` is always false: the derive has no field marker that sets it
         // any more, because the flag is inert — nothing on any write path reads
         // it. A derived model states its uniqueness constraints as UNIQUE
         // indexes (`#[lookup_by]`, `#[model(unique_index(...))]`), which the
-        // store does enforce.
+        // store does enforce. `counter` is always false too: a field can never
+        // be a counter column any more — see `#[model(counter(name = ...))]`.
         let default = match &f.default {
             Some(v) => quote! { ::core::option::Option::Some(#v) },
             None => quote! { ::core::option::Option::None },
         };
+        // The parent's table is read from the model, so a `#[model(table = ..)]`
+        // rename on the parent moves the relation with it.
+        let parent = match &f.belongs_to {
+            Some(p) => quote! {
+                ::core::option::Option::Some(::boogy_sdk::store::ForeignKey {
+                    references_table:
+                        <#p as ::boogy_sdk::model::Model>::TABLE.to_string(),
+                    references_column: "_id".to_string(),
+                    on_delete: ::boogy_sdk::store::CascadeAction::NoAction,
+                    on_update: ::boogy_sdk::store::CascadeAction::NoAction,
+                })
+            },
+            None => quote! { ::core::option::Option::None },
+        };
         quote! {
-            __t.columns.push(::boogy_sdk::model::col_def_for::<#ty>(#col, false, #counter, #default));
+            {
+                let mut __c =
+                    ::boogy_sdk::model::col_def_for::<#ty>(#col, false, false, #default);
+                __c.references = #parent;
+                __t.columns.push(__c);
+            }
         }
     });
+    let struct_counter_pushes = struct_counters.iter().map(|name| {
+        quote! {
+            __t.columns.push(
+                ::boogy_sdk::model::col_def_for::<i64>(#name, false, true, ::core::option::Option::None)
+            );
+        }
+    });
+    let col_pushes = field_pushes.chain(struct_counter_pushes);
     let field_index_pushes = field_infos.iter().filter(|f| f.index && !f.is_pk).map(|f| {
         let col = &f.column;
         let idx_name = format!("idx_{}_{}", table_name, f.column);
@@ -957,17 +1142,16 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     });
 
-    // --- to_columns (non-pk, non-counter) ---
+    // --- to_columns (non-pk) ---
     //
-    // A `#[counter]` field is deliberately absent. `to_columns` feeds both
-    // `db_insert` and `db_update`, and a counter column is written ONLY by the
-    // increment path — `db_update(id, &Row { title, ..row })` would otherwise
-    // carry the counter value the author read earlier and overwrite every atomic
-    // add made since. Emitting nothing (rather than emitting a value the store
-    // then ignores) keeps the wire honest: the update genuinely does not mention
-    // the column. The field stays on the struct and still reads back its true
-    // value; it is simply read-only.
-    let to_col_pushes = field_infos.iter().filter(|f| !f.is_pk && !f.counter).map(|f| {
+    // Every remaining field is an ordinary writable column. A counter column
+    // is never among them: it has no field at all — `struct_counter_pushes`
+    // (below) puts it in the schema, but `to_columns` only ever walks
+    // `field_infos`, and a counter never appears there. That absence is what
+    // keeps a counter's value out of `db_insert`/`db_update`: it is written
+    // ONLY by the increment path, so `db_update(id, &Row { title, ..row })`
+    // can never carry a stale read of it back over a concurrent atomic add.
+    let to_col_pushes = field_infos.iter().filter(|f| !f.is_pk).map(|f| {
         let ident = &f.ident;
         let col = &f.column;
         quote! {
@@ -994,6 +1178,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let expanded = quote! {
         impl #struct_ident {
             #(#const_defs)*
+            #(#typed_cols)*
+            #(#struct_counter_const_defs)*
+            #(#struct_counter_typed_cols)*
         }
 
         impl ::boogy_sdk::model::Model for #struct_ident {
@@ -1043,6 +1230,194 @@ fn to_snake_case(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// #[derive(Counter)]
+// ---------------------------------------------------------------------------
+
+/// Derive `boogy_sdk::model::Counter` for a marker type — either naming an
+/// existing counter column on a `#[derive(Model)]` struct (declared with
+/// `#[model(counter(name = "..."))]` — see that derive's docs), or standing
+/// alone as a counter keyed by an arbitrary tuple attached to no model.
+///
+/// ```ignore
+/// #[derive(Counter)]
+/// #[counter(of = Room, name = "post_count")]
+/// pub struct RoomPostCount;          // keyed by the room's row id
+/// ```
+///
+/// ```ignore
+/// #[derive(Counter)]
+/// #[counter(key = (room_id, day))]
+/// pub struct RoomDailyPosts;         // keyed by an arbitrary tuple, no model
+/// ```
+///
+/// Exactly one of two shapes, never both and never neither — combining them
+/// or giving neither is a compile error naming the fix:
+///
+/// - `#[counter(of = <Model>, name = "<column>")]` — a counter attached to
+///   a model's row.
+///   - `of` — the parent model type (a path, not a string — same reasoning
+///     as `#[belongs_to]`: the table name is read from `<of as Model>::TABLE`,
+///     so a `#[model(table = "...")]` rename on the parent cannot leave this
+///     pointing at a name nothing answers to).
+///   - `name` — the counter column's name on that model, as a string
+///     literal. The column itself is declared on `<of>`'s own
+///     `#[derive(Model)]`, with `#[model(counter(name = "<column>"))]`.
+///     This derive does not emit a column of its own, and does not inspect
+///     `<of>`'s declarations to check that `name` really is one — it only
+///     gives whichever cell that name already addresses a freestanding,
+///     typed handle.
+///   - Emits `Counter::Key = Id<of>`.
+///
+/// - `#[counter(key = (col_a, col_b, ...))]` — a counter keyed by an
+///   arbitrary tuple, attached to no model at all. `name = "..."` is an
+///   optional override for the counter's own name; the default is the
+///   struct's name in snake_case. Emits `Counter::Key = [Val; N]`, one
+///   value per listed column, in the listed order, plus a
+///   `Self::KEY_COLS: &'static [&'static str]` inherent const naming those
+///   columns in the same order.
+///
+///   **Unbounded key cardinality is a new way to fill a keyspace.** This
+///   derive allocates a cell for every DISTINCT key tuple ever added to and
+///   never reclaims one — keying by something with no natural bound (a
+///   request id, a raw event id) grows storage without limit, the same risk
+///   the store's `rollup-def` documents for an unbounded `group`. Keep
+///   `key` columns bounded (a customer id, a day, an IP) the way you would
+///   size an index.
+#[proc_macro_derive(Counter, attributes(counter))]
+pub fn derive_counter(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match expand_counter(input) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn expand_counter(input: DeriveInput) -> syn::Result<TokenStream2> {
+    let struct_ident = input.ident.clone();
+
+    let mut of: Option<syn::Path> = None;
+    let mut name: Option<LitStr> = None;
+    let mut key: Option<Vec<String>> = None;
+
+    for attr in &input.attrs {
+        if !attr.path().is_ident("counter") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("of") {
+                of = Some(meta.value()?.parse()?);
+                Ok(())
+            } else if meta.path.is_ident("name") {
+                name = Some(meta.value()?.parse()?);
+                Ok(())
+            } else if meta.path.is_ident("key") {
+                let value = meta.value()?;
+                let content;
+                syn::parenthesized!(content in value);
+                let cols: syn::punctuated::Punctuated<syn::Ident, syn::Token![,]> =
+                    content.parse_terminated(|p| p.parse::<syn::Ident>(), syn::Token![,])?;
+                if cols.is_empty() {
+                    return Err(meta.error(
+                        "#[counter(key = (...))] needs at least one column name — \
+                         e.g. `#[counter(key = (ip, window))]`",
+                    ));
+                }
+                key = Some(cols.into_iter().map(|i| i.to_string()).collect());
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "#[counter(...)] on a #[derive(Counter)] type takes `of = <Model>` \
+                     with `name = \"<column>\"` (a counter attached to a model's row), \
+                     or `key = (col_a, col_b)` (a counter keyed by an arbitrary tuple, \
+                     attached to no model) — e.g. `#[counter(of = Room, name = \
+                     \"post_count\")]` or `#[counter(key = (ip, window))]`",
+                ))
+            }
+        })?;
+    }
+
+    match (of, key) {
+        (Some(_), Some(_)) => Err(syn::Error::new_spanned(
+            &struct_ident,
+            "#[counter(...)] cannot combine `of = <Model>` with `key = (...)` — `of` is \
+             sugar for keying on that model's row id; use `#[counter(of = Room, name = \
+             \"post_count\")]` for a counter attached to a model's row, or `#[counter(key \
+             = (col_a, col_b))]` for a counter keyed by an arbitrary tuple attached to no \
+             model, not both",
+        )),
+        (Some(of), None) => {
+            let Some(name) = name else {
+                return Err(syn::Error::new_spanned(
+                    &struct_ident,
+                    "#[counter(...)] is missing `name = \"<column>\"` — the name of \
+                     the counter column on the model this type addresses, e.g. \
+                     `#[counter(of = Room, name = \"post_count\")]`",
+                ));
+            };
+            Ok(quote! {
+                impl ::boogy_sdk::model::Counter for #struct_ident {
+                    const NAME: &'static str = {
+                        const __TABLE: &str = <#of as ::boogy_sdk::model::Model>::TABLE;
+                        const __COLUMN: &str = #name;
+                        const __BYTES: [u8; __TABLE.len() + 1 + __COLUMN.len()] =
+                            ::boogy_sdk::model::concat_counter_name(__TABLE, __COLUMN);
+                        match ::core::str::from_utf8(&__BYTES) {
+                            ::core::result::Result::Ok(s) => s,
+                            // Unreachable: concatenating two valid `&str`s with a
+                            // single-byte ASCII separator is always valid UTF-8. A
+                            // bare string-literal panic (no interpolation) is the
+                            // form `const` contexts accept.
+                            ::core::result::Result::Err(_) => {
+                                panic!("counter name concatenation produced invalid utf8")
+                            }
+                        }
+                    };
+                    type Key = ::boogy_sdk::model::Id<#of>;
+                }
+            })
+        }
+        (None, Some(key_cols)) => {
+            let counter_name = name
+                .map(|l| l.value())
+                .unwrap_or_else(|| to_snake_case(&struct_ident.to_string()));
+            let n = key_cols.len();
+            let key_col_strs = key_cols.iter().map(|s| s.as_str());
+            Ok(quote! {
+                impl #struct_ident {
+                    /// The columns composing this counter's key, in order —
+                    /// the same order `Counter::Key`'s `[Val; #n]` values
+                    /// must be supplied in.
+                    pub const KEY_COLS: &'static [&'static str] = &[#(#key_col_strs),*];
+                }
+                impl ::boogy_sdk::model::Counter for #struct_ident {
+                    const NAME: &'static str = #counter_name;
+                    type Key = [::boogy_sdk::store::Val; #n];
+                }
+            })
+        }
+        (None, None) => {
+            if name.is_some() {
+                Err(syn::Error::new_spanned(
+                    &struct_ident,
+                    "#[counter(...)] is missing `of = <Model>` — the model that \
+                     declares the counter column this type addresses, e.g. \
+                     `#[counter(of = Room, name = \"post_count\")]`",
+                ))
+            } else {
+                Err(syn::Error::new_spanned(
+                    &struct_ident,
+                    "#[derive(Counter)] requires either `#[counter(of = <Model>, name = \
+                     \"<column>\")]` (a counter attached to a model's counter column) \
+                     or `#[counter(key = (col_a, col_b))]` (a counter keyed by an \
+                     arbitrary tuple, attached to no model) — e.g. `#[counter(of = Room, \
+                     name = \"post_count\")]` or `#[counter(key = (ip, window))]`",
+                ))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

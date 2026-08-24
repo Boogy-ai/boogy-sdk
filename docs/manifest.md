@@ -41,7 +41,6 @@ background_jobs = true
 memory_mb = 64
 timeout_ms = 10000
 cpu_deadline_ms = 15000
-storage_mb = 512
 
 [ingress]
 mode = "authenticated"
@@ -113,12 +112,15 @@ The `[capabilities]` section is **optional** — a missing or empty one grants n
 
 The `[limits]` section is **optional** — a missing or empty one takes the per-field defaults below.
 
+Storage capacity is **not** among them: it comes from your plan rather than being
+declared per service, and a `[limits] storage_mb` key is refused by name at
+publish. Check your usage with `GET /v1/quota`.
+
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `memory_mb` | u32 | `32` | Per-request Wasm linear memory cap in MiB. |
 | `timeout_ms` | u64 | `5000` | Legacy wall-clock timeout in ms. |
 | `cpu_deadline_ms` | u64 | `30000` | Per-request wall-clock budget `B_req` in ms. The scheduler uses this as the slot-holding ceiling. Epoch deadline traps a CPU-bound guest; an outer timeout returns HTTP 504. Range: 1–600000. |
-| `storage_mb` | u32 or null | `null` (platform default) | Soft storage quota in MiB. `null` = use the platform default; `0` = unlimited (trusted opt-out). |
 
 ---
 
@@ -154,14 +156,27 @@ build = "ts"
 private = false
 ```
 
-A frontend-only deployment needs **no `[capabilities]`, `[ingress]`, or data
-model** — it runs no wasm. See the `boogy-serving-frontends` skill.
+A frontend-only deployment needs **no `[capabilities]` and no data model** — it
+runs no wasm. It still declares `[ingress]`: the assets are served over HTTP, so
+who may fetch them is a decision like any other (`mode = "public"` for a public
+site). See the `boogy-serving-frontends` skill.
 
 ---
 
 ## `[ingress]`
 
-Controls who can call your service. The entire section is optional; omitting it is equivalent to `mode = "public"`.
+Controls who can call your service. **The section is required, and it must state
+a `mode`** — a manifest that omits either is refused at publish. There is no
+default: `public` would be an unsafe guess and `authenticated` would silently
+401 a service you meant to publish, so the decision is yours to write down.
+
+`mode` is what is required, not merely the header: a bare `[ingress]`, or a
+manifest that writes only `[ingress.rate_limit]`, is refused the same way.
+
+```toml
+[ingress]
+mode = "public"   # public = anyone on the internet, with no credential
+```
 
 ### Mode guide
 
@@ -177,9 +192,39 @@ Controls who can call your service. The entire section is optional; omitting it 
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `mode` | string | `"public"` | One of the five modes above. |
+| `mode` | string | **required** | One of the five modes above. No default — state it. Required on every `[[ingress.routes]]` block too (see below). |
 | `allowed_agents` | string array | `[]` | For `allowlist` / `mixed`: agent matchers. Each entry is `*` (any agent), `@handle` (by handle, case-insensitive), or `agent_<uuid>` (exact ID). **Required non-empty when `mode = "allowlist"`.** |
 | `allowed_origins` | string array | `[]` | For `internal` / `mixed`: workload URI matchers. Each entry is `*` / `boogy://*` (any workload), `boogy://<owner>/*` (any service owned by `<owner>`), or `boogy://<owner>/services/<name>` (exact service). **Required non-empty when `mode = "internal"`.** |
+
+### `[[ingress.routes]]`
+
+Per-route carve-outs. Each block pins its own mode (and its own allowlists — a
+route inherits nothing from the service-wide policy) for the paths it matches.
+The classic case is a `mode = "public"` webhook receiver inside an otherwise
+restricted service.
+
+```toml
+[ingress]
+mode = "authenticated"
+
+[[ingress.routes]]
+path = "/webhook"     # service-relative; exact, or trailing /* for a prefix
+mode = "public"       # required — see below
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `path` | string | **required** | Service-relative pattern: exact (`/webhook`) or prefix (`/stripe/*`). Literal only — no `{param}` capture. Applies to all HTTP methods. |
+| `mode` | string | **required** | One of the five modes above. No default — state it. |
+| `allowed_agents` | string array | `[]` | This route's own matchers. Same rules as the service-wide field. |
+| `allowed_origins` | string array | `[]` | This route's own matchers. Same rules as the service-wide field. |
+
+A matching route **replaces** the service-wide mode for that path — it does not
+narrow it. That is why `mode` is required here as well: omitting it on an
+`internal` service would leave that one path reachable by anyone. A block with no
+`mode` is refused at deploy, and the diagnostic names the `path`. Among matching
+routes the most specific wins (exact beats prefix, longer prefix beats shorter);
+if none match, the service-wide mode applies.
 
 ### `[ingress.rate_limit]`
 
@@ -335,6 +380,13 @@ If your Wasm component calls `store::*`, `auth::*`, etc. without the correspondi
 **`outbound_http` with empty `allowed_hosts`**
 
 Granting `capabilities.outbound_http = true` without a `[outbound]` block (or with `allowed_hosts = []`) fails validation. The capability requires at least one destination.
+
+**No `[ingress]`, or an `[ingress]` with no `mode`**
+
+Both are refused at publish. A service is reachable over HTTP, so its exposure
+must be stated rather than inferred — and the section header is not the
+statement, `mode` is. A bare `[ingress]`, or a manifest whose only ingress key
+is a subtable such as `[ingress.rate_limit]`, fails the same check.
 
 **`allowlist`/`internal`/`mixed` ingress with empty lists**
 

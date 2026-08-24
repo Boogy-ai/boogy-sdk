@@ -1,0 +1,5 @@
+error: #[counter] is not supported as a field: a counter column has no field of its own. Declare it on the struct instead — #[model(counter(name = "<column>"))] — and read or add its value through a companion #[derive(Counter)] #[counter(of = Self, name = "<column>")] marker type.
+  --> tests/ui/counter_field_form.rs:12:5
+   |
+12 |     #[counter]
+   |     ^^^^^^^^^^

@@ -30,4 +30,34 @@ interface runtime {
     /// module, which can't hardcode an owner identity in its manifest). Ungated,
     /// like `self-identity`.
     caller-is-service-owner: func() -> bool;
+
+    /// What this invocation must do about the service's DECLARED schema
+    /// (its tables, indexes and rollups).
+    ///
+    /// Declaring a schema is a property of a deployed version, not of a
+    /// request: the declaration cannot change between two requests served by
+    /// the same version. Re-deriving it per request therefore costs the
+    /// platform a fixed number of store round trips that answer a question
+    /// already answered. The host resolves the schema ONCE per deployment
+    /// version and then tells every subsequent invocation to skip the pass
+    /// outright — there is no read to serve from a cache, because there is no
+    /// read.
+    ///
+    /// Host-attested, like `self-identity`: derived from the deployment the
+    /// host is executing, never from a guest value or an inbound header, so a
+    /// caller cannot talk a service out of creating its tables. Ungated.
+    enum schema-mode {
+        /// Run the declaration + convergence pass, then serve the request.
+        /// The fail-safe default: any invocation the host cannot positively
+        /// account for lands here, so behaviour degrades to "do the work".
+        apply,
+        /// The declared schema for this deployment version is already
+        /// applied. Skip the pass entirely and serve the request.
+        skip,
+        /// Resolution pass. Run the declaration + convergence pass and return
+        /// without dispatching to any route. The host issues exactly one of
+        /// these per deployment version, off the request path.
+        apply-only,
+    }
+    current-schema-mode: func() -> schema-mode;
 }

@@ -11,11 +11,12 @@
 //! speaks no SQL and rejects it outright — then groups the result by FK so
 //! handlers can splice children onto parents in O(1) per parent.
 //!
-//! It reads the matching children in pages, because the host caps a single
-//! `find` at `BOOGY_STORE_MAX_PAGE_ROWS`. Those pages are taken by OFFSET and
-//! request no sort, so above one page the result is not stable under
-//! concurrent writes — see the guarantee audit (1ae) before relying on it for
-//! a large child set.
+//! It reads **one page** of children and refuses past it. An `IN` list is
+//! planned as one seek per parent, unioned and sorted in host memory, so unlike
+//! a single-equality lookup no declared composite would let it page in bounded
+//! work — batching the parents is the caller's lever, and the refusal names it.
+//! The earlier shape walked pages by OFFSET with no sort, which above one page
+//! could return a row twice or skip it while still reporting success.
 //!
 //! ## Typical handler
 //!
@@ -24,8 +25,14 @@
 //! // not `boogy_sdk::relations::load_has_many`. In a submodule, reach it as
 //! // `use crate::load_has_many;`.
 //! fn list_notes_with_comments(_req: &mut Req<'_>) -> Result<Json<json::Value>, ApiError> {
-//!     // 1) parents
-//!     let notes = auth::find_owned::<Note>(DEFAULT_OWNER_COL)?;
+//!     // 1) parents — ONE page. The batched child read below is bounded by the
+//!     // parent page, so an unbounded parent read would just move the same
+//!     // unbounded read one level down.
+//!     let page = auth::find_owned::<Note>(
+//!         DEFAULT_OWNER_COL,
+//!         &boogy_sdk::pagination::PageRequest::first(),
+//!     )?;
+//!     let notes = &page.rows;
 //!     // `Row::id()` is a u64 — the key type `load_has_many` groups on.
 //!     let note_ids: Vec<u64> = notes.iter().map(|n| n.id()).collect();
 //!

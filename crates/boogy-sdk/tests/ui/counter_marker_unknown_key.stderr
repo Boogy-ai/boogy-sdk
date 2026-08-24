@@ -1,0 +1,5 @@
+error: #[counter(...)] on a #[derive(Counter)] type takes `of = <Model>` with `name = "<column>"` (a counter attached to a model's row), or `key = (col_a, col_b)` (a counter keyed by an arbitrary tuple, attached to no model) — e.g. `#[counter(of = Room, name = "post_count")]` or `#[counter(key = (ip, window))]`
+  --> tests/ui/counter_marker_unknown_key.rs:15:43
+   |
+15 | #[counter(of = Room, name = "post_count", index = true)]
+   |                                           ^^^^^

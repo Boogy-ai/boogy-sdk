@@ -1,0 +1,22 @@
+error[E0277]: the trait bound `i64: From<&str>` is not satisfied
+ --> tests/ui/expr_wrong_value_type.rs:8:24
+  |
+8 |     let _ = ROOM_ID.eq("not an integer");
+  |                     -- ^^^^^^^^^^^^^^^^ the trait `From<&str>` is not implemented for `i64`
+  |                     |
+  |                     required by a bound introduced by this call
+  |
+  = help: the following other types implement trait `From<T>`:
+            `i64` implements `From<bool>`
+            `i64` implements `From<i16>`
+            `i64` implements `From<i32>`
+            `i64` implements `From<i8>`
+            `i64` implements `From<u16>`
+            `i64` implements `From<u32>`
+            `i64` implements `From<u8>`
+  = note: required for `&str` to implement `Into<i64>`
+note: required by a bound in `Col::<T>::eq`
+ --> src/expr.rs
+  |
+  |     pub fn eq(&self, v: impl Into<T>) -> Expr {
+  |                              ^^^^^^^ required by this bound in `Col::<T>::eq`

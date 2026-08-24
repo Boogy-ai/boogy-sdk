@@ -88,9 +88,14 @@ impl From<&Note> for NoteOut {
     }
 }
 
-fn list_notes(_req: &mut Req<'_>) -> Result<Json<Vec<NoteOut>>, ApiError> {
-    let rows = auth::find_owned::<Note>(DEFAULT_OWNER_COL)?;
-    Ok(Json(rows.iter().map(|r| NoteOut::from(&Note::from_row(r))).collect()))
+fn list_notes(req: &mut Req<'_>) -> Result<Json<boogy_sdk::pagination::CursorPage<NoteOut>>, ApiError> {
+    // One bounded page + the cursor to continue from. There is no form of this
+    // call that returns the principal's whole set.
+    let page = auth::find_owned::<Note>(
+        DEFAULT_OWNER_COL,
+        &boogy_sdk::pagination::PageRequest::new(20, req.query("cursor").map(str::to_string)),
+    )?;
+    Ok(Json(page.map(|r| NoteOut::from(&Note::from_row(r)))))
 }
 
 #[derive(Deserialize, garde::Validate)]
@@ -166,7 +171,7 @@ The macro emits into **your crate's root**:
 | `create_model::<M>()`, `db_insert`, `db_get`, `db_update`, `db_delete`, `db_find_by` | The typed-model CRUD layer (see [Data](#data-models-queries-transactions)). |
 | `Query`, `find_row_by`, `find_rows`, `count_rows`, `get_row`, `get_many`, `find_all_rows`, `find_many`, `for_each_batch` | Read helpers. `Query` is the fluent one; the rest are the direct forms. |
 | `tx`, `migration`, `migrations` | Transactions and schema migrations. |
-| `auth::*` | `current_principal`, `current_handle`, `current_scopes`, `has_scope`, `required()`, `require_scope(...)`, `owns_resource(...)`, `find_owned(...)`, `load_owned(...)`. |
+| `auth::*` | `current_principal`, `current_handle`, `current_scopes`, `has_scope`, `required()`, `require_scope(...)`, `owns_resource(...)`, `find_owned(..., &PageRequest) -> RowPage` (one bounded page + cursor), `load_owned(...)`. |
 | `peer_fetch`, `jobs_enqueue`/`_cancel`/`_status`, `ws_publish`, `signing_*`, `secrets_verify_hmac`, `now_millis`, `random_*`, `self_identity`, `caller_is_service_owner` | Thin wrappers over the other host capabilities. |
 | `use` statements | `Deserialize`, `Serialize`, `json`, `response`, `Params`, `Req`, `Router`, `Ctx`, `Row`, `Table`, `StoreError`, `ApiError`, `parse_body`, `validate_body`, `Json`, `Created`, `NoContent`, `Redirect`, `IntoResponse`, `Path`, `Principal`, `Alphabet`, `DEFAULT_OWNER_COL`. |
 
@@ -302,7 +307,11 @@ Field markers worth knowing on day one:
 - `#[pk]` — maps to the store's auto-assigned `_id`. Insert with `Id::new(0)`; `db_insert` returns the real id.
 - `#[index]` / `#[lookup_by]` — a single-column index; `#[lookup_by]` makes it unique and declares a point-lookup pattern. There is no field-level `#[unique]`: uniqueness is enforced by an index, so use `#[lookup_by]`, or `#[model(unique_index(cols = [...]))]` for a composite.
 - `#[default = "pending"]` / `#[default = 0]` — a column default. Declaring or changing one never rewrites stored rows: a row that predates the column resolves against the current default on read. A defaulted column also satisfies the not-null requirement, which makes this the way to add a required field to a live table. Use `#[default(-1)]` for negative numbers.
-- `#[counter]` — a conflict-free integer counter. The value lives in its own cell and moves by an atomic add that takes no read-conflict range, so concurrent increments compose instead of serializing. Three consequences: the field is **read-only** (excluded from `db_insert`/`db_update`, moved only by `upsert_increment`), it **cannot back an index** (the derive rejects `#[index]`, `#[lookup_by]`, and any access-pattern column), and a counter read inside a transaction is **not** serialized against concurrent increments — so never gate a write on a counter value, or on a count derived from one, read in the same transaction.
+<!-- retired-spelling: the bullet below names the retired field-level
+     `#[counter]` only to say it is a compile error; the live declaration is
+     `#[model(counter(name = "..."))]` on the struct, plus a companion
+     `#[derive(Counter)]` marker type. -->
+- `#[model(counter(name = "hits"))]` — a conflict-free integer counter, declared **on the struct**, with **no field of its own** (there is no field-level `#[counter]`; writing one is a compile error). The value lives in its own cell and moves by an atomic add that takes no read-conflict range, so concurrent increments compose instead of serializing. Three consequences: there is no field for a write to carry, so no write can clobber it — the store never packs it into the row and it is moved only by `upsert_increment` (or a companion `#[derive(Counter)]` marker type's add) — it **cannot back an index** (the derive rejects `#[index]`, `#[lookup_by]`, and any access-pattern column) — though you can still **order by it**: `.order(T::hits.desc()).limit(20)` is served from the counter's own cells, bounded by the page rather than the table, and is ordered as of a recent snapshot rather than live — and a counter read inside a transaction is **not** serialized against concurrent increments — so never gate a write on a counter value, or on a count derived from one, read in the same transaction. **Reading back a counter you added to in the same transaction is now refused** with a `ConstraintViolation` naming the counter: the value it would return is correct (it includes your add) but carries no read-conflict range, so ten transactions can each read 9, each decide they are under the limit, and all ten commit. If you genuinely depend on the value, read it non-snapshot and accept that concurrent writers will conflict with you; if you only want to report it, read it after the transaction commits. Note the limit: only reading back a cell **you bumped** is refused — reading a counter you did not touch and branching on it in your own code is still unserialized, and still yours to avoid.
 
 ### Reading
 
@@ -310,17 +319,23 @@ Field markers worth knowing on day one:
 
 ```rust
 let recent: Vec<Row> = Query::on(Post::TABLE)
-    .where_eq(Post::ROOM_ID, 42_i64)
-    .where_gt(Post::CREATED_AT, 0_i64)
-    .order_by_desc(Post::CREATED_AT)
+    .filter(Post::room_id.eq(42_i64))
+    .filter(Post::created_at.gt(0_i64))
+    .order(Post::created_at.desc())
     .limit(50)
     .fetch_all()?;
 
-let one: Option<Row> = Query::on(Post::TABLE).where_eq(Post::SLUG, "hello").fetch_one()?;
-let n: u64 = Query::on(Post::TABLE).where_eq(Post::ROOM_ID, 42_i64).count()?;
+let one: Option<Row> = Query::on(Post::TABLE).filter(Post::slug.eq("hello")).fetch_one()?;
+let n: u64 = Query::on(Post::TABLE).filter(Post::room_id.eq(42_i64)).count()?;
 ```
 
-`fetch_all` and `fetch_one` discard the total row count, so they set the store's `skip_total` flag and the host skips computing it. Use `fetch_all_with_total()` when you actually display a total, and `fetch_page(|row| …)` for keyset pagination after `.keyset_by(col, dir)`. `count()` sends **only** the base AND-filters — it ignores `.or(...)`, ordering and paging, because the store's count operation is filters-only.
+Operators live on the typed column handle the derive emits (`Post::room_id`, a `Col<i64>`), so `Post::room_id.eq("nope")` does not compile and `is_null()` is offered only on a column that can hold one. Two verbs carry the query: repeated `.filter(..)` calls AND together (compose with `.and(..)`/`.or(..)` for structure), and `.order(..)` takes either a column ordering or an aggregate one, because `ORDER BY` is one clause. The uppercase const (`Post::ROOM_ID`) stays for the places a column is genuinely just a name — row accessors, `agg::sum(..)`.
+
+**`fetch_all` requires a `.limit(n)` and will not compile without one.** The builder carries its row ceiling in its type: a query starts unbounded, `.limit(n)` moves it to the bounded state, and the two row-materializing terminals (`fetch_all`, `fetch_all_with_total`) exist only there. So `Query::on(T).order(..).fetch_all()` is a compile error naming the missing bound, not a request the store answers with a page of its own choosing. `fetch_one`, `count`, `fetch_page` and the aggregate terminals are bounded by their own construction and need no `.limit(..)`.
+
+`fetch_all` truncates *by your instruction*: it returns the first `n` rows in the query's order and says nothing about the rest. That is the right verb for a top-N, an `is_in` over `n` ids, or an existence probe at `.limit(1)`. When the matching set grows with the tenant, use `fetch_page(|row| …)` — same `.limit(..)`, plus the cursor that continues the listing.
+
+`fetch_all` and `fetch_one` discard the total row count, so they set the store's `skip_total` flag and the host skips computing it. Use `fetch_all_with_total()` when you actually display a total, and `fetch_page(|row| …)` plus `.cursor(token)` for cursor pagination — **the ordering is the cursor key**, so there is no second verb naming it, and `.cursor(..)` takes the opaque token the client round-trips rather than a decoded one. `count()` sends the lowered predicate and ignores ordering and paging, which cannot change a count; an **OR predicate is refused** rather than dropped, because the store's count op takes a conjunction only and a count carries no evidence of what it counted.
 
 Declare the access pattern your query needs (`list_by`, `ranked_by`, `lookup_by`, `tagged_by`, or an explicit index) so the planner has an index to walk. A query the planner cannot serve from an index degrades to a table scan. That is **warned and metered, never refused**: the guardrail logs an actionable hint and `keys_examined` records what the read actually looked at, so the cost is visible and priced. What stops an abusive scan is the per-request budget (`[limits] cpu_deadline_ms`), which cuts the request off *and* cancels the work. There is no per-query opt-out and no strict mode — an unindexed read on a declared column is caught at BUILD time by the service-conventions gate instead.
 
@@ -336,13 +351,26 @@ let opts = store::FindOptions {
         in_values: None,
     }],
     or_groups: vec![],
-    sort: vec![store::SortBy { column: "created_at".into(), dir: store::SortDir::Desc }],
+    order_by: vec![store::OrderTerm::Column(
+        store::SortBy { column: "created_at".into(), dir: store::SortDir::Desc },
+    )],
     page: Some(store::Page { limit: 50, offset: 0 }),
     skip_total: true,
+    group_cursor: None,                   // resume a ranked listing
+    counters: vec![],                     // name counter columns to merge them
 };
 let result = store::find("users", &opts)?;
 let ids: Vec<u64> = result.rows.iter().map(|r| to_sdk_row(r).id()).collect();
 ```
+
+`result.total_count` is `Option<u64>` — `None` when `skip_total` declined the
+count, which is a different answer from `Some(0)`. `result.has_more` says
+whether more rows follow this page, and on the raw form it is the only thing
+that does: the store clamps `page.limit` to its own per-call ceiling, so a short
+page may be the ceiling rather than the end, and a full page may be the end
+rather than the ceiling. Never derive "there is more" from the row count, and do
+not try to escape it by asking for `limit + 1` — that ask is clamped too. The
+`Query` terminals do this for you; this is the escape hatch's share of the work.
 
 `to_sdk_row` converts a raw WIT row into the typed `Row` (`row.text(col)`, `row.int(col)`, `row.bool(col)`, `row.real(col)`, `row.id() -> u64`, `row.to_json(&[…])`). `M::from_row(&row)` goes one step further and rebuilds the model.
 
@@ -350,7 +378,7 @@ let ids: Vec<u64> = result.rows.iter().map(|r| to_sdk_row(r).id()).collect();
 
 `db_insert(&m) -> u64`, `db_update::<M>(id, &m)`, `db_delete::<M>(id)` are the typed writes. Beneath them, `store::insert(table, &[store::Column { name, val: store::Value::* }]) -> u64`, `store::update(table, id, &cols) -> bool` and `store::delete(table, id) -> bool` are the raw forms — note that ids are `u64` throughout, never strings.
 
-`upsert(table, key, columns)` and `upsert_increment(table, key, counter, delta, columns)` are keyed on a **unique index over the key columns**, which must exist. `columns` is an `UpsertColumns { always, on_insert }`: `always` is written on every call (insert and update alike); `on_insert` is written only by the call that creates the row, then never touched again — the answer for a computed value (`now()`, a derived id) that a static `default` can't express. `upsert_increment` is only conflict-free when `counter` names a `#[counter]` column *and* `always` is empty — a non-empty `always` rewrites the row and reintroduces the conflict; `on_insert` does not, since it plays no part in any call after the first.
+`upsert(table, key, columns)` and `upsert_increment(table, key, counter, delta, columns)` are keyed on a **unique index over the key columns**, which must exist. `columns` is an `UpsertColumns { always, on_insert }`: `always` is written on every call (insert and update alike); `on_insert` is written only by the call that creates the row, then never touched again — the answer for a computed value (`now()`, a derived id) that a static `default` can't express. `upsert_increment` is only conflict-free when `counter` names a counter column *and* `always` is empty — a non-empty `always` rewrites the row and reintroduces the conflict; `on_insert` does not, since it plays no part in any call after the first.
 
 `store::update_where(table, filters, fields)` and `store::delete_where(table, filters)` apply a predicate to many rows in one call. **They evaluate the predicate by scanning the whole table** — no index is consulted, on either the plain or the transactional path. They are correct, and they are the right way to serialize a decision against concurrent counter increments (only the *matched* rows enter the read set), but they are not a way to make a bulk update cheap.
 
@@ -360,7 +388,7 @@ let ids: Vec<u64> = result.rows.iter().map(|r| to_sdk_row(r).id()).collect();
 
 ```rust
 // One vote on a post: record it and move the post's score, or neither.
-// `Post::slug` is the unique lookup key; `Post::vote_score` is a `#[counter]`.
+// `Post::slug` is the unique lookup key; `vote_score` is a counter column.
 let slug = "hello".to_string();
 tx::<_, _, ApiError>(|| {
     db_insert(&Receipt {

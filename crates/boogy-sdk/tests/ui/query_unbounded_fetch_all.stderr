@@ -1,0 +1,20 @@
+error[E0277]: this query states no row limit, so it cannot materialize rows
+  --> tests/ui/query_unbounded_fetch_all.rs:14:24
+   |
+14 |     materialize_rows::<Unbounded>();
+   |                        ^^^^^^^^^ needs a `.limit(n)` earlier in the chain
+   |
+   = help: the trait `BoundedRead` is not implemented for `boogy_sdk::query::Unbounded`
+   = note: Without a limit the store answers with a page of its own choosing (BOOGY_STORE_MAX_PAGE_ROWS, default 1000 rows) and returns no cursor and no total, so a truncated answer is indistinguishable from a complete one.
+   = note: If the set is bounded by construction — a top-N, an `is_in` over N ids, an existence probe — say so with `.limit(n)`.
+   = note: If it grows with the tenant, use `.limit(n).cursor(token)` and end on `.fetch_page(|row| ..)`, which returns the token that continues the listing.
+help: the trait `BoundedRead` is implemented for `Bounded`
+  --> src/query.rs
+   |
+   | impl BoundedRead for Bounded {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `materialize_rows`
+  --> tests/ui/query_unbounded_fetch_all.rs:11:24
+   |
+11 | fn materialize_rows<B: BoundedRead>() {}
+   |                        ^^^^^^^^^^^ required by this bound in `materialize_rows`

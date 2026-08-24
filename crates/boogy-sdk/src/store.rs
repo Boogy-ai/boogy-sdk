@@ -100,6 +100,13 @@ pub enum StoreError {
     /// from an index. The answer is the data model (finer keys, counter columns)
     /// or narrowing the read, not more capacity.
     TooContended(String),
+    /// A listing whose ordering has been rebuilt and reclaimed while it was
+    /// being paged. **Not retryable and not adjustable** — the generation the
+    /// cursor named is gone. Start the listing again from the first page.
+    ///
+    /// 410 rather than 409 because nothing about the request was wrong and
+    /// nothing about it can be changed to make it work.
+    Gone(String),
     Internal(String),
 }
 
@@ -127,6 +134,7 @@ impl std::fmt::Display for StoreError {
             | StoreError::ResourceExhausted(m)
             | StoreError::Poisoned(m)
             | StoreError::TooContended(m)
+            | StoreError::Gone(m)
             | StoreError::Internal(m) => write!(f, "{m}"),
         }
     }
@@ -228,6 +236,7 @@ impl From<StoreError> for ApiError {
             StoreError::TooContended(_)        => {
                 ApiError::service_unavailable_with_cause(msg, crate::error::cause::TX_CONTENDED, Some(1))
             }
+            StoreError::Gone(_)                => ApiError::gone(msg),
             StoreError::Internal(_)            => ApiError::internal(msg),
         }
     }
@@ -385,6 +394,13 @@ pub enum AccessPattern {
     /// Membership on a junction/side table: rows where `tag == v`, exposing
     /// `refs` (the parent id) to join back.
     TaggedBy { tag: String, refs: String },
+    /// Per-group totals kept up to date as rows change, so `count`/`sum` over
+    /// this grouping answer without reading the rows.
+    ///
+    /// Unlike the other patterns this one produces no index — it is a different
+    /// mechanism, not a different key order — so `resolve` ignores it and the
+    /// declaration is applied on its own pass.
+    Rollup { group: Vec<String>, sum: Vec<String>, count: bool },
 }
 
 /// The ordering a model DECLARED for listing rows filtered by `filter_col` —
@@ -421,20 +437,51 @@ pub fn declared_list_order(schema: &Table, filter_col: &str) -> Option<Order> {
 ///
 /// It is a service defect surfaced at runtime because the data grew, so the
 /// detail carries what the AUTHOR needs — they are the only one who can act.
+/// Two independent witnesses that more rows exist, and either one refuses.
+///
+/// `total` is the matching count the read asked for; `has_more` is the store's
+/// own statement about this page. They answer the same question by different
+/// routes — a count over the whole matching set, and the page's own edge — so
+/// requiring both to agree before refusing would mean a listing is only
+/// bounded when nothing has gone wrong. `total` is an `Option` because a read
+/// that declined the count has none to give; `None` is "unknown", never "zero",
+/// which is the whole reason it is not a bare `u64`.
 pub fn refuse_beyond_one_page(
     what: &str,
     got: usize,
-    total: u64,
+    total: Option<u64>,
+    has_more: bool,
     remedy: &str,
 ) -> Result<(), StoreError> {
-    if total > got as u64 {
+    let over = total.is_some_and(|t| t > got as u64);
+    if over || has_more {
+        let matched = match total {
+            Some(t) => format!("matched {t} rows"),
+            None => "matched more rows than one page holds".to_string(),
+        };
         return Err(StoreError::Internal(format!(
-            "{what} matched {total} rows but reads at most one page ({got}). It is for small \
+            "{what} {matched} but reads at most one page ({got}). It is for small \
              bounded sets and cannot page safely: there is no stable order across pages, so \
              continuing would silently duplicate or skip rows. {remedy}"
         )));
     }
     Ok(())
+}
+
+/// The total from a read that ASKED for one.
+///
+/// A `find` issued without `skip-total` always answers with a total, so `None`
+/// here is the request and the response disagreeing — a platform fault, not a
+/// count of zero. Folding it to `0` would rebuild, one layer up, the exact
+/// ambiguity `option<u64>` was introduced to remove: a caller cannot tell an
+/// empty table from a total that was never computed.
+pub fn required_total(what: &str, total: Option<u64>) -> Result<u64, StoreError> {
+    total.ok_or_else(|| {
+        StoreError::Internal(format!(
+            "{what} asked the store for a total and got none back. Treating that as 0 would \
+             report an empty result for a table that may be full."
+        ))
+    })
 }
 
 /// How a filtered multi-row read may safely be executed.
@@ -927,6 +974,168 @@ pub struct ColumnInfo {
 /// `Table::index()` produces — indexes have no create-vs-read asymmetry,
 /// so this struct also matches the SDK's `Index` (used by the Table
 /// builder).
+/// Which aggregate to compute.
+///
+/// `Avg` is never stored anywhere — it is derived from a sum and a count at
+/// read time — so there are only ever two accumulators behind these five.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    CountAll,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// One aggregate to compute. `column` is `None` only for [`AggFunc::CountAll`],
+/// which counts rows rather than values.
+///
+/// Build these with the [`crate::query::agg`] helpers rather than by hand: a
+/// spec that does not compare equal to the one a selector registered will be
+/// rejected as naming an aggregate the query never selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggSpec {
+    pub kind: AggFunc,
+    pub column: Option<String>,
+}
+
+/// A predicate applied AFTER aggregation, against an aggregate's own value —
+/// SQL's `HAVING`. Distinct from [`Filter`], which selects the rows that go
+/// INTO the aggregate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggFilter {
+    pub agg: AggSpec,
+    pub op: FilterOp,
+    pub val: Val,
+}
+
+/// Ordering by an aggregate's value rather than by a column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggSort {
+    pub agg: AggSpec,
+    pub dir: SortDir,
+}
+
+/// One row of a grouped result: the group's key, and the aggregates computed
+/// over it.
+///
+/// Values are read back by naming the same aggregate that was selected —
+/// `g.sum("amount")` for a query built with `.sum("amount")` — rather than by
+/// position, so adding an aggregate to a query cannot silently shift what an
+/// existing accessor reads.
+///
+/// # NULL is preserved
+///
+/// `sum`/`avg`/`min`/`max` return `Option`, and `None` is SQL NULL: no
+/// non-null value contributed. It is deliberately not flattened to zero,
+/// because "no refunds recorded" and "refunds totalling zero" are different
+/// facts and nothing downstream could tell them apart afterwards. `count_all`
+/// returns a bare `i64` — counting is the one aggregate defined on the empty
+/// set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    keys: Vec<Val>,
+    values: Vec<Option<Val>>,
+    specs: Vec<AggSpec>,
+}
+
+impl Group {
+    /// Assemble a group. Called by the generated query terminals; user code
+    /// receives these rather than building them.
+    pub fn new(keys: Vec<Val>, values: Vec<Option<Val>>, specs: Vec<AggSpec>) -> Self {
+        Self { keys, values, specs }
+    }
+
+    /// The group's key, or `None` for an ungrouped query — which returns
+    /// exactly one row, carrying no key, even over no rows at all.
+    pub fn key(&self) -> Option<&Val> {
+        self.keys.first()
+    }
+
+    /// Every key column, for a query grouped by more than one.
+    pub fn keys(&self) -> &[Val] {
+        &self.keys
+    }
+
+    fn value_of(&self, want: &AggSpec) -> Option<&Val> {
+        let i = self.specs.iter().position(|s| s == want).unwrap_or_else(|| {
+            // An authoring error, not a data condition: it cannot depend on the
+            // rows, and the query and this call sit in the same function.
+            // Reading as NULL instead would be indistinguishable from an empty
+            // group, forever.
+            //
+            // Logged BEFORE panicking, because a panic in a guest is a trap and
+            // the caller sees a bare 500 with none of this text. The log is the
+            // only place the developer can actually read why.
+            crate::log::error!(
+                "aggregate {want:?} was read but never selected; the query \
+                 selected {:?}",
+                self.specs
+            );
+            panic!(
+                "this query did not select {want:?}. Add the matching selector                  (for example `.sum(\"col\")`) to the query, or read an                  aggregate it does select: {:?}",
+                self.specs
+            )
+        });
+        self.values.get(i).and_then(|v| v.as_ref())
+    }
+
+    fn as_int(v: Option<&Val>) -> Option<i64> {
+        match v {
+            Some(Val::Integer(n)) => Some(*n),
+            Some(Val::Real(f)) => Some(*f as i64),
+            _ => None,
+        }
+    }
+
+    /// `SUM(column)`. `None` is SQL NULL — no non-null value contributed.
+    pub fn sum(&self, column: &str) -> Option<i64> {
+        Self::as_int(self.value_of(&crate::query::agg::sum(column)))
+    }
+
+    /// `AVG(column)`. `None` is SQL NULL, never a division by zero.
+    pub fn avg(&self, column: &str) -> Option<f64> {
+        match self.value_of(&crate::query::agg::avg(column)) {
+            Some(Val::Real(f)) => Some(*f),
+            Some(Val::Integer(n)) => Some(*n as f64),
+            _ => None,
+        }
+    }
+
+    /// `MIN(column)` / `MAX(column)`, as stored — text columns have extremes
+    /// too, so these are not narrowed to a number.
+    pub fn min(&self, column: &str) -> Option<&Val> {
+        self.value_of(&crate::query::agg::min(column))
+    }
+
+    pub fn max(&self, column: &str) -> Option<&Val> {
+        self.value_of(&crate::query::agg::max(column))
+    }
+
+    /// `COUNT(*)`. Not an `Option`: counting is defined on the empty set, and a
+    /// group that exists has at least one row anyway.
+    pub fn count_all(&self) -> i64 {
+        Self::as_int(self.value_of(&crate::query::agg::count_all())).unwrap_or(0)
+    }
+}
+
+/// A maintained rollup as the store reports it — what the schema reconcile
+/// compares against, and what a migration checks before declaring one.
+///
+/// Compared by its whole shape, not by name: a rollup whose grouping or summed
+/// columns changed is a different rollup wearing the same name, and treating it
+/// as a match would leave the declaration silently never taking effect.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollupInfo {
+    pub name: String,
+    /// The grouping columns, in declaration order. Order follows the
+    /// composite-index rule: a query may bind a leading prefix by equality and
+    /// group by a prefix of what remains.
+    pub group: Vec<String>,
+    pub sum: Vec<String>,
+    pub count: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexInfo {
     pub name: String,
@@ -1065,6 +1274,28 @@ pub struct Filter {
     pub in_values: Option<Vec<Val>>,
 }
 
+/// One counter a [`crate::query::QueryArgs::with_counter`] call asks to have
+/// merged into a query's rows.
+///
+/// This is the whole opt-in contract, carried as data rather than as a side
+/// effect: a query that never builds one of these reads no counter cells,
+/// however many counters the tables it touches declare — the replacement for
+/// the old merge that fired because a predicate happened to name a counter
+/// column, which a reader could not see at the call site.
+///
+/// `key_cols` names the columns whose PER-ROW values supply the counter's
+/// key — empty for a counter keyed by the row's own id (`_id`), which every
+/// row carries. For an arbitrary-key counter, every named column must be one
+/// the query already establishes a value for on every row it returns (a
+/// filter, a group-by, or `_id` itself) — see
+/// [`crate::query::QueryArgs::counter_build_refusal`], which refuses by name
+/// rather than merging a key built from a column no row can supply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CounterRequest {
+    pub name: String,
+    pub key_cols: Vec<String>,
+}
+
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::new();
@@ -1109,6 +1340,11 @@ mod tests {
             (StoreError::Poisoned("x".into()), 409),
             (StoreError::TooContended("x".into()), 503),
             (StoreError::Internal("x".into()), 500),
+            // A listing whose ordering has been reclaimed. 410, not 409: the
+            // caller did nothing wrong and nothing about the request can be
+            // adjusted to make it work — what it referred to is simply no
+            // longer there. 409 would invite a retry that must fail again.
+            (StoreError::Gone("x".into()), 410),
         ];
         for (e, want) in cases {
             let api: ApiError = e.into();
@@ -1417,8 +1653,12 @@ mod table_verbs_tests {
     /// not break the small bounded reads these helpers exist for.
     #[test]
     fn one_page_of_results_is_allowed_through() {
-        assert!(refuse_beyond_one_page("find_owned", 40, 40, "use keyset").is_ok());
-        assert!(refuse_beyond_one_page("find_owned", 40, 12, "use keyset").is_ok());
+        assert!(refuse_beyond_one_page("find_owned", 40, Some(40), false, "use keyset").is_ok());
+        assert!(refuse_beyond_one_page("find_owned", 40, Some(12), false, "use keyset").is_ok());
+        // A read that declined the count is still allowed through when the
+        // store says nothing follows — `None` must not be read as a refusal
+        // any more than as a zero.
+        assert!(refuse_beyond_one_page("find_owned", 40, None, false, "use keyset").is_ok());
     }
 
     /// More rows than one page → refuse. The old behaviour paged on with
@@ -1426,9 +1666,31 @@ mod table_verbs_tests {
     /// still reporting success. A loud error replaces a quiet wrong answer.
     #[test]
     fn more_than_one_page_is_refused() {
-        let err = refuse_beyond_one_page("find_owned", 1000, 4321, "use keyset")
+        let err = refuse_beyond_one_page("find_owned", 1000, Some(4321), true, "use keyset")
             .expect_err("a set larger than one page must be refused");
         assert!(matches!(err, StoreError::Internal(_)), "got {err:?}");
+    }
+
+    /// `has_more` alone refuses, with no total at all.
+    ///
+    /// This is the case the old signature could not express: a read that
+    /// declined the count reported `total = 0`, which compared as "fits in one
+    /// page" and let a truncated set through as complete.
+    #[test]
+    fn a_declined_total_still_refuses_when_the_page_says_more_follows() {
+        let err = refuse_beyond_one_page("find_owned", 1000, None, true, "use keyset")
+            .expect_err("has_more alone must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("find_owned"), "must name the helper: {msg}");
+        assert!(!msg.contains(" 0 rows"), "must not invent a count it does not have: {msg}");
+    }
+
+    /// The control for the pair above: neither witness fires, so nothing is
+    /// refused. Without this the two tests above pass under a
+    /// `refuse_beyond_one_page` that refuses unconditionally.
+    #[test]
+    fn neither_witness_firing_is_not_a_refusal() {
+        assert!(refuse_beyond_one_page("find_owned", 1000, None, false, "use keyset").is_ok());
     }
 
     /// The message must carry what the AUTHOR needs to act: which helper, how
@@ -1436,7 +1698,7 @@ mod table_verbs_tests {
     /// fix it — the end user's request was valid.
     #[test]
     fn the_refusal_names_the_helper_the_size_and_the_remedy() {
-        let err = refuse_beyond_one_page("find_owned", 1000, 4321, "switch to keyset paging")
+        let err = refuse_beyond_one_page("find_owned", 1000, Some(4321), true, "switch to keyset paging")
             .expect_err("must refuse");
         let msg = err.to_string();
         assert!(msg.contains("find_owned"), "must name the helper: {msg}");

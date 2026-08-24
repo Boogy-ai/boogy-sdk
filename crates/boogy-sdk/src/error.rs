@@ -237,6 +237,23 @@ impl ApiError {
     }
 
     /// 409 Conflict — uniqueness violation, version mismatch, etc.
+    /// The thing the request referred to existed and is now gone, and no
+    /// retry will bring it back. Distinct from `not_found`, which covers a
+    /// thing that never existed or is not the caller's — a client can retry
+    /// that after creating it; there is nothing to do about this one but
+    /// start over.
+    pub fn gone(msg: impl Into<String>) -> Self {
+        Self {
+            kind: "/errors/gone".to_string(),
+            title: "Gone".to_string(),
+            status: 410,
+            detail: Some(msg.into()),
+            errors: Default::default(),
+            cause: None,
+            retry_after_secs: None,
+        }
+    }
+
     pub fn conflict(msg: impl Into<String>) -> Self {
         Self {
             kind: "/errors/conflict".to_string(),
