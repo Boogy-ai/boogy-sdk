@@ -2727,3 +2727,35 @@ mod tests {
             "HEAD /openapi.json (unregistered) must 404 — the doc short-circuit is GET-only");
     }
 }
+
+#[cfg(test)]
+mod route_precedence_tests {
+    use super::*;
+
+    /// A literal segment beats a `{param}` at the same position.
+    ///
+    /// Asked by a skill eval that was building a link shortener: is
+    /// `GET /l/{slug}` shadowed by `GET /l/api/links`, or does the literal win?
+    /// The agent could not tell from the skills and restructured its URLs to
+    /// avoid depending on the answer — so the answer is now a test rather than
+    /// folklore, and the skills can state it.
+    #[test]
+    fn a_literal_segment_beats_a_param_at_the_same_position() {
+        let mut r = matchit::Router::new();
+        r.insert("/l/{slug}", "param").unwrap();
+        r.insert("/l/api", "literal").unwrap();
+
+        assert_eq!(*r.at("/l/api").unwrap().value, "literal", "the literal must win");
+        assert_eq!(*r.at("/l/abc123").unwrap().value, "param", "and the param still matches");
+    }
+
+    /// Registration ORDER does not decide it — otherwise the rule would be
+    /// "whichever you wrote first", which is not a rule anyone can rely on.
+    #[test]
+    fn precedence_does_not_depend_on_registration_order() {
+        let mut r = matchit::Router::new();
+        r.insert("/l/api", "literal").unwrap();
+        r.insert("/l/{slug}", "param").unwrap();
+        assert_eq!(*r.at("/l/api").unwrap().value, "literal");
+    }
+}

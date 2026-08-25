@@ -1833,6 +1833,32 @@ macro_rules! wit_glue {
             $bindings::boogy::platform::runtime::now_millis()
         }
 
+        /// Is an ambient transaction open for THIS request?
+        ///
+        /// Only useful in a service that is called by another service. A
+        /// read-modify-write — read a value, decide from it, write it back —
+        /// is serializable only inside a transaction; outside one, each store
+        /// call is its own auto-commit transaction and two racing callers can
+        /// both pass the same check.
+        ///
+        /// A callee cannot open one defensively: a callee that calls `tx`
+        /// fails at commit. So a service whose correctness depends on the
+        /// caller having opened one should refuse when it has not:
+        ///
+        /// ```ignore_snippet: illustrative guard; ApiError and the handler around it are not in scope in this doc block
+        /// if !in_transaction() {
+        ///     return Err(ApiError::conflict(
+        ///         "reserve must be called inside a transaction",
+        ///     ));
+        /// }
+        /// ```
+        ///
+        /// Reads no data and takes no conflict range. Returns `false` when the
+        /// store capability is not granted.
+        fn in_transaction() -> bool {
+            $bindings::boogy::platform::store::in_transaction()
+        }
+
         /// This service's own host-pinned identity — the
         /// `(owner, service_id)` of the deployment currently executing.
         /// Wrapper around `runtime::self_identity()` so user code can call

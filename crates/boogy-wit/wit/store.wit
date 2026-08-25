@@ -444,6 +444,21 @@ interface store {
         options: create-table-options,
     ) -> result<_, store-error>;
     drop-table: func(table: string) -> result<_, store-error>;
+    /// Is an ambient transaction open for this request?
+    ///
+    /// A callee cannot otherwise tell. That matters for a service whose
+    /// correctness DEPENDS on being called inside one — a read-modify-write
+    /// such as "read stock, decide, write stock" is serializable only while a
+    /// transaction is open, and outside one each store op is its own
+    /// auto-commit transaction, so two racing callers can both pass the check.
+    ///
+    /// The callee cannot open a transaction defensively (a callee that calls
+    /// `tx` fails at commit), so before this existed the contract could only be
+    /// enforced by ingress and documentation. Now the callee can refuse.
+    ///
+    /// Reads no data and takes no conflict range.
+    in-transaction: func() -> bool;
+
     list-tables: func() -> result<list<table-info>, store-error>;
 
     record index-def {
