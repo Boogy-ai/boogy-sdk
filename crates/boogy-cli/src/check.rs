@@ -6,7 +6,7 @@ use anyhow::Context;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use boogy_conventions::{lint_file, route_findings, Finding, Severity};
+use boogy_conventions::{counter_findings, lint_file, route_findings, Finding, Severity};
 
 /// Recursively collect `*.rs` files under `root`, skipping build/output dirs.
 fn collect_rs_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -135,6 +135,7 @@ pub fn run(root: Option<&str>) -> anyhow::Result<()> {
         findings.extend(lint_file(rel, src));
     }
     findings.extend(route_findings(&sources));
+    findings.extend(counter_findings(&sources));
 
     report(&findings, sources.len());
     if findings.is_empty() && fe_errors.is_empty() {
@@ -219,18 +220,27 @@ pub fn check_frontend_refs(files: &[(String, String)]) -> (Vec<String>, Vec<Stri
     (errors, warnings)
 }
 
+/// Report groups, in print order: `(check id, human title)`.
+///
+/// Module-scope so `every_check_the_engine_emits_has_a_report_group` can assert
+/// it against `boogy_conventions::CHECKS`. It was a local const inside `report`
+/// until 2026-08-24, which is why nothing noticed a check with no group.
+const REPORT_GROUPS: &[(&str, &str)] = &[
+    ("raw-schema", "Raw table schema (use #[derive(Model)])"),
+    ("unannotated-routes", "Routes without a summary"),
+    ("router-no-info", "Router without Router::info(...)"),
+    ("untyped-response", "Untyped response body"),
+    ("raw-store-crud", "Raw store CRUD"),
+    ("multi-write-no-tx", "Multi-write handler without a transaction"),
+    ("counter-read-in-tx", "Counter read at snapshot and written in one transaction"),
+];
+
 fn report(findings: &[Finding], scanned: usize) {
     if findings.is_empty() {
         println!("boogy check: {scanned} file(s) scanned — no issues. ✓");
         return;
     }
-    const ORDER: &[(&str, &str)] = &[
-        ("raw-schema", "Raw table schema (use #[derive(Model)])"),
-        ("unannotated-routes", "Routes without a summary"),
-        ("untyped-response", "Untyped response body"),
-        ("raw-store-crud", "Raw store CRUD"),
-        ("multi-write-no-tx", "Multi-write handler without a transaction"),
-    ];
+    const ORDER: &[(&str, &str)] = REPORT_GROUPS;
     println!("boogy check: {} issue(s) across {scanned} file(s)\n", findings.len());
     for (id, title) in ORDER {
         let group: Vec<&Finding> = findings.iter().filter(|f| f.check == *id).collect();
@@ -248,11 +258,46 @@ fn report(findings: &[Finding], scanned: usize) {
         }
         println!("    ↳ {}\n", group[0].hint);
     }
+    // Anything ORDER does not name still prints. The unit test below keeps the
+    // two lists in step, but a finding must never be counted and then silently
+    // dropped — that failure reads as "1 issue" followed by nothing.
+    let unlisted: Vec<&Finding> =
+        findings.iter().filter(|f| !ORDER.iter().any(|(id, _)| *id == f.check)).collect();
+    for f in &unlisted {
+        println!("  [FAIL] {}", f.check);
+        println!("    {}:{} — {}", f.file, f.line, f.message);
+        println!("    ↳ {}\n", f.hint);
+    }
 }
 
 #[cfg(test)]
 mod fe_tests {
     use super::*;
+
+    #[test]
+    fn every_check_the_engine_emits_has_a_report_group() {
+        // ORDER is hand-maintained and the reporter iterates IT, not the
+        // findings — so a check missing from it was counted and never printed.
+        // Measured: `counter-read-in-tx` produced "boogy check: 1 issue(s)"
+        // followed by an empty report and a non-zero exit, which reads as a
+        // crash rather than a finding.
+        let listed: Vec<&str> = REPORT_GROUPS.iter().map(|(id, _)| *id).collect();
+        for id in boogy_conventions::CHECKS {
+            assert!(
+                listed.contains(id),
+                "check `{id}` has no group in `boogy check`'s ORDER — it would be \
+                 counted in the total and never shown to the author",
+            );
+        }
+        for id in &listed {
+            assert!(
+                boogy_conventions::CHECKS.contains(id),
+                "ORDER names `{id}`, which the lint engine never emits — a group \
+                 that can never render is a claim the check exists",
+            );
+        }
+    }
+
     #[test]
     fn check_frontend_refs_source_level() {
         // index references ./app.ts (source exists as app.ts) → warning, not error.

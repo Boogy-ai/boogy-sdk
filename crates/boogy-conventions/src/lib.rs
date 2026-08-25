@@ -13,6 +13,26 @@
 //!   4. unannotated-routes— more route registrations than `.summary(...)` calls  (no escape)
 //!   5. multi-write-no-tx — ≥2 `db_{insert,update,delete}(` in one fn body without
 //!                          `tx(`/`tx::<` and without `// independent-writes:`
+//!   6. counter-read-in-tx — a snapshot `<Counter>::get(` AND a `<Counter>::add(`
+//!                          for the SAME counter in one `tx(` body, without
+//!                          `// counter-read-display-only:`
+
+/// Every `Finding::check` id this crate can emit.
+///
+/// The one producer. `boogy check` groups findings under human-readable titles
+/// from its own ORDER list, and a check missing from that list was COUNTED and
+/// never PRINTED — the run said "1 issue" and then said nothing about it, which
+/// is how `counter-read-in-tx` shipped invisible for its first hour. The CLI
+/// asserts its list covers this one exactly.
+pub const CHECKS: &[&str] = &[
+    "raw-schema",
+    "raw-store-crud",
+    "untyped-response",
+    "unannotated-routes",
+    "router-no-info",
+    "multi-write-no-tx",
+    "counter-read-in-tx",
+];
 
 /// `Hard` findings have no escape hatch; `Fail` findings can be suppressed with
 /// a documented marker. Both gate the check (any finding → non-zero exit).
@@ -126,6 +146,165 @@ pub fn lint_file(file: &str, src: &str) -> Vec<Finding> {
     out
 }
 
+/// Counter handles a crate declares: `#[counter(...)]` immediately above a
+/// `struct <Name>`.
+///
+/// Discovered rather than pattern-matched on the call site, because the call
+/// site is `RoomPostCount::get(store, id)` and a bare `::get(` matches most of
+/// a Rust program. The derive is routinely aliased
+/// (`use boogy_sdk::Counter as CounterDerive`), so the ATTRIBUTE is the stable
+/// marker, not the derive name.
+fn counter_handles(files: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, src) in files {
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("#[counter(") {
+                continue;
+            }
+            // The struct may not be the very next line (further attributes, or
+            // a doc comment between). Look ahead a few lines for the decl.
+            for probe in lines.iter().skip(i + 1).take(4) {
+                if let Some(name) = struct_name(probe) {
+                    out.push(name);
+                    break;
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether `body` reads counter `h` at SNAPSHOT isolation.
+///
+/// Two call forms, because the SDK has two and a service may use either:
+///
+///  * the typed handle — `LinkClicks::get(..)`, snapshot by definition
+///    (`get_for_update` is the serializable one and cannot match, since `(` must
+///    follow `get` immediately);
+///  * the store verb — `counter_get(LinkClicks::NAME, &[..], true)` / the
+///    `max_get` twin, where the trailing bool IS the isolation. This is the form
+///    the examples actually write, so a check that matched only the typed handle
+///    would have been decorative.
+///
+/// The bool is read from the call text up to the next `;`. A call passing
+/// `false` has paid for the read-conflict range and is the documented escape, so
+/// it never matches.
+fn snapshot_reads(body: &str, handle: &str) -> bool {
+    if body.contains(&format!("{handle}::get(")) {
+        return true;
+    }
+    let name_const = format!("{handle}::NAME");
+    for verb in ["counter_get(", "max_get("] {
+        let mut from = 0;
+        while let Some(rel) = body[from..].find(verb) {
+            let at = from + rel;
+            let end = body[at..].find(';').map(|e| at + e).unwrap_or(body.len());
+            let call = &body[at..end];
+            if call.contains(&name_const) && !call.contains("false") {
+                return true;
+            }
+            from = at + verb.len();
+        }
+    }
+    false
+}
+
+/// Whether `body` writes counter `h` — the typed handle or the store verb.
+fn writes_counter(body: &str, handle: &str) -> bool {
+    let name_const = format!("{handle}::NAME");
+    body.contains(&format!("{handle}::add("))
+        || body.contains(&format!("{handle}::observe("))
+        || [("counter_add(", ()), ("max_observe(", ())].iter().any(|(verb, _)| {
+            let mut from = 0;
+            while let Some(rel) = body[from..].find(verb) {
+                let at = from + rel;
+                let end = body[at..].find(';').map(|e| at + e).unwrap_or(body.len());
+                if body[at..end].contains(&name_const) {
+                    return true;
+                }
+                from = at + verb.len();
+            }
+            false
+        })
+}
+
+/// Extract `<Name>` from a line declaring `struct <Name>`, with a word boundary
+/// before `struct` so `pub struct` matches and `my_struct` does not.
+fn struct_name(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find("struct ") {
+        let at = from + rel;
+        if at == 0 || !is_ident_char(bytes[at - 1]) {
+            let rest = line[at + 7..].trim_start();
+            let name: String = rest.chars().take_while(|&c| is_ident_char(c as u8)).collect();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+        from = at + 7;
+    }
+    None
+}
+
+/// Check 6: reading a counter at SNAPSHOT and writing that same counter inside
+/// one transaction.
+///
+/// **This predicts a runtime refusal.** Since 2026-08-24 the store refuses the
+/// write outright (`ERR_COUNTER_WRITE_AFTER_READ`, guarantee-audit §1ap): a
+/// snapshot read takes no read-conflict range, so anything decided from it is
+/// serialized against nobody — two transactions read a counter one below its
+/// limit, both decide there is room, both commit, and the limit is breached
+/// with no error anywhere. The check exists so an author meets that in their
+/// own loop, before a deploy, rather than on a live request.
+///
+/// It fires only when BOTH halves are present for the SAME counter, which is
+/// exactly the store's condition. A read alone is fine and a write alone is the
+/// normal case; neither is flagged.
+///
+/// Run-level, not per-file, for the same reason `route_findings` is: the handle
+/// is declared in `models.rs` and used in `lib.rs`.
+///
+/// `get_for_update(` cannot match `::get(` — the `(` is required immediately
+/// after `get` — so the documented remedy never trips the check that names it.
+pub fn counter_findings(files: &[(String, String)]) -> Vec<Finding> {
+    let handles = counter_handles(files);
+    if handles.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (file, src) in files {
+        for (name, fn_line, body) in fn_bodies(src) {
+            if !body.contains("tx(") && !body.contains("tx::<") {
+                continue;
+            }
+            if body.contains("// counter-read-display-only:") {
+                continue;
+            }
+            for h in &handles {
+                if snapshot_reads(&body, h) && writes_counter(&body, h) {
+                    out.push(Finding {
+                        check: "counter-read-in-tx",
+                        severity: Severity::Fail,
+                        file: file.clone(),
+                        line: fn_line,
+                        message: format!(
+                            "fn `{name}` reads counter `{h}` at snapshot and writes it in the \
+                             same transaction — the store REFUSES this at runtime"
+                        ),
+                        hint: "A snapshot read takes no read-conflict range, so a decision made from it is serialized against nobody: two callers read the same number, both decide there is room for one more, and both commit. Use `::get_for_update(..)` if you are deciding with the value, read it outside the transaction if you only wanted to report it, or mark `// counter-read-display-only: <reason>` (boogy:boogy-counters).",
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Aggregate route findings across ALL scanned files (a router can be split
 /// across modules, so this is run-level, not per-file — matching the CI gate's
 /// per-crate aggregation). Two findings are possible: more routes than
@@ -196,6 +375,32 @@ fn line_registers_route(line: &str) -> bool {
 /// `db_{insert,update,delete}(`, and require `tx(`/`tx::<` (atomicity) or
 /// `// independent-writes:` (an explicit opt-out) when there are ≥2.
 fn multi_write_findings(file: &str, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for (name, fn_line, body) in fn_bodies(src) {
+        let writes = count_writes(&body);
+        if writes >= 2
+            && !body.contains("tx(")
+            && !body.contains("tx::<")
+            && !body.contains("// independent-writes:")
+        {
+            out.push(Finding {
+                check: "multi-write-no-tx",
+                severity: Severity::Fail,
+                file: file.into(),
+                line: fn_line,
+                message: format!("fn `{name}` writes {writes} rows without a transaction"),
+                hint: "Treat the handler as one unit of work: wrap its writes in `tx(|| { … })` so ANY later error rolls back ALL of them — no partial state. Mark `// independent-writes: <reason>` only if the writes are genuinely unrelated (boogy:boogy-transactions).",
+            });
+        }
+    }
+    out
+}
+
+/// Split a source file into `(fn name, 1-based fn line, body)` triples by brace
+/// depth. The one producer — checks 5 and 6 both scan handler bodies, and a
+/// second copy of this loop is a second place for the two to disagree about
+/// what a body is.
+fn fn_bodies(src: &str) -> Vec<(String, usize, String)> {
     let lines: Vec<&str> = src.lines().collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -205,7 +410,7 @@ fn multi_write_findings(file: &str, src: &str) -> Vec<Finding> {
             continue;
         };
         let fn_line = i + 1;
-        // Accumulate the body from the `fn` line until brace depth returns to 0.
+        // Accumulate from the `fn` line until brace depth returns to 0.
         let mut depth: i32 = 0;
         let mut started = false;
         let mut body = String::new();
@@ -226,22 +431,7 @@ fn multi_write_findings(file: &str, src: &str) -> Vec<Finding> {
             }
             j += 1;
         }
-
-        let writes = count_writes(&body);
-        if writes >= 2
-            && !body.contains("tx(")
-            && !body.contains("tx::<")
-            && !body.contains("// independent-writes:")
-        {
-            out.push(Finding {
-                check: "multi-write-no-tx",
-                severity: Severity::Fail,
-                file: file.into(),
-                line: fn_line,
-                message: format!("fn `{name}` writes {writes} rows without a transaction"),
-                hint: "Treat the handler as one unit of work: wrap its writes in `tx(|| { … })` so ANY later error rolls back ALL of them — no partial state. Mark `// independent-writes: <reason>` only if the writes are genuinely unrelated (boogy:boogy-transactions).",
-            });
-        }
+        out.push((name, fn_line, body));
         i = j + 1;
     }
     out
@@ -305,6 +495,203 @@ fn is_ident_char(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    // -- check 6: counter-read-in-tx (guarantee-audit §1ap) ----------------
+
+    /// The two files a real service splits this across.
+    fn counter_crate(handler: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                "models.rs".to_string(),
+                "#[derive(CounterDerive)]\n#[counter(of = Room, name = \"taken\")]\npub struct RoomTaken;\n"
+                    .to_string(),
+            ),
+            ("lib.rs".to_string(), handler.to_string()),
+        ]
+    }
+
+    #[test]
+    fn a_snapshot_counter_read_and_a_write_in_one_tx_is_flagged() {
+        let f = counter_findings(&counter_crate(
+            r#"
+            fn take(req: &mut Req) -> Result<(), ApiError> {
+                tx::<_, _, ApiError>(|| {
+                    let n = RoomTaken::get(store, id)?;
+                    if n < LIMIT { RoomTaken::add(store, id, 1)?; }
+                    Ok(())
+                })
+            }
+        "#,
+        ));
+        assert_eq!(f.len(), 1, "the oversell shape must be flagged: {f:?}");
+        assert_eq!(f[0].check, "counter-read-in-tx");
+        assert_eq!(f[0].file, "lib.rs", "flagged where it is USED, not where declared");
+        assert!(
+            f[0].message.contains("RoomTaken") && f[0].message.contains("take"),
+            "the finding must name the counter and the handler: {}",
+            f[0].message
+        );
+    }
+
+    #[test]
+    fn get_for_update_is_never_flagged() {
+        // The documented remedy. A check that flags its own fix teaches the
+        // author to suppress it instead.
+        let f = counter_findings(&counter_crate(
+            r#"
+            fn take(req: &mut Req) -> Result<(), ApiError> {
+                tx::<_, _, ApiError>(|| {
+                    let n = RoomTaken::get_for_update(store, id)?;
+                    if n < LIMIT { RoomTaken::add(store, id, 1)?; }
+                    Ok(())
+                })
+            }
+        "#,
+        ));
+        assert!(f.is_empty(), "get_for_update is the FIX, not the defect: {f:?}");
+    }
+
+    #[test]
+    fn each_half_alone_is_not_flagged() {
+        // A read alone is fine; a write alone is the normal case. Flagging
+        // either would make the check fire on most services that use a counter
+        // at all, which is how a check gets globally suppressed.
+        let read_only = counter_findings(&counter_crate(
+            "fn show() { tx::<_,_,E>(|| { let n = RoomTaken::get(store, id)?; Ok(n) }) }",
+        ));
+        assert!(read_only.is_empty(), "a read alone is not the defect: {read_only:?}");
+        let write_only = counter_findings(&counter_crate(
+            "fn bump() { tx::<_,_,E>(|| { RoomTaken::add(store, id, 1) }) }",
+        ));
+        assert!(write_only.is_empty(), "a write alone is the normal case: {write_only:?}");
+    }
+
+    #[test]
+    fn outside_a_transaction_is_not_flagged() {
+        // Each autocommit op is its own transaction, so the read cannot precede
+        // the write inside one. The store does not refuse it and neither does this.
+        let f = counter_findings(&counter_crate(
+            "fn take() { let n = RoomTaken::get(store, id)?; RoomTaken::add(store, id, 1)?; }",
+        ));
+        assert!(f.is_empty(), "no tx, no hazard: {f:?}");
+    }
+
+    #[test]
+    fn the_display_only_marker_suppresses_it() {
+        let f = counter_findings(&counter_crate(
+            r#"
+            fn take() {
+                tx::<_, _, ApiError>(|| {
+                    // counter-read-display-only: echoed into the response, never branched on
+                    let n = RoomTaken::get(store, id)?;
+                    RoomTaken::add(store, id, 1)?;
+                    Ok(n)
+                })
+            }
+        "#,
+        ));
+        assert!(f.is_empty(), "the documented escape must work: {f:?}");
+    }
+
+    #[test]
+    fn a_crate_that_declares_no_counter_is_never_scanned() {
+        // The handle set is DISCOVERED. Without a declaration there is nothing
+        // to match, and `::get(`/`::add(` must not be matched bare — they
+        // appear all over ordinary Rust.
+        let f = counter_findings(&[(
+            "lib.rs".to_string(),
+            "fn h() { tx::<_,_,E>(|| { let v = Map::get(k)?; List::add(v)?; Ok(()) }) }"
+                .to_string(),
+        )]);
+        assert!(f.is_empty(), "bare ::get(/::add( must never match: {f:?}");
+    }
+
+    #[test]
+    fn the_handle_is_found_through_an_aliased_derive_and_a_doc_comment() {
+        // `use boogy_sdk::Counter as CounterDerive` is what the examples
+        // actually write, so keying on the derive NAME would find nothing. The
+        // attribute is the stable marker, and the struct may sit a few lines
+        // below it.
+        let files = vec![
+            (
+                "models.rs".to_string(),
+                "#[counter(of = Room, name = \"taken\")]\n/// Typed handle.\n#[allow(dead_code)]\npub struct RoomTaken;\n".to_string(),
+            ),
+            (
+                "lib.rs".to_string(),
+                "fn take() { tx::<_,_,E>(|| { let n = RoomTaken::get(s,i)?; RoomTaken::add(s,i,1) }) }".to_string(),
+            ),
+        ];
+        assert_eq!(counter_findings(&files).len(), 1, "the handle must still be found");
+    }
+
+    #[test]
+    fn the_raw_store_verb_form_is_flagged_too() {
+        // The form the examples actually write. Matching only the typed handle
+        // made the check decorative — `wit_glue!` emits no counter verbs, so
+        // `LinkClicks::get(..)` is not reachable from a deployed service at all
+        // and every real read goes through `st::counter_get(NAME, .., true)`.
+        let f = counter_findings(&counter_crate(
+            r#"
+            fn take() -> Result<(), ApiError> {
+                tx::<_, _, ApiError>(|| {
+                    let n = st::counter_get(RoomTaken::NAME, &[st::Value::Integer(id)], true)?;
+                    if n < LIMIT {
+                        st::counter_add(RoomTaken::NAME, &[st::Value::Integer(id)], 1)?;
+                    }
+                    Ok(())
+                })
+            }
+        "#,
+        ));
+        assert_eq!(f.len(), 1, "the raw verb form must be flagged: {f:?}");
+    }
+
+    #[test]
+    fn the_raw_serializable_read_is_the_escape() {
+        // `false` is the trailing snapshot flag — the caller paid for the
+        // read-conflict range. Same program, one argument apart from the test
+        // above, and it must not be flagged.
+        let f = counter_findings(&counter_crate(
+            r#"
+            fn take() -> Result<(), ApiError> {
+                tx::<_, _, ApiError>(|| {
+                    let n = st::counter_get(RoomTaken::NAME, &[st::Value::Integer(id)], false)?;
+                    if n < LIMIT {
+                        st::counter_add(RoomTaken::NAME, &[st::Value::Integer(id)], 1)?;
+                    }
+                    Ok(())
+                })
+            }
+        "#,
+        ));
+        assert!(f.is_empty(), "snapshot=false is the documented escape: {f:?}");
+    }
+
+    #[test]
+    fn a_raw_read_of_a_DIFFERENT_counter_is_not_flagged() {
+        // The store's condition is per-CELL, and the check mirrors it: reading
+        // one counter and writing another is not the oversell shape.
+        let files = vec![
+            (
+                "models.rs".to_string(),
+                "#[counter(of = Room, name = \"taken\")]\npub struct RoomTaken;\n                 #[counter(of = Room, name = \"views\")]\npub struct RoomViews;\n".to_string(),
+            ),
+            (
+                "lib.rs".to_string(),
+                "fn h() { tx::<_,_,E>(|| { let n = st::counter_get(RoomViews::NAME, &k, true)?;                  st::counter_add(RoomTaken::NAME, &k, 1)?; Ok(n) }) }".to_string(),
+            ),
+        ];
+        assert!(counter_findings(&files).is_empty(), "different cells do not interact");
+    }
+
+    #[test]
+    fn max_observe_after_a_snapshot_max_get_is_flagged() {
+        let f = counter_findings(&counter_crate(
+            "fn h() { tx::<_,_,E>(|| { let v = st::max_get(RoomTaken::NAME, &k, true)?;              st::max_observe(RoomTaken::NAME, &k, v.unwrap_or(0) + 1)?; Ok(()) }) }",
+        ));
+        assert_eq!(f.len(), 1, "the max accumulator carries the same hazard: {f:?}");
+    }
 
     #[test]
     fn count_writes_sees_upsert_increment_and_raw_store_writes() {
