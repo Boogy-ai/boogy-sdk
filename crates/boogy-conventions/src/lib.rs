@@ -1,3 +1,8 @@
+//! retired-spelling-file: this crate now HOSTS the `counter-field` check, which
+//! exists to reject the retired `#[counter]` struct-field form — so the dead
+//! spelling appears here in the detector, its message and its tests. What is
+//! true now: `#[model(counter(name = "..."))]` on the struct plus a
+//! `#[derive(Counter)]` marker type.
 //! Heuristic conventions lint for Boogy service source. Pure (no I/O):
 //! `lint_file` scans one file, `route_findings` aggregates route/summary
 //! annotation across a whole crate. Shared by `boogy check` (CLI) and the
@@ -32,6 +37,9 @@ pub const CHECKS: &[&str] = &[
     "router-no-info",
     "multi-write-no-tx",
     "counter-read-in-tx",
+    "counter-field",
+    "legacy-init-tables",
+    "hardcoded-index-name",
 ];
 
 /// `Hard` findings have no escape hatch; `Fail` findings can be suppressed with
@@ -51,6 +59,19 @@ pub struct Finding {
     pub line: usize,
     pub message: String,
     pub hint: &'static str,
+}
+
+/// Whether `lines[i]` or the line above carries `marker` FOLLOWED BY a reason.
+///
+/// Distinct from `lint_file`'s `marked()`, which only asks whether the marker is
+/// present. A bare `// reconcile-exempt:` suppresses nothing: a marker is the
+/// one place an author can write anything and be believed, so an empty one is a
+/// suppression with no argument behind it.
+fn marked_with_reason(lines: &[&str], i: usize, marker: &str) -> bool {
+    let has = |l: &str| {
+        l.split(marker).nth(1).map(|tail| !tail.trim().is_empty()).unwrap_or(false)
+    };
+    has(lines[i]) || (i > 0 && has(lines[i - 1]))
 }
 
 /// Whether a line makes a raw single-row store CRUD call: `store::<m>(` for an
@@ -100,11 +121,20 @@ pub fn lint_file(file: &str, src: &str) -> Vec<Finding> {
         // a string literal — rare for these tokens.)
         let code = line.split("//").next().unwrap_or(line);
 
-        // 1. raw table schema (HARD)
-        if code.contains("Table::new(") || code.contains("create_table_from(") {
+        // 1. raw table schema
+        //
+        // `// dynamic-schema: <reason>` is the DECLARED exception, for a table
+        // whose name or shape is only known at runtime — there is no
+        // `#[derive(Model)]` that can express one. The internal gate has
+        // honoured this marker all along; `boogy check` did not, so a developer
+        // with a legitimate dynamic table was told to do something impossible
+        // and had no way out. Found 2026-08-25 while converging the two gates.
+        if (code.contains("Table::new(") || code.contains("create_table_from("))
+            && !marked_with_reason(&lines, i, "// dynamic-schema:")
+        {
             out.push(Finding {
                 check: "raw-schema",
-                severity: Severity::Hard,
+                severity: Severity::Fail,
                 file: file.into(),
                 line: ln,
                 message: "raw table schema — define the table with #[derive(Model)]".into(),
@@ -137,6 +167,50 @@ pub fn lint_file(file: &str, src: &str) -> Vec<Finding> {
                 line: ln,
                 message: "raw store CRUD — prefer the Model API / declared access patterns".into(),
                 hint: "Use the `#[derive(Model)]` query methods / access patterns, or mark `// escape-hatch: <reason>` (boogy:boogy-access-patterns).",
+            });
+        }
+        // 6. retired `#[counter]` field attribute (HARD — the derive rejects it)
+        if code.trim() == "#[counter]" {
+            out.push(Finding {
+                check: "counter-field",
+                severity: Severity::Hard,
+                file: file.into(),
+                line: ln,
+                message: "`#[counter]` on a field is a retired form".into(),
+                hint: "Declare the counter on the STRUCT — `#[model(counter(name = \"<column>\"))]` — and read or add it through a `#[derive(Counter)]` marker type. There is no backing field (boogy:boogy-counters).",
+            });
+        }
+
+        // 8. hardcoded index-name literal in a low-level cursor call
+        let cursor_call = code.contains("for_each_batch(") || code.contains("open_cursor(");
+        let index_literal = code.contains("\"ix_") || code.contains("\"idx_");
+        if cursor_call && index_literal && !marked_with_reason(&lines, i, "// index-name-ok:") {
+            out.push(Finding {
+                check: "hardcoded-index-name",
+                severity: Severity::Fail,
+                file: file.into(),
+                line: ln,
+                message: "hardcoded index name — index names are schema-canonical and a literal drifts silently".into(),
+                hint: "Use the query DSL and let the planner choose the index by COLUMNS; if the low-level cursor is genuinely required, mark `// index-name-ok: <reason>` (boogy:boogy-access-patterns).",
+            });
+        }
+
+        // 7. legacy init_tables / out-of-model index
+        let legacy_init = code.contains("fn init_tables");
+        let hand_index =
+            code.contains("create_index(") && (code.contains("\"ix_") || code.contains("\"idx_"));
+        if (legacy_init || hand_index) && !marked_with_reason(&lines, i, "// reconcile-exempt:") {
+            out.push(Finding {
+                check: "legacy-init-tables",
+                severity: Severity::Fail,
+                file: file.into(),
+                line: ln,
+                message: if legacy_init {
+                    "`init_tables` is replaced by a declared schema + migrate + bootstrap".into()
+                } else {
+                    "hand-created index — declare the access pattern on the model instead".into()
+                },
+                hint: "Declare indexes through the model's access-pattern verbs (`list_by` / `ranked_by` / `lookup_by` / `tagged_by`) so the planner and the schema cannot disagree. Mark `// reconcile-exempt: <reason>` only for a migration-time backfill (boogy:boogy-migrations).",
             });
         }
     }
@@ -511,6 +585,125 @@ mod tests {
     }
 
     #[test]
+    fn a_dynamic_schema_marker_permits_a_runtime_table() {
+        // A table whose name is a request parameter has no `#[derive(Model)]`
+        // that could express it. The internal gate has always allowed this with
+        // a stated reason; the shipped check refused it outright.
+        let f = lint_file(
+            "lib.rs",
+            "    // dynamic-schema: table name is a request parameter, known only now.\n    create_table_from(&Table::new(&t).text(\"label\"));\n",
+        );
+        assert!(f.is_empty(), "the declared exception must be honoured: {f:?}");
+    }
+
+    #[test]
+    fn raw_schema_with_no_marker_is_still_flagged() {
+        // The control — the escape must not blunt the check.
+        let f = lint_file("lib.rs", "    create_table_from(&Table::new(\"rooms\").text(\"slug\"));\n");
+        assert_eq!(f.len(), 1, "an unmarked raw table must still be flagged: {f:?}");
+        assert_eq!(f[0].check, "raw-schema");
+    }
+
+    #[test]
+    fn a_dynamic_schema_marker_with_no_reason_does_not_suppress() {
+        let f = lint_file("lib.rs", "    // dynamic-schema:\n    create_table_from(&Table::new(&t));\n");
+        assert_eq!(f.len(), 1, "an empty marker must not suppress: {f:?}");
+    }
+
+    #[test]
+    fn a_hardcoded_index_name_in_a_cursor_call_is_flagged() {
+        // Index names are schema-canonical. A literal drifts the moment the
+        // model's declared access patterns change, and nothing objects.
+        let f = lint_file("lib.rs", "    for_each_batch(\"rooms\", \"ix_rooms_slug\", 100, |b| Ok(()))?;\n");
+        assert_eq!(f.len(), 1, "a literal index name must be flagged: {f:?}");
+        assert_eq!(f[0].check, "hardcoded-index-name");
+    }
+
+    #[test]
+    fn open_cursor_is_covered_too() {
+        let f = lint_file("lib.rs", "    open_cursor(\"rooms\", \"idx_rooms_created\", 50)?;\n");
+        assert_eq!(f.len(), 1, "open_cursor is the same hazard: {f:?}");
+    }
+
+    #[test]
+    fn a_cursor_call_with_no_index_literal_is_not_flagged() {
+        // The control: it must fire on the LITERAL, not on the call. A variable
+        // is at least a single source of truth.
+        let f = lint_file("lib.rs", "    for_each_batch(Room::TABLE, idx, 100, |b| Ok(()))?;\n");
+        assert!(f.is_empty(), "a non-literal index argument is fine: {f:?}");
+    }
+
+    #[test]
+    fn the_index_name_ok_marker_suppresses_it() {
+        let f = lint_file(
+            "lib.rs",
+            "    // index-name-ok: low-level cursor over a migration-only index\n    open_cursor(\"rooms\", \"ix_rooms_slug\", 50)?;\n",
+        );
+        assert!(f.is_empty(), "the documented escape must work: {f:?}");
+    }
+
+
+
+
+
+    #[test]
+    fn a_bare_counter_field_attribute_is_flagged() {
+        // `#[counter]` on a FIELD is a retired form — the derive rejects it with
+        // a diagnostic naming the struct-level declaration. The internal gate has
+        // caught this since the counters-outside-structs port; a developer
+        // running `boogy check` never saw it.
+        let f = lint_file("models.rs", "pub struct Room {\n    #[counter]\n    pub hits: i64,\n}\n");
+        assert_eq!(f.len(), 1, "the bare field attribute must be flagged: {f:?}");
+        assert_eq!(f[0].check, "counter-field");
+        assert_eq!(f[0].severity, Severity::Hard, "no escape — the derive rejects it outright");
+    }
+
+    #[test]
+    fn the_struct_level_counter_declaration_is_not_flagged() {
+        // The control. The struct-level form is CURRENT and must never be
+        // flagged, or the check fires on every correct model.
+        let f = lint_file(
+            "models.rs",
+            "#[model(table = \"rooms\", counter(name = \"hits\"))]\npub struct Room {}\n",
+        );
+        assert!(f.is_empty(), "the struct-level form is correct: {f:?}");
+    }
+
+    #[test]
+    fn legacy_init_tables_and_out_of_model_indexes_are_flagged() {
+        // `init_tables` was replaced by schema + migrate + bootstrap. A
+        // hand-created index bypasses the model's declared access patterns, so
+        // the planner and the schema disagree.
+        let a = lint_file("lib.rs", "fn init_tables() {}\n");
+        assert_eq!(a.len(), 1, "legacy init_tables must be flagged: {a:?}");
+        assert_eq!(a[0].check, "legacy-init-tables");
+
+        let b = lint_file("lib.rs", "    create_index(\"ix_rooms_slug\", &[\"slug\"])?;\n");
+        assert_eq!(b.len(), 1, "a hand-rolled index name must be flagged: {b:?}");
+        assert_eq!(b[0].check, "legacy-init-tables");
+    }
+
+    #[test]
+    fn the_reconcile_exempt_marker_suppresses_a_hand_created_index() {
+        let f = lint_file(
+            "lib.rs",
+            "    // reconcile-exempt: migration backfill, dropped next release\n    create_index(\"ix_rooms_slug\", &[\"slug\"])?;\n",
+        );
+        assert!(f.is_empty(), "the documented escape must work: {f:?}");
+    }
+
+    #[test]
+    fn a_reconcile_exempt_marker_with_no_reason_does_not_suppress() {
+        // A marker is the one place an author can write anything and be
+        // believed. An empty one is a suppression with no argument behind it.
+        let f = lint_file(
+            "lib.rs",
+            "    // reconcile-exempt:\n    create_index(\"ix_rooms_slug\", &[\"slug\"])?;\n",
+        );
+        assert_eq!(f.len(), 1, "an empty marker must not suppress: {f:?}");
+    }
+
+    #[test]
     fn a_snapshot_counter_read_and_a_write_in_one_tx_is_flagged() {
         let f = counter_findings(&counter_crate(
             r#"
@@ -755,14 +948,14 @@ mod tests {
     }
 
     #[test]
-    fn flags_raw_schema_hard() {
-        let f = lint_file("lib.rs", "let t = Table::new(\"items\");");
+    fn flags_raw_schema_with_a_declared_exception() {
+        // Severity is Fail, not Hard, since 2026-08-25: `// dynamic-schema:`
+        // is a real declared exception the internal gate has always honoured,
+        // and `Hard` in this crate means "no escape hatch exists".
+        let f = lint_file("models.rs", "    let t = Table::new(\"rooms\");\n");
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].check, "raw-schema");
-        assert_eq!(f[0].severity, Severity::Hard);
-        assert!(lint_file("lib.rs", "create_table_from(&schema);")
-            .iter()
-            .any(|x| x.check == "raw-schema"));
+        assert_eq!(f[0].severity, Severity::Fail);
     }
 
     #[test]

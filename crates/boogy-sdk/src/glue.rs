@@ -728,6 +728,71 @@ macro_rules! wit_glue {
             }
         }
 
+        /// The store handle the [`Counter`](boogy_sdk::model::Counter) and
+        /// [`MaxAccum`](boogy_sdk::model::MaxAccum) verbs take.
+        ///
+        /// **Why this exists.** Those traits are generic over a `CounterStore`
+        /// so `boogy-sdk` can stay free of any dependency on generated
+        /// bindings. Nothing supplied one, so `Counter::get(store, key)` — the
+        /// form the derive's docs, the trait docs and the guides all teach —
+        /// was unreachable from a deployed service, and the only way to touch a
+        /// counter was the raw binding call. Closes guarantee-audit §1az.
+        ///
+        /// Zero-sized: `BOOGY_COUNTERS` is a const, so `Room::HITS`-style calls
+        /// cost nothing at runtime.
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct GuestCounterStore;
+
+        /// The handle to pass to a counter verb: `RoomHits::add(&BOOGY_COUNTERS, id, 1)?`.
+        pub const BOOGY_COUNTERS: GuestCounterStore = GuestCounterStore;
+
+        impl $crate::model::CounterStore for GuestCounterStore {
+            fn counter_add(
+                &self,
+                name: &str,
+                key: &[$crate::store::Val],
+                delta: i64,
+            ) -> ::core::result::Result<(), $crate::store::StoreError> {
+                let k: ::std::vec::Vec<_> = key.iter().map(__boogy_val_to_wit).collect();
+                $bindings::boogy::platform::store::counter_add(name, &k, delta)
+                    .map_err($crate::store::StoreError::from_wit)
+            }
+
+            fn counter_get(
+                &self,
+                name: &str,
+                key: &[$crate::store::Val],
+                snapshot: bool,
+            ) -> ::core::result::Result<i64, $crate::store::StoreError> {
+                let k: ::std::vec::Vec<_> = key.iter().map(__boogy_val_to_wit).collect();
+                $bindings::boogy::platform::store::counter_get(name, &k, snapshot)
+                    .map_err($crate::store::StoreError::from_wit)
+            }
+
+            fn max_observe(
+                &self,
+                name: &str,
+                key: &[$crate::store::Val],
+                value: i64,
+            ) -> ::core::result::Result<(), $crate::store::StoreError> {
+                let k: ::std::vec::Vec<_> = key.iter().map(__boogy_val_to_wit).collect();
+                $bindings::boogy::platform::store::max_observe(name, &k, value)
+                    .map_err($crate::store::StoreError::from_wit)
+            }
+
+            fn max_get(
+                &self,
+                name: &str,
+                key: &[$crate::store::Val],
+                snapshot: bool,
+            ) -> ::core::result::Result<::core::option::Option<i64>, $crate::store::StoreError>
+            {
+                let k: ::std::vec::Vec<_> = key.iter().map(__boogy_val_to_wit).collect();
+                $bindings::boogy::platform::store::max_get(name, &k, snapshot)
+                    .map_err($crate::store::StoreError::from_wit)
+            }
+        }
+
         /// Internal: convert SDK `(name, Val)` pairs to WIT `Column`
         /// records. Used by the macro-private write helpers below
         /// (which the api_keys glue calls). User code should NOT use

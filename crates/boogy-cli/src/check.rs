@@ -233,6 +233,11 @@ const REPORT_GROUPS: &[(&str, &str)] = &[
     ("raw-store-crud", "Raw store CRUD"),
     ("multi-write-no-tx", "Multi-write handler without a transaction"),
     ("counter-read-in-tx", "Counter read at snapshot and written in one transaction"),
+    // retired-spelling: the group TITLE names the form the check rejects — now
+    // `#[model(counter(name = "..."))]` plus `#[derive(Counter)]`.
+    ("counter-field", "Retired `#[counter]` field attribute"),
+    ("legacy-init-tables", "Legacy init_tables / hand-created index"),
+    ("hardcoded-index-name", "Hardcoded index name in a cursor call"),
 ];
 
 fn report(findings: &[Finding], scanned: usize) {
