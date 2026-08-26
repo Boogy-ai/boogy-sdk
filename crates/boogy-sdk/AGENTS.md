@@ -783,7 +783,7 @@ fn create_link(target: &str) -> Result<Created<LinkOut>, ApiError> {
 }
 ```
 
-### The model is the sole source of truth for indexes
+### The model is the sole source of truth for indexes and columns
 
 A service's physical index set is **reconciled** against what its models declare.
 On each init the SDK diffs the declared set against the store and converges it:
@@ -809,8 +809,49 @@ Two consequences for how you write services:
   models do not declare is indistinguishable from one whose declaration was
   deleted, so the reconcile removes it.
 
-Tables and columns are never reconciled. Dropping those is lossy, so they stay
-behind explicit versioned migrations — see below.
+**Columns are reconciled too, on the same pass, with narrower rules than
+indexes** — a column carries data, so a change that could lose it needs an
+explicit signal from the developer, where an index change never does:
+
+- **Adding a field needs nothing.** Add it to the struct and redeploy. A
+  required (non-`Option`) field with no `#[default]` gets a
+  platform-synthesised zero value (`""`, `0`, `false`, timestamp `0`) so rows
+  that predate the column still read and still get indexed if the field also
+  declares one — the reconcile backfills index entries for existing rows the
+  same way it always has for a brand-new index. The one case that still fails
+  the deploy: a required field that is also a foreign key (`#[belongs_to(Parent)]`
+  on the derive, or `.references(table, col)` on a raw `Table`). No
+  synthesised value can be a valid reference, so that combination
+  is a compile-clean but deploy-time conflict — declare it `Option<T>` or give
+  it a `#[default]` naming a real row.
+- **Renaming needs `#[renamed_from = "old"]` on the new field.** Never
+  inferred: a diff containing a drop and an add looks identical whether you
+  renamed a field or replaced it, and guessing wrong either destroys data or
+  silently rebinds the column to the wrong field with no way to see which
+  happened. Without the annotation, it is a drop plus an add and follows the
+  removal rule below.
+- **Removing a field needs `#[model(dropped("old_name"))]` on the struct** —
+  the field itself is gone, so the annotation cannot live on it. This
+  soft-drops the column: the bytes stay, it stops being required, and it
+  stops being read. Re-declaring the field later revives the column with its
+  data intact. Removing a field WITHOUT naming it in `dropped(...)` still
+  deploys as long as the stored column would not start refusing writes (it is
+  nullable, carries a default, or is a counter) — the deploy succeeds with a
+  logged warning, because a hand-written migration may legitimately own a
+  column your model never declares. If the stored column has none of those
+  escape valves, the deploy is refused rather than shipping a table that
+  accepts no more writes.
+- **Changing a column's type, changing its nullability, or converting a plain
+  column to an accumulator (`counter`/`max`) is always refused.** Each needs
+  every existing row rewritten, which needs a backfill this pass does not do.
+  The deployment does not go live. In the common case the platform also
+  restores whatever was running before it back to active; that restoration is
+  a best-effort compensating step, not a guarantee — it can itself fail, and
+  if this was the service's first-ever deploy there is nothing to restore it
+  to, in which case the refused deployment is left recorded (still not
+  serving, just not replaced by anything either). Bring a new table with the
+  shape you want and a migration that copies the data across instead — see
+  below.
 
 ### Migrations
 

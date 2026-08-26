@@ -259,34 +259,117 @@ macro_rules! wit_glue {
             }
         }
 
+        /// One declared column as the WIT `column-def`.
+        ///
+        /// The single ColDef→WIT mapping: `create_table` sends the whole set
+        /// through it and the column reconcile sends one column at a time. It
+        /// was inline in `create_table_from` until the reconcile needed the
+        /// same mapping — and a second copy would be free to disagree about,
+        /// say, whether a default rides along, which is precisely the class of
+        /// bug the reconcile exists to fix.
+        fn __boogy_col_def_to_wit(
+            c: &$crate::store::ColDef,
+        ) -> $bindings::boogy::platform::store::ColumnDef {
+            $bindings::boogy::platform::store::ColumnDef {
+                name: c.name.clone(),
+                col_type: match c.col_type {
+                    $crate::store::ColType::Text     => $bindings::boogy::platform::store::ColumnType::Text,
+                    $crate::store::ColType::Integer  => $bindings::boogy::platform::store::ColumnType::Integer,
+                    $crate::store::ColType::Real     => $bindings::boogy::platform::store::ColumnType::Real,
+                    $crate::store::ColType::Blob     => $bindings::boogy::platform::store::ColumnType::Blob,
+                    $crate::store::ColType::Boolean  => $bindings::boogy::platform::store::ColumnType::Boolean,
+                },
+                nullable: c.nullable,
+                unique: c.unique,
+                references: c.references.as_ref().map(|fk| {
+                    $bindings::boogy::platform::store::ForeignKey {
+                        references_table: fk.references_table.clone(),
+                        references_column: fk.references_column.clone(),
+                        on_delete: __boogy_cascade(fk.on_delete),
+                        on_update: __boogy_cascade(fk.on_update),
+                    }
+                }),
+                default: c.default.as_ref().map(|v| __boogy_val_to_wit(v)),
+                counter: c.counter,
+                counter_max: c.counter_max,
+            }
+        }
+
+        /// Conflicts the schema pass could not apply, in developer-facing prose.
+        ///
+        /// A thread-local for the same reason `__BOOGY_DECLARED` is one:
+        /// `create_table_from` is a free fn called per table, and the value has
+        /// to outlive it and reach the response the resolution pass returns.
+        ///
+        /// **Reset at the start of every schema pass**, so once the pass
+        /// returns the buffer holds exactly that pass's conflicts. That is what
+        /// makes it a snapshot rather than a running total: the declaration
+        /// re-runs per request whenever a deployment's schema was never
+        /// resolved, and a buffer that only ever grew would report the same
+        /// conflict N times and leak.
+        ///
+        /// Conflicts also reach the developer through `log::warn!` as they are
+        /// found; `__boogy_take_schema_conflicts` is for the pass that will
+        /// turn them into a response header.
+        ///
+        /// A conflict is NOT an error here. The pass applies everything it can
+        /// and reports what it could not, because the alternative — trapping on
+        /// the first one — hides every conflict after it and reaches the
+        /// developer as an opaque 500.
+        thread_local! {
+            static __BOOGY_SCHEMA_CONFLICTS: ::std::cell::RefCell<
+                ::std::vec::Vec<::std::string::String>
+            > = ::std::cell::RefCell::new(::std::vec::Vec::new());
+        }
+
+        /// Record one unappliable schema difference.
+        fn __boogy_note_schema_conflict(msg: ::std::string::String) {
+            $crate::log::warn!("schema: {msg}");
+            __BOOGY_SCHEMA_CONFLICTS.with(|c| c.borrow_mut().push(msg));
+        }
+
+        /// Take everything recorded by the schema pass, emptying the buffer.
+        fn __boogy_take_schema_conflicts() -> ::std::vec::Vec<::std::string::String> {
+            __BOOGY_SCHEMA_CONFLICTS.with(|c| ::std::mem::take(&mut *c.borrow_mut()))
+        }
+
+        /// Has anything already been recorded as a conflict in THIS pass?
+        ///
+        /// Peeks; it must not drain. The buffer is what the `ApplyOnly` response
+        /// builder turns into the `x-boogy-schema-conflict` header, so emptying
+        /// it here would silently disable the whole refusal.
+        ///
+        /// Exists because the abandon-the-plan rule is a property of the
+        /// DEPLOYMENT, not of one table: `create_table_from` runs once per model,
+        /// so a service whose first table plans a rename and whose second plans a
+        /// conflict would otherwise apply the rename and then be refused —
+        /// the same irrecoverable state, one level up.
+        fn __boogy_schema_conflicts_pending() -> bool {
+            __BOOGY_SCHEMA_CONFLICTS.with(|c| !c.borrow().is_empty())
+        }
+
         // -- Table builder → WIT create_table + create_index calls --
         fn create_table_from(table: &$crate::store::Table) {
             let cols: Vec<$bindings::boogy::platform::store::ColumnDef> =
-                table.columns.iter().map(|c| {
-                    $bindings::boogy::platform::store::ColumnDef {
-                        name: c.name.clone(),
-                        col_type: match c.col_type {
-                            $crate::store::ColType::Text     => $bindings::boogy::platform::store::ColumnType::Text,
-                            $crate::store::ColType::Integer  => $bindings::boogy::platform::store::ColumnType::Integer,
-                            $crate::store::ColType::Real     => $bindings::boogy::platform::store::ColumnType::Real,
-                            $crate::store::ColType::Blob     => $bindings::boogy::platform::store::ColumnType::Blob,
-                            $crate::store::ColType::Boolean  => $bindings::boogy::platform::store::ColumnType::Boolean,
-                        },
-                        nullable: c.nullable,
-                        unique: c.unique,
-                        references: c.references.as_ref().map(|fk| {
-                            $bindings::boogy::platform::store::ForeignKey {
-                                references_table: fk.references_table.clone(),
-                                references_column: fk.references_column.clone(),
-                                on_delete: __boogy_cascade(fk.on_delete),
-                                on_update: __boogy_cascade(fk.on_update),
-                            }
-                        }),
-                        default: c.default.as_ref().map(|v| __boogy_val_to_wit(v)),
-                        counter: c.counter,
-                        counter_max: c.counter_max,
-                    }
-                }).collect();
+                table.columns.iter().map(__boogy_col_def_to_wit).collect();
+
+            // Resolve declared access patterns + explicit indexes into the
+            // physical index set; surface build-time diagnostics via logging.
+            // Resolved BEFORE anything is applied: an `Error` diagnostic means
+            // the declaration is impossible to satisfy, and creating the table
+            // first would leave a half-built schema behind the panic. The
+            // reconcile below also needs the resolved set, to say which added
+            // columns are indexed.
+            #[allow(unused)]
+            let (__resolved, __diags) = table.resolved_indices();
+            for d in &__diags {
+                match d {
+                    $crate::schema_resolve::Diagnostic::Warning(m) =>
+                        $crate::log::warn!("schema {}: {}", table.name, m),
+                    $crate::schema_resolve::Diagnostic::Error(m) =>
+                        panic!("schema {}: {}", table.name, m),
+                }
+            }
             // create_table: guarded by list_tables. Skip if table already exists;
             // propagate genuine engine errors via unwrap_or_else with context. The
             // earlier list_tables idempotency drift has been fixed at the engine +
@@ -319,20 +402,10 @@ macro_rules! wit_glue {
                             );
                         }
                     });
+            } else {
+                __boogy_reconcile_columns(table, &__resolved);
             }
 
-            // Resolve declared access patterns + explicit indexes into the
-            // physical index set; surface build-time diagnostics via logging.
-            #[allow(unused)]
-            let (__resolved, __diags) = table.resolved_indices();
-            for d in &__diags {
-                match d {
-                    $crate::schema_resolve::Diagnostic::Warning(m) =>
-                        $crate::log::warn!("schema {}: {}", table.name, m),
-                    $crate::schema_resolve::Diagnostic::Error(m) =>
-                        panic!("schema {}: {}", table.name, m),
-                }
-            }
             // Record the resolved set; the reconcile pass applies every
             // table's changes once `Api::init_tables()` has declared them all.
             // A per-table pass cannot work here: it would read every OTHER
@@ -364,6 +437,271 @@ macro_rules! wit_glue {
             if !__rollups.is_empty() {
                 __BOOGY_DECLARED_ROLLUPS
                     .with(|d| d.borrow_mut().push((table.name.clone(), __rollups)));
+            }
+        }
+
+        /// Converge one EXISTING table's columns on what its model declares.
+        ///
+        /// Only reached when `list_tables` already shows the table: a table
+        /// that does not exist is created whole, columns included.
+        ///
+        /// This arm used not to exist. A table's columns were fixed at
+        /// creation, so adding a field to a `#[derive(Model)]` struct deployed
+        /// cleanly and then every write to that table was refused — forever,
+        /// with no diagnostic — because the row carried a column the stored
+        /// schema had never heard of.
+        ///
+        /// Every action here is O(1) metadata and **nothing is backfilled**,
+        /// which is what makes the pass affordable at provision time and is
+        /// also its one visible limitation — see the index warning below.
+        ///
+        /// `Revive` is the exception, and it is an INDIRECT one: dropping a
+        /// column discarded every index spec that mentioned it, so the index
+        /// reconcile that runs after this pass sees those indexes as missing
+        /// and recreates them — and `create_index` backfills. Reviving a column
+        /// on a large table therefore costs O(rows), just not here. Left as is:
+        /// the alternative is an index that exists in the metadata and has no
+        /// entries, which reads as an empty result rather than as an error.
+        ///
+        /// Safe to re-run: the plan is computed from a fresh `list_columns`, so
+        /// a converged schema plans nothing at all, and the residual race (a
+        /// second host applying the same plan concurrently) lands on
+        /// "already exists", which is treated as success exactly as the create
+        /// path treats it.
+        ///
+        /// **All-or-nothing.** The whole plan is scanned for conflicts before
+        /// any of it is applied, and a single conflict applies NOTHING. That is
+        /// not tidiness: a conflict refuses the deploy, and the refusal restores
+        /// the previous WASM, not the previous SCHEMA. So a partially-applied
+        /// plan leaves the restored deployment declaring one thing and the store
+        /// holding another — for a `Rename`, irrecoverably, because the next
+        /// resolution re-adds the old name EMPTY beside the renamed column that
+        /// still holds the data. Applying nothing is the only outcome the
+        /// refusal can actually undo. It also removes the cross-action ordering
+        /// coupling entirely: actions are sorted by column name, so before this
+        /// scan a rename of `a_col` was applied before a conflict on `z_col` was
+        /// even looked at, and any future action order could reintroduce that.
+        ///
+        /// The rule is a property of the DEPLOYMENT, so it does not stop at this
+        /// table: this function also refuses to apply anything once ANY earlier
+        /// table in the same pass has recorded a conflict
+        /// (`__boogy_schema_conflicts_pending`). Without that, a service whose
+        /// first model plans a rename and whose second plans a conflict reaches
+        /// the identical unrecoverable state one level up.
+        ///
+        /// **What that does NOT give you is full atomicity across tables.**
+        /// Models reconcile in declaration order, and nothing here can un-apply
+        /// an earlier table's actions — so a conflict in a LATER table still
+        /// leaves an EARLIER table converged while the deploy is refused. That
+        /// residual is bounded to actions this pass considers safe on their own
+        /// (an add, a default change, a rename or a soft drop the model asked
+        /// for), and the restored deployment declares the schema it was
+        /// deployed with, so its own next resolution converges rather than
+        /// stranding data. Closing it properly needs the whole declaration
+        /// planned before any of it is applied, which is a different shape than
+        /// `create_table_from`'s per-model call.
+        fn __boogy_reconcile_columns(
+            table: &$crate::store::Table,
+            resolved: &[$crate::store::Index],
+        ) {
+            use $crate::schema_resolve::ColumnAction as CA;
+            let actual = match list_columns(&table.name) {
+                Ok(v) => v,
+                // Store capability not granted, or the table went away between
+                // the `list_tables` guard and here. Nothing to reconcile
+                // against; the service fails properly on its first data op
+                // rather than trapping during init. Same posture as
+                // `__boogy_reconcile_indexes`.
+                Err(_) => return,
+            };
+            let plan = $crate::schema_resolve::plan_column_reconcile(
+                &table.columns,
+                &actual,
+                table.allow_dropped,
+            );
+
+            // Read BEFORE this table records anything of its own, or its own
+            // pushes would be indistinguishable from an earlier table's.
+            let __earlier_table_conflicted = __boogy_schema_conflicts_pending();
+
+            // Pass one: report, apply nothing. Every conflict is recorded (not
+            // just the first) so the deploy's 409 names the whole disagreement
+            // rather than one column of it, and the warnings are logged here so
+            // an aborted pass still says everything it found. This runs even
+            // when an earlier table already conflicted: the deploy is refused
+            // either way, and a developer fixing it should see every column
+            // involved, not just the ones before the first failure.
+            let mut __conflicted = false;
+            for action in &plan {
+                match action {
+                    CA::Conflict { column, reason } => {
+                        __conflicted = true;
+                        __boogy_note_schema_conflict(::std::format!(
+                            "{}.{}: {}", &table.name, column, reason));
+                    }
+                    // Logged, never recorded. A warning describes a schema the
+                    // service RUNS on — most often a column a hand-written
+                    // migration owns and the model never declared — so pushing
+                    // it into the conflict buffer would fail a deploy that has
+                    // nothing wrong with it.
+                    CA::Warn { column, reason } => {
+                        $crate::log::warn!("schema {}.{}: {}", &table.name, column, reason);
+                    }
+                    // Enumerated rather than `_`: a new action variant must be
+                    // classified here as "applies something" or "reports
+                    // something", not silently inherit either answer.
+                    CA::Add(_)
+                    | CA::SetDefault { .. }
+                    | CA::Rename { .. }
+                    | CA::SoftDrop(_)
+                    | CA::Revive { .. } => {}
+                }
+            }
+            if __conflicted || __earlier_table_conflicted {
+                return;
+            }
+
+            // Pass two: apply. Reached only when the plan is entirely mutating.
+            for action in &plan {
+                let res: ::core::result::Result<(), ::std::string::String> = match &action {
+                    CA::Add(c) => {
+                        let r = $bindings::boogy::platform::store::add_column(
+                            &table.name,
+                            &__boogy_col_def_to_wit(c),
+                        )
+                        .map_err(::std::string::String::from);
+                        if r.is_ok() {
+                            __boogy_warn_if_indexed(&table.name, &c.name, resolved);
+                        }
+                        r
+                    }
+                    CA::SetDefault { column, value } => {
+                        // `add-column` on a column whose name, type and
+                        // nullability already match replaces the default in
+                        // place — the documented path, and idempotent. The rest
+                        // of the definition must therefore come from the STORED
+                        // shape, not the declaration: any other difference is
+                        // refused as a conflict, which is the behaviour we want
+                        // for a real shape change and not for this one.
+                        match actual.iter().find(|a| &a.name == column) {
+                            Some(a) => {
+                                let mut c = a.to_col_def();
+                                c.default = ::core::option::Option::Some(value.clone());
+                                $bindings::boogy::platform::store::add_column(
+                                    &table.name,
+                                    &__boogy_col_def_to_wit(&c),
+                                )
+                                .map_err(::std::string::String::from)
+                            }
+                            // `plan_column_reconcile` only emits `SetDefault`
+                            // for a column it matched in `actual`, so this is
+                            // unreachable. Reported rather than unwrapped: a
+                            // schema pass must not trap the request.
+                            ::core::option::Option::None => ::core::result::Result::Err(
+                                ::std::string::String::from(
+                                    "planned a default change for a column that is not in the store",
+                                ),
+                            ),
+                        }
+                    }
+                    CA::Rename { from, to } => rename_column(&table.name, from, to),
+                    CA::SoftDrop(n) => drop_column(&table.name, n),
+                    CA::Revive { column, default } =>
+                        revive_column(&table.name, column, default.as_ref()),
+                    // Both were handled by the reporting pass above, and a
+                    // conflict returned before reaching here. Left as explicit
+                    // no-op arms rather than `unreachable!()`: a schema pass
+                    // must not trap the request under any input.
+                    CA::Conflict { .. } | CA::Warn { .. } => ::core::result::Result::Ok(()),
+                };
+                if let ::core::result::Result::Err(msg) = res {
+                    if !__boogy_schema_action_is_benign(action, &msg) {
+                        __boogy_note_schema_conflict(::std::format!(
+                            "{}.{}: {}", &table.name, action.column_name(), msg));
+                    }
+                }
+            }
+        }
+
+        /// Is this failure the target state already holding, rather than a
+        /// conflict?
+        ///
+        /// The plan is computed from a `list_columns` snapshot, so on ONE host
+        /// a converged schema plans nothing and nothing here can fire. The case
+        /// this covers is two hosts resolving the same deployment at once: the
+        /// other host applied the action between our read and our call, and the
+        /// column is now in exactly the state we wanted.
+        ///
+        /// Per-action, not one blanket substring list, because the benign
+        /// message differs by action and a blanket list gets it wrong in both
+        /// directions — "column not found" is convergence for a drop and a real
+        /// failure for a rename, and matching "already exists" on a soft drop
+        /// would swallow nothing while leaving the drop's own race unhandled.
+        ///
+        /// "not granted" is benign for every action: the store capability is
+        /// absent, which the first data op reports properly.
+        fn __boogy_schema_action_is_benign(
+            action: &$crate::schema_resolve::ColumnAction,
+            msg: &str,
+        ) -> bool {
+            use $crate::schema_resolve::ColumnAction as CA;
+            if msg.contains("not granted") {
+                return true;
+            }
+            match action {
+                // NOTHING. Read `add_column_core`: an identical concurrent
+                // re-add returns Ok and replaces the default in place, so
+                // convergence never reaches this function at all. The store
+                // says "already exists" on exactly one input — a DIFFERENT
+                // column wearing the same name (type, nullability or
+                // accumulator differs) — the table refusing every write, all
+                // over again.
+                // Swallowing it here would hide the one error that matters
+                // most, in the one arm where it matters.
+                CA::Add(_) | CA::SetDefault { .. } => false,
+                // Either the new name is taken (renamed already) or the old one
+                // is gone (same thing, seen from the other side).
+                CA::Rename { .. } => msg.contains("already exists") || msg.contains("not found"),
+                // No LIVE column under that name: already dropped.
+                CA::SoftDrop(_) => msg.contains("not found"),
+                // "is not dropped" — already revived. Deliberately does NOT
+                // match "is not a dropped column", which means the name is
+                // absent entirely: that is a real conflict, not convergence.
+                CA::Revive { .. } => msg.contains("not dropped"),
+                // Never reached: both reporting arms return Ok.
+                CA::Conflict { .. } | CA::Warn { .. } => false,
+            }
+        }
+
+        /// Say so when a newly added column is one an index covers.
+        ///
+        /// The pass adds columns; it never backfills VALUES. A row written
+        /// before the column existed has no value for it, so what a seek on
+        /// that column finds is not what the declaration implies:
+        ///
+        /// - an index created in the same pass backfills, and indexes every
+        ///   pre-existing row under the column's DEFAULT;
+        /// - an index that already existed has no entry for those rows at all.
+        ///
+        /// Either way the rows that predate this deployment are not findable by
+        /// any real value on this column, and nothing in the declaration says
+        /// so. Backfill is out of scope; saying so is the minimum this pass
+        /// owes the developer.
+        fn __boogy_warn_if_indexed(
+            table: &str,
+            column: &str,
+            resolved: &[$crate::store::Index],
+        ) {
+            if resolved.iter().any(|i| i.columns.iter().any(|n| n == column)) {
+                $crate::log::warn!(
+                    "schema {table}: column `{column}` was added to a table that may \
+                     already hold rows, and it is covered by an index. NOTHING IS \
+                     BACKFILLED: rows written before this deployment have no value \
+                     for `{column}`, so they are indexed under its default (if the \
+                     index is built now) or carry no entry for it at all (if the \
+                     index already existed). A seek on `{column}` will not find them \
+                     by any real value until they are rewritten."
+                );
             }
         }
 
@@ -563,8 +901,8 @@ macro_rules! wit_glue {
         ///
         /// The host enforces the operation strictly — call from a migration
         /// body, not from `init_tables` (which may re-run on a table that
-        /// already has the column). For idempotent use, prefer `MigrationCtx`
-        /// (Task 5) which guards with `list_columns` first.
+        /// already has the column). For idempotent use, prefer
+        /// `MigrationCtx::add_column`, which guards with `list_columns` first.
         fn add_column(
             table: &str,
             spec: &$crate::store::ColumnSpec,
@@ -612,26 +950,77 @@ macro_rules! wit_glue {
                 .map_err(::std::string::String::from)
         }
 
+        /// Restore a soft-dropped column: the undo for `drop_column`.
+        ///
+        /// Needed as its own primitive because `add_column` refuses a name that
+        /// is already present — including a tombstoned one — so a re-declared
+        /// column could not otherwise come back. Fails when the name is live
+        /// or absent; only a dropped column can be revived.
+        ///
+        /// `default`, when given, is installed in the same write that clears
+        /// the tombstone. A soft drop does not stop the table taking writes, so
+        /// rows written while the column was gone hold no value for it — a
+        /// required column revived without a default would leave those rows
+        /// with nothing to resolve against, which is precisely the state
+        /// `add_column`'s synthesised default exists to prevent.
+        fn revive_column(
+            table: &str,
+            name: &str,
+            default: ::core::option::Option<&$crate::store::Val>,
+        ) -> ::core::result::Result<(), ::std::string::String> {
+            $bindings::boogy::platform::store::revive_column(
+                table,
+                name,
+                default.map(|v| __boogy_val_to_wit(v)).as_ref(),
+            )
+            .map_err(::std::string::String::from)
+        }
+
+        /// One WIT `column-info` as the SDK [`ColumnInfo`].
+        ///
+        /// Destructured exhaustively on purpose, for the reason spelled out on
+        /// `list_indexes`: a new WIT field then fails to compile HERE rather
+        /// than being silently dropped from the comparison the column
+        /// reconcile makes.
+        fn __boogy_to_sdk_column_info(
+            ci: $bindings::boogy::platform::store::ColumnInfo,
+        ) -> $crate::store::ColumnInfo {
+            let $bindings::boogy::platform::store::ColumnInfo {
+                name, col_type, nullable, unique, counter, counter_max, dropped,
+                has_references, default,
+            } = ci;
+            $crate::store::ColumnInfo {
+                name,
+                col_type: match col_type {
+                    $bindings::boogy::platform::store::ColumnType::Text    => $crate::store::ColType::Text,
+                    $bindings::boogy::platform::store::ColumnType::Integer => $crate::store::ColType::Integer,
+                    $bindings::boogy::platform::store::ColumnType::Real    => $crate::store::ColType::Real,
+                    $bindings::boogy::platform::store::ColumnType::Blob    => $crate::store::ColType::Blob,
+                    $bindings::boogy::platform::store::ColumnType::Boolean => $crate::store::ColType::Boolean,
+                },
+                nullable,
+                unique,
+                counter,
+                counter_max,
+                dropped,
+                has_references,
+                default: default.as_ref().map(__boogy_wit_to_val),
+            }
+        }
+
         /// List the current columns of a table, returning [`ColumnInfo`]
         /// for each. Useful for idempotency guards in migrations — check
         /// whether a column already exists before calling `add_column`.
+        ///
+        /// Reports DROPPED columns too, flagged. A reconcile has to see a
+        /// tombstone to tell "never declared" from "deliberately removed";
+        /// callers doing a presence check want `!c.dropped` (see
+        /// `MigrationCtx::add_column`).
         fn list_columns(
             table: &str,
         ) -> ::core::result::Result<::std::vec::Vec<$crate::store::ColumnInfo>, ::std::string::String> {
             let wit_cols = $bindings::boogy::platform::store::list_columns(table)?;
-            Ok(wit_cols.into_iter().map(|ci| {
-                $crate::store::ColumnInfo {
-                    name: ci.name,
-                    col_type: match ci.col_type {
-                        $bindings::boogy::platform::store::ColumnType::Text    => $crate::store::ColType::Text,
-                        $bindings::boogy::platform::store::ColumnType::Integer => $crate::store::ColType::Integer,
-                        $bindings::boogy::platform::store::ColumnType::Real    => $crate::store::ColType::Real,
-                        $bindings::boogy::platform::store::ColumnType::Blob    => $crate::store::ColType::Blob,
-                        $bindings::boogy::platform::store::ColumnType::Boolean => $crate::store::ColType::Boolean,
-                    },
-                    nullable: ci.nullable,
-                }
-            }).collect())
+            Ok(wit_cols.into_iter().map(__boogy_to_sdk_column_info).collect())
         }
 
         /// List the current indexes on a table, returning [`IndexInfo`] for
@@ -3360,14 +3749,20 @@ macro_rules! wit_glue {
 
         impl MigrationCtx {
             /// Add a column to `table` with the given spec. **Idempotent:**
-            /// if `list_columns` already shows a column with `spec.name`,
+            /// if `list_columns` already shows a LIVE column with `spec.name`,
             /// this is a no-op.
+            ///
+            /// Checks `!c.dropped` explicitly: `list_columns` reports
+            /// soft-dropped columns as well as live ones (a schema reconcile
+            /// needs to see them to tell "already dropped" from "never
+            /// existed"), so a name match alone would misread "was added, then
+            /// dropped" as "already applied" and silently skip re-adding it.
             pub fn add_column(
                 &self,
                 table: &str,
                 spec: &$crate::store::ColumnSpec,
             ) -> ::core::result::Result<(), ::std::string::String> {
-                if list_columns(table)?.iter().any(|c| c.name == spec.name) {
+                if list_columns(table)?.iter().any(|c| c.name == spec.name && !c.dropped) {
                     return Ok(()); // already applied
                 }
                 add_column(table, spec)
@@ -3377,6 +3772,9 @@ macro_rules! wit_glue {
             /// - If `new` is present and `old` is absent → already renamed, no-op.
             /// - If `old` is absent (and `new` is also absent) → error: nothing to rename.
             /// - Otherwise calls the underlying rename op.
+            ///
+            /// Presence checks exclude dropped columns for the same reason
+            /// `add_column`'s does — see its doc comment.
             pub fn rename_column(
                 &self,
                 table: &str,
@@ -3384,8 +3782,8 @@ macro_rules! wit_glue {
                 new: &str,
             ) -> ::core::result::Result<(), ::std::string::String> {
                 let cols = list_columns(table)?;
-                let has_new = cols.iter().any(|c| c.name == new);
-                let has_old = cols.iter().any(|c| c.name == old);
+                let has_new = cols.iter().any(|c| c.name == new && !c.dropped);
+                let has_old = cols.iter().any(|c| c.name == old && !c.dropped);
                 if has_new && !has_old {
                     return Ok(()); // already renamed
                 }
@@ -3399,13 +3797,18 @@ macro_rules! wit_glue {
             }
 
             /// Drop a column from `table`. **Idempotent:** if `list_columns`
-            /// does not contain `name`, this is a no-op (already dropped).
+            /// shows no LIVE column named `name`, this is a no-op (already
+            /// dropped) — the underlying `drop_column` errors "column not
+            /// found" on a name that is already dropped, so this guard must
+            /// exclude dropped entries rather than merely check presence (see
+            /// `add_column`'s doc comment for why `list_columns` now returns
+            /// dropped columns at all).
             pub fn drop_column(
                 &self,
                 table: &str,
                 name: &str,
             ) -> ::core::result::Result<(), ::std::string::String> {
-                if !list_columns(table)?.iter().any(|c| c.name == name) {
+                if !list_columns(table)?.iter().any(|c| c.name == name && !c.dropped) {
                     return Ok(()); // already dropped
                 }
                 drop_column(table, name)
@@ -5561,6 +5964,10 @@ macro_rules! wit_glue {
                     // declared set; the reconcile completes before migrations,
                     // which may rely on a declared index; bootstrap is last,
                     // because seeding needs the final schema.
+                    // Start from empty: this buffer is a snapshot of THIS
+                    // pass, and the pass re-runs per request for a deployment
+                    // whose schema was never resolved.
+                    let _ = __boogy_take_schema_conflicts();
                     let mut __schema = $crate::schema_decl::Schema::new();
                     <$api_struct as $crate::Api>::schema(&mut __schema);
                     for __t in __schema.tables() {
@@ -5581,12 +5988,31 @@ macro_rules! wit_glue {
                     // ordinary route — would be indistinguishable from one that
                     // resolved its schema, and the platform would mark a
                     // deployment resolved on the strength of a 404.
+                    let mut __headers = ::std::vec![(
+                        ::std::string::String::from("x-boogy-schema-applied"),
+                        ::std::string::String::from("1"),
+                    )];
+                    // Drained AFTER the pass above (declaration, reconcile,
+                    // migrate, bootstrap) has fully run, so this holds exactly
+                    // that pass's conflicts — not the empty buffer a drain any
+                    // earlier would read. Only a `Conflict` ever reaches this
+                    // list; a `Warn` (a harmless stored-but-undeclared column)
+                    // is logged and never recorded, so it can never turn into a
+                    // fatal header. The applied header above keeps its existing
+                    // meaning regardless: a pass can legitimately apply some
+                    // tables and conflict on another.
+                    let __schema_conflicts = __boogy_take_schema_conflicts();
+                    if let ::core::option::Option::Some(__joined) =
+                        $crate::schema_resolve::schema_conflict_header_value(&__schema_conflicts)
+                    {
+                        __headers.push((
+                            ::std::string::String::from("x-boogy-schema-conflict"),
+                            __joined,
+                        ));
+                    }
                     return $bindings::exports::boogy::platform::http_handler::HttpResponse {
                         status: 204,
-                        headers: ::std::vec![(
-                            ::std::string::String::from("x-boogy-schema-applied"),
-                            ::std::string::String::from("1"),
-                        )],
+                        headers: __headers,
                         body: ::core::option::Option::None,
                     };
                 }

@@ -405,10 +405,22 @@ interface store {
         counter-max: bool,
     }
 
+    /// One column as the store actually holds it.
+    ///
+    /// Carries every field a schema diff must compare. It deliberately mirrors
+    /// `column-def` rather than being a summary: a reconciler that cannot see
+    /// `default`, `counter` or `dropped` cannot tell an applied migration from
+    /// an unapplied one, which is the defect this record was widened to fix.
     record column-info {
         name: string,
         col-type: column-type,
         nullable: bool,
+        unique: bool,
+        counter: bool,
+        counter-max: bool,
+        dropped: bool,
+        has-references: bool,
+        default: option<value>,
     }
 
     /// Lightweight per-table introspection. Counts are derived metadata;
@@ -715,6 +727,22 @@ interface store {
     add-column: func(table: string, column: column-def) -> result<_, store-error>;
     rename-column: func(table: string, old: string, new: string) -> result<_, store-error>;
     drop-column: func(table: string, name: string) -> result<_, store-error>;
+
+    /// Clear a column's `dropped` flag, restoring it to the declared set.
+    ///
+    /// The undo for a soft drop: the bytes were never removed, so a column that
+    /// comes back is the same column, with its data. Fails
+    /// `constraint-violation` if the column is not dropped or does not exist.
+    ///
+    /// `default`, when present, is installed as the revived column's default in
+    /// the SAME metadata write that clears the tombstone; `none` leaves the
+    /// stored default exactly as the drop left it. This is not a convenience:
+    /// rows written WHILE the column was dropped carry no slot for it, so a
+    /// required column revived with no default would leave those rows
+    /// unresolvable — the same hole `add-column` closes by taking a default up
+    /// front. Doing it in one write is what keeps the two states — tombstone
+    /// cleared, default installed — from ever being observed apart.
+    revive-column: func(table: string, name: string, default: option<value>) -> result<_, store-error>;
     list-columns: func(table: string) -> result<list<column-info>, store-error>;
 
     // -- Raw SQL (parameterized) --

@@ -271,7 +271,7 @@ pub enum EncryptionMode {
 }
 
 /// Column type for table definitions.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColType {
     Text,
     Integer,
@@ -281,7 +281,7 @@ pub enum ColType {
 }
 
 /// Foreign-key cascade action for `ON DELETE` / `ON UPDATE`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CascadeAction {
     /// `NO ACTION` — default. The DB rejects modifications that would
     /// orphan a child row.
@@ -296,7 +296,7 @@ pub enum CascadeAction {
 }
 
 /// A column-level foreign-key constraint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ForeignKey {
     pub references_table: String,
     pub references_column: String,
@@ -305,7 +305,7 @@ pub struct ForeignKey {
 }
 
 /// Column definition for table creation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColDef {
     pub name: String,
     pub col_type: ColType,
@@ -357,6 +357,15 @@ pub struct ColDef {
     ///
     /// Literal values only; there are no expression defaults (no "now()").
     pub default: Option<Val>,
+    /// Declared previous name, from `#[renamed_from = "old"]`.
+    ///
+    /// A declaration diff cannot distinguish a rename from a drop plus an add —
+    /// the two are textually identical and have opposite consequences for the
+    /// data. The platform therefore never infers one; this field is the only
+    /// way a rename is expressed. Never sent to the store: it is consumed by
+    /// `schema_resolve::plan_column_reconcile` and does not appear in
+    /// `column-def`.
+    pub renamed_from: Option<String>,
 }
 
 /// Index definition for a table.
@@ -561,11 +570,25 @@ pub struct Table {
     pub indices: Vec<Index>,
     pub access_patterns: Vec<AccessPattern>,
     pub encryption: EncryptionMode,
+    /// Columns this table has deliberately removed, from
+    /// `#[model(dropped("a", "b"))]`.
+    ///
+    /// Carried on the table rather than on a column because the column is gone
+    /// — there is nothing left to annotate. The schema pass hands this to
+    /// [`crate::schema_resolve::plan_column_reconcile`] as its `allow_dropped`
+    /// list: a stored column missing from the declaration is a soft drop when
+    /// it is named here and a conflict when it is not, so losing a column is
+    /// always something the developer wrote down.
+    ///
+    /// `&'static` because every producer is either a literal list emitted by
+    /// the derive or the empty default — a runtime-built table declares no
+    /// drops, since there was never an earlier version of it to drop from.
+    pub allow_dropped: &'static [&'static str],
 }
 
 impl Table {
     pub fn new(name: &str) -> Self {
-        Self { name: name.to_string(), columns: vec![], indices: vec![], access_patterns: vec![], encryption: EncryptionMode::None }
+        Self { name: name.to_string(), columns: vec![], indices: vec![], access_patterns: vec![], encryption: EncryptionMode::None, allow_dropped: &[] }
     }
 
     /// Declare a non-unique index over one or more columns. Index names
@@ -686,37 +709,37 @@ impl Table {
     }
 
     pub fn text(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
         self
     }
 
     pub fn integer(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
         self
     }
 
     pub fn real(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Real, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Real, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
         self
     }
 
     pub fn boolean(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Boolean, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Boolean, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
         self
     }
 
     pub fn blob(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Blob, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Blob, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
         self
     }
 
     pub fn nullable_text(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
         self
     }
 
     pub fn nullable_integer(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
         self
     }
 
@@ -837,6 +860,23 @@ pub enum Val {
 }
 
 impl Val {
+    /// The type's zero, used as the default the platform attaches to a NOT NULL
+    /// column added to a table that may already hold rows.
+    ///
+    /// Rows predating the column resolve against the default on every read, so
+    /// this is what makes such an add safe with no backfill. It is recorded in
+    /// the stored schema like any other default rather than being implicit
+    /// behaviour, and an explicit default replaces it through `SetDefault`.
+    pub fn zero_for(t: ColType) -> Val {
+        match t {
+            ColType::Text => Val::Text(String::new()),
+            ColType::Integer => Val::Integer(0),
+            ColType::Real => Val::Real(0.0),
+            ColType::Boolean => Val::Boolean(false),
+            ColType::Blob => Val::Blob(Vec::new()),
+        }
+    }
+
     pub fn as_text(&self) -> String {
         match self {
             Val::Text(s) => s.clone(),
@@ -983,12 +1023,54 @@ impl ColumnSpec {
 
 /// Column metadata returned by `list_columns`.
 ///
-/// SDK mirror of the WIT `column-info` record.
+/// SDK mirror of the WIT `column-info` record. Carries every field a schema
+/// diff must compare — `default`/`counter`/`dropped` included — so a caller
+/// (or `MigrationCtx`) can tell an applied migration from an unapplied one
+/// rather than seeing only a summary.
 #[derive(Debug, Clone)]
 pub struct ColumnInfo {
     pub name: String,
     pub col_type: ColType,
     pub nullable: bool,
+    pub unique: bool,
+    pub counter: bool,
+    pub counter_max: bool,
+    pub dropped: bool,
+    pub has_references: bool,
+    pub default: Option<Val>,
+}
+
+impl ColumnInfo {
+    /// The stored column as a [`ColDef`] — what the declaration side speaks.
+    ///
+    /// Used by the schema pass to rebuild a column definition from what the
+    /// store actually holds, so a `SetDefault` action can re-send the column
+    /// unchanged except for its default (`add-column` updates the default of a
+    /// column whose name, type and nullability already match, and refuses any
+    /// other difference — so the rest MUST come from the stored shape, not from
+    /// the declaration).
+    ///
+    /// Two fields cannot round-trip and are deliberately lossy:
+    ///
+    /// - `references` — the wire record carries only `has_references`, a bool.
+    ///   A `ColDef` rebuilt here therefore has `references: None`. That is
+    ///   correct for the one caller: `add-column` compares name, type and
+    ///   nullability only, so an omitted FK neither drops nor re-declares one.
+    /// - `renamed_from` — a declaration-side annotation with no stored
+    ///   counterpart; a column read back from the store has no previous name.
+    pub fn to_col_def(&self) -> ColDef {
+        ColDef {
+            name: self.name.clone(),
+            col_type: self.col_type,
+            nullable: self.nullable,
+            unique: self.unique,
+            references: None,
+            counter: self.counter,
+            counter_max: self.counter_max,
+            default: self.default.clone(),
+            renamed_from: None,
+        }
+    }
 }
 
 /// Index metadata returned by `list_indexes`.

@@ -1,0 +1,5 @@
+error: #[model(dropped("headline"))] names column `headline`, but a field still declares it. `dropped(...)` is for columns with NO field left — if you meant to rename it, use #[renamed_from = "headline"] on the new field instead; if you meant to actually remove it, delete the field first.
+ --> tests/ui/dropped_names_existing_field.rs:6:12
+  |
+6 | pub struct Doc {
+  |            ^^^

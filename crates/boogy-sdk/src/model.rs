@@ -631,6 +631,7 @@ pub fn col_def_for_accum<T: Field>(
         counter,
         counter_max,
         default,
+        renamed_from: None,
     }
 }
 

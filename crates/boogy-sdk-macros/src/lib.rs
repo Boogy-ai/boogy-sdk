@@ -122,6 +122,25 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, LitStr};
 ///   read. A defaulted column also satisfies the not-null requirement, which
 ///   makes this the way to add a required field.
 ///
+/// - `#[renamed_from = "old_name"]` (field) — the column's previous name.
+///   A declaration diff can never tell a rename from a drop-plus-add apart —
+///   the two are textually identical and have opposite consequences for the
+///   data — so the platform never infers one; this is the ONLY way a rename
+///   is expressed. Lives on the field because the field still exists to
+///   carry it. Consumed by `schema_resolve::plan_column_reconcile`, which
+///   renames the live column in place instead of dropping the old name and
+///   adding the new one as empty.
+/// - `#[model(dropped("a", "b"))]` (struct) — columns this model has
+///   deliberately removed, repeatable-by-list rather than repeatable-by-verb.
+///   Lives on the model, not a field, because by the time a column is
+///   dropped there is no field left to annotate — this doubles as the record
+///   of what was removed, and an entry is deleted once that column has
+///   actually been purged from the live table. Emitted as `M::ALLOW_DROPPED`,
+///   the list `schema_resolve::plan_column_reconcile` checks before treating
+///   a missing column as an undeclared, accidental drop. Naming a column a
+///   field still declares is a compile error — if you meant a rename, use
+///   `#[renamed_from]` on the new field instead.
+///
 /// There is no field-level `#[unique]`. It existed, compiled, and enforced
 /// nothing — it set a column flag no write path reads, while emitting no index,
 /// so duplicate values were accepted silently by a model that had declared they
@@ -139,7 +158,7 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, LitStr};
 /// above. `#[counter]` is still *registered* below purely so the derive can
 /// reject it with that explanation rather than leaving rustc to say "cannot
 /// find attribute".
-#[proc_macro_derive(Model, attributes(model, pk, unique, index, covering_index, lookup_by, counter, default, belongs_to))]
+#[proc_macro_derive(Model, attributes(model, pk, unique, index, covering_index, lookup_by, counter, default, belongs_to, renamed_from))]
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand(input) {
@@ -171,6 +190,15 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // rather than a second list so both kinds share ONE name namespace — the
     // duplicate-name check below then covers them without knowing they differ.
     let mut struct_max_names: std::collections::HashSet<String> = Default::default();
+    // `#[model(dropped("a", "b"))]` — columns this model has deliberately
+    // removed. Lives on the model, not a field, because by the time a column
+    // is dropped there is no field left to hang the declaration on. Doubles
+    // as the record of what was removed: the developer deletes an entry once
+    // that column has actually been purged. Consumed by
+    // `schema_resolve::plan_column_reconcile` via the emitted `ALLOW_DROPPED`
+    // const, which is what lets that column vanish from `desired` without
+    // being read back as an accidental, undeclared drop.
+    let mut model_dropped: Vec<String> = Vec::new();
     // `list_by` order columns, resolved after the attribute loop so a
     // `counter`/`max` declared later in the same attribute still counts.
     let mut list_by_order_cols: Vec<String> = Vec::new();
@@ -442,6 +470,22 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 }
                 struct_max_names.insert(name.clone());
                 struct_counters.push(name);
+                Ok(())
+            } else if meta.path.is_ident("dropped") {
+                // dropped("legacy_note", "old_flag") — a bare, comma-separated
+                // list of column-name literals, not `key = value` pairs, so it
+                // is parsed off the raw token stream rather than through
+                // `parse_nested_meta` (which expects each item to be a `Meta`).
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let cols: syn::punctuated::Punctuated<LitStr, syn::Token![,]> =
+                    content.parse_terminated(|p| p.parse::<LitStr>(), syn::Token![,])?;
+                if cols.is_empty() {
+                    return Err(meta.error(
+                        "dropped(...) requires at least one column-name string literal",
+                    ));
+                }
+                model_dropped.extend(cols.into_iter().map(|c| c.value()));
                 Ok(())
             } else {
                 Err(meta.error("unknown model attribute"))
@@ -760,6 +804,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         default: Option<proc_macro2::TokenStream>,
         /// `#[belongs_to(Parent)]` — the parent type this column's value keys.
         belongs_to: Option<syn::Path>,
+        /// `#[renamed_from = "old"]` — the column's previous name, so the
+        /// reconciler can rename in place instead of reading a drop-plus-add.
+        renamed_from: Option<String>,
     }
 
     let mut field_infos: Vec<FieldInfo> = Vec::new();
@@ -775,6 +822,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         let mut lookup_by = false;
         let mut default: Option<proc_macro2::TokenStream> = None;
         let mut belongs_to: Option<syn::Path> = None;
+        let mut renamed_from: Option<String> = None;
         for attr in &f.attrs {
             if attr.path().is_ident("pk") {
                 deny_marker_args(attr, "pk", "")?;
@@ -895,6 +943,30 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                     }
                 }
                 default = Some(val);
+            } else if attr.path().is_ident("renamed_from") {
+                // #[renamed_from = "old_name"] — the ONLY way a rename is ever
+                // expressed. A declaration diff cannot tell a rename from a
+                // drop-plus-add (textually identical, opposite consequences
+                // for the data), so the platform never infers one; this
+                // annotation lives on the field because the field still
+                // exists to carry it.
+                let syn::Meta::NameValue(nv) = &attr.meta else {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "#[renamed_from = \"old_name\"] needs a string value, e.g. \
+                         #[renamed_from = \"title\"]",
+                    ));
+                };
+                let old = match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => s.value(),
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            other,
+                            "#[renamed_from] needs a string literal naming the old column",
+                        ))
+                    }
+                };
+                renamed_from = Some(old);
             } else if attr.path().is_ident("model") {
                 attr.parse_nested_meta(|m| {
                     if m.path.is_ident("column") {
@@ -927,6 +999,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
         field_infos.push(FieldInfo {
             ident, ty: f.ty.clone(), column, is_pk, index, covering, default, belongs_to,
+            renamed_from,
         });
     }
 
@@ -1075,6 +1148,28 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 }
             }
         }
+        // --- dropped(...) may never name a column a field still declares ----
+        //
+        // Declaring and dropping the same column is a contradiction: `dropped`
+        // exists precisely because the field is GONE, so if a field is still
+        // sitting right there, the developer meant something else (a real
+        // rename, which is `#[renamed_from]`) or made a mistake. Either way
+        // this is cheap to catch here and expensive to debug after a bad
+        // reconcile plan runs against a live table.
+        for name in &model_dropped {
+            if known(name) {
+                return Err(syn::Error::new_spanned(
+                    &struct_ident,
+                    format!(
+                        "#[model(dropped(\"{name}\"))] names column `{name}`, but a field \
+                         still declares it. `dropped(...)` is for columns with NO field left \
+                         — if you meant to rename it, use #[renamed_from = \"{name}\"] on the \
+                         new field instead; if you meant to actually remove it, delete the \
+                         field first."
+                    ),
+                ));
+            }
+        }
     }
 
     // --- column-name consts: `pub const FIELD: &str = "column";` ---
@@ -1161,11 +1256,16 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             },
             None => quote! { ::core::option::Option::None },
         };
+        let renamed = match &f.renamed_from {
+            Some(old) => quote! { ::core::option::Option::Some(#old.to_string()) },
+            None => quote! { ::core::option::Option::None },
+        };
         quote! {
             {
                 let mut __c =
                     ::boogy_sdk::model::col_def_for::<#ty>(#col, false, false, #default);
                 __c.references = #parent;
+                __c.renamed_from = #renamed;
                 __t.columns.push(__c);
             }
         }
@@ -1249,12 +1349,25 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         None => quote! { ::core::option::Option::None },
     };
 
+    let dropped_lits = model_dropped.iter().map(|s| quote! { #s });
+
     let expanded = quote! {
         impl #struct_ident {
             #(#const_defs)*
             #(#typed_cols)*
             #(#struct_counter_const_defs)*
             #(#struct_counter_typed_cols)*
+
+            /// Columns this model has deliberately removed. Declared with
+            /// `#[model(dropped("a", "b"))]` — named on the model rather than
+            /// a field because the field is gone; there is nothing left to
+            /// annotate. Consumed by
+            /// `boogy_sdk::schema_resolve::plan_column_reconcile` as the
+            /// `allow_dropped` list, so a missing column matching an entry
+            /// here reconciles as an intentional drop rather than an
+            /// undeclared one. Remove an entry once that column has actually
+            /// been purged from the live table.
+            pub const ALLOW_DROPPED: &'static [&'static str] = &[#(#dropped_lits),*];
         }
 
         impl ::boogy_sdk::model::Model for #struct_ident {
@@ -1262,6 +1375,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
             fn schema() -> ::boogy_sdk::store::Table {
                 let mut __t = ::boogy_sdk::store::Table::new(#table_name);
+                // Read from the emitted const rather than re-expanding the
+                // literals: `ALLOW_DROPPED` is the documented, user-visible
+                // name for this list, and two expansions of one attribute can
+                // disagree.
+                __t.allow_dropped = #struct_ident::ALLOW_DROPPED;
                 #(#col_pushes)*
                 #(#field_index_pushes)*
                 #(#struct_index_pushes)*
