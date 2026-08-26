@@ -987,7 +987,7 @@ macro_rules! wit_glue {
         ) -> $crate::store::ColumnInfo {
             let $bindings::boogy::platform::store::ColumnInfo {
                 name, col_type, nullable, unique, counter, counter_max, dropped,
-                has_references, default,
+                dropped_at, has_references, default,
             } = ci;
             $crate::store::ColumnInfo {
                 name,
@@ -1003,6 +1003,7 @@ macro_rules! wit_glue {
                 counter,
                 counter_max,
                 dropped,
+                dropped_at,
                 has_references,
                 default: default.as_ref().map(__boogy_wit_to_val),
             }

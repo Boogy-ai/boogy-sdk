@@ -862,7 +862,7 @@ mod tests {
     fn info(name: &str, ty: CT, nullable: bool) -> ColumnInfo {
         ColumnInfo {
             name: name.into(), col_type: ty, nullable, unique: false,
-            counter: false, counter_max: false, dropped: false,
+            counter: false, counter_max: false, dropped: false, dropped_at: None,
             has_references: false, default: None,
         }
     }

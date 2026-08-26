@@ -419,6 +419,10 @@ interface store {
         counter: bool,
         counter-max: bool,
         dropped: bool,
+        /// Epoch milliseconds of the drop, when `dropped` is true. `none` for
+        /// a live column, and for a column dropped before this field existed
+        /// (there is nothing to backfill it from).
+        dropped-at: option<s64>,
         has-references: bool,
         default: option<value>,
     }

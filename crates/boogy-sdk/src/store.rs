@@ -1036,6 +1036,9 @@ pub struct ColumnInfo {
     pub counter: bool,
     pub counter_max: bool,
     pub dropped: bool,
+    /// Epoch millis of the drop, when `dropped` is true. `None` for a live
+    /// column, and for a column dropped before this field existed.
+    pub dropped_at: Option<i64>,
     pub has_references: bool,
     pub default: Option<Val>,
 }
