@@ -6,7 +6,9 @@ use anyhow::Context;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use boogy_conventions::{counter_findings, lint_file, route_findings, Finding, Severity};
+use boogy_conventions::{
+    counter_findings, key_route_findings, lint_file, route_findings, Finding, Severity,
+};
 
 /// Recursively collect `*.rs` files under `root`, skipping build/output dirs.
 fn collect_rs_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -136,6 +138,10 @@ pub fn run(root: Option<&str>) -> anyhow::Result<()> {
     }
     findings.extend(route_findings(&sources));
     findings.extend(counter_findings(&sources));
+    // The mount comes from the manifest, not from the shape of the routes:
+    // a root-mounted service is free to group its own routes under `/api`,
+    // and inferring a mount from that flags correct code.
+    findings.extend(key_route_findings(&sources, routing_path(&root).as_deref()));
 
     report(&findings, sources.len());
     if findings.is_empty() && fe_errors.is_empty() {
@@ -238,6 +244,7 @@ const REPORT_GROUPS: &[(&str, &str)] = &[
     ("counter-field", "Retired `#[counter]` field attribute"),
     ("legacy-init-tables", "Legacy init_tables / hand-created index"),
     ("hardcoded-index-name", "Hardcoded index name in a cursor call"),
+    ("unmounted-key-routes", "API-key routes registered without the service's mount prefix"),
 ];
 
 fn report(findings: &[Finding], scanned: usize) {
@@ -319,4 +326,16 @@ mod fe_tests {
         assert!(errors[0].contains("missing.css"));
         assert_eq!(warnings.len(), 1, "app.ts ref → warn (serves .js)");
     }
+}
+
+/// The manifest's `[routing] path`, when this crate has a `boogy.toml`.
+///
+/// Deliberately tolerant: a missing, unreadable or malformed manifest yields
+/// `None`, and the checks that consult it then abstain. A conventions lint
+/// that started failing because a manifest could not be parsed would be
+/// reporting on the wrong thing.
+fn routing_path(root: &std::path::Path) -> Option<String> {
+    let raw = fs::read_to_string(root.join("boogy.toml")).ok()?;
+    let doc: toml::Value = raw.parse().ok()?;
+    doc.get("routing")?.get("path")?.as_str().map(str::to_string)
 }

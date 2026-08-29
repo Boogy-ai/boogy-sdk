@@ -412,11 +412,37 @@ macro_rules! api_keys_glue {
             /// `use crate::api_key_routes::ApiKeyRoutes;`. The guard for your
             /// own routes stays a separate `.group([api_key_routes::guard], …)`
             /// — which routes to gate is inherently per-service.
+            ///
+            /// # Mount prefix — the one way to get this wrong
+            ///
+            /// **A route path is the FULL external path, mount included.** The
+            /// host forwards the request with the manifest's `[routing] path`
+            /// still attached and does not strip it, so a service mounted at
+            /// `/board` registers `/board/rooms`, not `/rooms`.
+            ///
+            /// `with_api_key_routes()` is the one helper that does not follow
+            /// that rule for you: it mounts the LITERAL `/_keys`, which is
+            /// correct only for a service declaring `path = "/"`. Anywhere
+            /// else, use `with_api_key_routes_at("<your mount>/_keys")`.
+            ///
+            /// Getting it wrong is silent in every direction — the crate
+            /// compiles, the deploy succeeds, every other route serves, and
+            /// the four key endpoints 404 exactly like paths that were never
+            /// registered. `boogy check`'s `unmounted-key-routes` catches it
+            /// offline; this note is here because the call site is where the
+            /// decision is made.
             pub trait ApiKeyRoutes {
-                /// Mount the management endpoints at the conventional `/_keys`.
+                /// Mount the management endpoints at the literal `/_keys`.
+                ///
+                /// Correct **only when the service is mounted at `/`**. On any
+                /// other mount this registers a path the host will never route
+                /// to — see the trait docs above and reach for
+                /// [`ApiKeyRoutes::with_api_key_routes_at`] instead.
                 fn with_api_key_routes(self) -> Self;
-                /// Mount the management endpoints under a custom `prefix`
-                /// (e.g. `/admin/keys`). A trailing `/` is trimmed.
+                /// Mount the management endpoints under a custom `prefix`,
+                /// which must include the service's mount
+                /// (e.g. `/board/_keys`, or `/board/admin/keys`). A trailing
+                /// `/` is trimmed.
                 fn with_api_key_routes_at(self, prefix: &str) -> Self;
             }
 

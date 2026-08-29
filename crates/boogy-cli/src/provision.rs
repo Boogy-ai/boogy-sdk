@@ -272,6 +272,24 @@ pub async fn publish(
     let service_url = body.get("service_url").and_then(|u| u.as_str());
     if let Some(url) = service_url {
         println!("  URL: {url}");
+        // Printing a URL is a claim, so check it. A provisioned service whose
+        // hostname has no route at the edge answers from the ingress default
+        // backend — indistinguishable, from the author's side, from their own
+        // router being wrong. One probe turns hours of looking in the wrong
+        // place into a line of output.
+        if provisioned {
+            match crate::smoke::probe_reachable(url).await {
+                crate::smoke::Reachability::PlatformAnswered => {}
+                crate::smoke::Reachability::AnsweredByNonPlatform { status } => {
+                    println!("{}", crate::smoke::unreachable_advice(url));
+                    println!("\x20   (answered {status}, with no platform response header)");
+                }
+                crate::smoke::Reachability::Unreachable { detail } => {
+                    println!("{}", crate::smoke::unreachable_advice(url));
+                    println!("\x20   (connection failed: {detail})");
+                }
+            }
+        }
     }
 
     // Opt-in post-deploy smoke. Only meaningful once a service is actually

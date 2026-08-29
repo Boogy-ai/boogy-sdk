@@ -1378,6 +1378,35 @@ impl RouteSet {
     pub fn nest(self, prefix: &str, sub: Router) -> Self {
         Self(self.0.nest(prefix, sub))
     }
+
+    /// Mount an MCP server inside this group, so it carries the group's
+    /// guards. Same semantics as [`Router::mcp`].
+    ///
+    /// This exists because its absence had a security shape rather than an
+    /// ergonomic one. An MCP mount is usually the same data the REST routes
+    /// expose, so it belongs behind the same guard; without this method the
+    /// only spellings available were to move `.mcp(..)` out of the
+    /// `.group(..)` block — which silently **drops the guard** — or to wrap
+    /// it in a one-route sub-router via `nest`. The first is what an author
+    /// reaches for when the compiler rejects the obvious line, and nothing
+    /// afterwards reports that the endpoint became unguarded.
+    pub fn mcp<F, R>(self, path: &str, handler: F) -> Self
+    where
+        F: Fn(&mut Req<'_>) -> R + 'static,
+        R: IntoResponse,
+    {
+        Self(self.0.mcp(path, handler))
+    }
+
+    /// Mount a JSON-RPC dispatcher inside this group, so it carries the
+    /// group's guards. Same semantics as [`Router::rpc`], and present for
+    /// the same reason as [`RouteSet::mcp`] above.
+    pub fn rpc<F>(self, path: &str, build: F) -> Self
+    where
+        F: Fn() -> crate::rpc::Dispatcher + 'static,
+    {
+        Self(self.0.rpc(path, build))
+    }
 }
 
 // ─── Path joining (used by nest) + doc-path predicate ───────────────────────
@@ -2436,6 +2465,74 @@ mod tests {
         );
         // The MCP endpoint itself still dispatches (anonymous caller, unguarded)
         assert_eq!(r.handle(&req("OPTIONS", "/mcp")).status, 204);
+    }
+
+    /// `RouteSet::mcp` must actually carry the group's guards. The reason
+    /// this method exists is that its absence pushed authors to move
+    /// `.mcp(..)` OUT of the `.group(..)` block to get it to compile, which
+    /// silently unguards the endpoint — so the guard applying is the whole
+    /// contract, not an incidental property.
+    #[test]
+    fn mcp_inside_group_is_guarded() {
+        fn deny(_req: &mut Req<'_>) -> Result<(), response::HttpResponse> {
+            Err(response::HttpResponse { status: 401, headers: vec![], body: None })
+        }
+        fn mcp_handler(req: &mut Req<'_>) -> response::HttpResponse {
+            crate::mcp::McpServer::new("t", "1.0").handle(req.request)
+        }
+
+        let guarded = Router::new().group([deny as fn(&mut Req<'_>) -> _], |g| {
+            g.mcp("/mcp", mcp_handler)
+        });
+        // Probe with POST, not OPTIONS: the router answers a preflight 204
+        // ahead of the guard chain by design (a browser sends no credentials
+        // on a preflight), so OPTIONS cannot distinguish guarded from not.
+        assert_eq!(
+            guarded.handle(&req("POST", "/mcp")).status,
+            401,
+            "an MCP mount registered inside a group must run the group's guards"
+        );
+
+        // Control: the same mount outside the group is reachable, which is
+        // exactly the silent downgrade this method removes.
+        let unguarded = Router::new().mcp("/mcp", mcp_handler);
+        assert_ne!(unguarded.handle(&req("POST", "/mcp")).status, 401);
+    }
+
+    /// Same contract for `RouteSet::rpc`.
+    #[test]
+    fn rpc_inside_group_is_guarded() {
+        fn deny(_req: &mut Req<'_>) -> Result<(), response::HttpResponse> {
+            Err(response::HttpResponse { status: 401, headers: vec![], body: None })
+        }
+        let r = Router::new().group([deny as fn(&mut Req<'_>) -> _], |g| {
+            g.rpc("/rpc", crate::rpc::Dispatcher::new)
+        });
+        assert_eq!(r.handle(&req("POST", "/rpc")).status, 401);
+    }
+
+    /// A guarded MCP mount is hidden from an anonymous spec reader, the same
+    /// two-tier visibility every other guarded route gets. Registering it
+    /// through the group is what sets `guarded`, so this pins that the flag
+    /// travels with the method rather than being lost in the delegation.
+    #[test]
+    fn mcp_inside_group_is_hidden_from_anonymous_specs() {
+        fn deny(_req: &mut Req<'_>) -> Result<(), response::HttpResponse> {
+            Err(response::HttpResponse { status: 401, headers: vec![], body: None })
+        }
+        fn mcp_handler(req: &mut Req<'_>) -> response::HttpResponse {
+            crate::mcp::McpServer::new("t", "1.0").handle(req.request)
+        }
+        let r = Router::new()
+            .group([deny as fn(&mut Req<'_>) -> _], |g| g.mcp("/mcp", mcp_handler));
+
+        let resp = r.handle(&req("GET", "/openapi.json"));
+        assert_eq!(resp.status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&resp.body.unwrap()).unwrap();
+        assert!(
+            doc["paths"].get("/mcp").is_none(),
+            "a guarded MCP mount must not appear to an anonymous caller: {doc}"
+        );
     }
 
     // ─── Hardening sweep (spec-endpoints) ─────────────────────────────────

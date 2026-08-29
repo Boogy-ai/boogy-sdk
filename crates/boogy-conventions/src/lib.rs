@@ -21,6 +21,10 @@
 //!   6. counter-read-in-tx — a snapshot `<Counter>::get(` AND a `<Counter>::add(`
 //!                          for the SAME counter in one `tx(` body, without
 //!                          `// counter-read-display-only:`
+//!   7. unmounted-key-routes — bare `.with_api_key_routes()` on a service whose
+//!                          manifest `[routing] path` is not `/`, without
+//!                          `// root-mounted:`  (needs the manifest; see
+//!                          `key_route_findings`)
 
 /// Every `Finding::check` id this crate can emit.
 ///
@@ -40,6 +44,7 @@ pub const CHECKS: &[&str] = &[
     "counter-field",
     "legacy-init-tables",
     "hardcoded-index-name",
+    "unmounted-key-routes",
 ];
 
 /// `Hard` findings have no escape hatch; `Fail` findings can be suppressed with
@@ -217,6 +222,66 @@ pub fn lint_file(file: &str, src: &str) -> Vec<Finding> {
 
     // 5. multi-write handlers without a transaction.
     out.extend(multi_write_findings(file, src));
+    out
+}
+
+/// Check 8: `.with_api_key_routes()` mounts the LITERAL `/_keys`, but the host
+/// forwards every request with the manifest's `[routing] path` still attached
+/// and never strips it. On any service not mounted at `/`, the four key
+/// endpoints therefore answer nothing.
+///
+/// This is worth a gate rather than a doc line because every signal points the
+/// wrong way: the crate compiles, `boogy deploy` succeeds, the service serves
+/// its other routes perfectly, and the key endpoints 404 exactly like a path
+/// that was never registered. The author's own routes all carry the prefix —
+/// this one helper is the only place the convention is broken FOR them, so it
+/// is also the last place they will look.
+///
+/// `routing_path` is the manifest's `[routing] path`. It is a **parameter**
+/// rather than something inferred from the source because the obvious
+/// inference is wrong: "the routes have more than one segment, so there must
+/// be a mount" flags a root-mounted service that merely groups its routes
+/// under `/api`, which is `shortlinks` and is perfectly correct. A false
+/// positive on a correct example is how a check gets switched off, so this one
+/// asks the manifest or says nothing: `None` (no manifest available, as when
+/// the builder MCP is handed bare file contents) yields no findings.
+pub fn key_route_findings(files: &[(String, String)], routing_path: Option<&str>) -> Vec<Finding> {
+    let mut out = Vec::new();
+
+    // A service that owns the whole owner subtree has no prefix to carry, so
+    // the bare helper is correct there.
+    let Some(mount) = routing_path else { return out };
+    let mount = mount.trim_end_matches('/');
+    if mount.is_empty() {
+        return out;
+    }
+
+    for (file, src) in files {
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(".with_api_key_routes()") {
+                continue;
+            }
+            if marked_with_reason(&lines, i, "// root-mounted:") {
+                continue;
+            }
+            out.push(Finding {
+                check: "unmounted-key-routes",
+                severity: Severity::Fail,
+                file: file.clone(),
+                line: i + 1,
+                message: format!(
+                    "`with_api_key_routes()` registers the literal `/_keys`, but this service \
+                     is mounted at `{mount}` — every key request would 404. Use \
+                     `with_api_key_routes_at(\"{mount}/_keys\")`."
+                ),
+                hint: "Route paths are the FULL external path: the host forwards the manifest's \
+                       `[routing] path` and does not strip it, so the key endpoints need the same \
+                       prefix as your other routes. Mark `// root-mounted: <reason>` only when the \
+                       manifest declares `path = \"/\"` (boogy:boogy-auth).",
+            });
+        }
+    }
     out
 }
 
@@ -1099,4 +1164,76 @@ mod tests {
         assert!(!lint_file("lib.rs", "let t = Table::new(\"x\");").is_empty());
     }
 
+
+    // ── Check 8: api-key routes vs the mount prefix ──────────────────────
+
+    fn one(src: &str) -> Vec<(String, String)> {
+        vec![("lib.rs".to_string(), src.to_string())]
+    }
+
+    /// The trap this check exists for: the manifest mounts the service at
+    /// `/board`, the key helper ignores that, and nothing else notices.
+    #[test]
+    fn bare_key_routes_on_a_mounted_service_are_flagged() {
+        let f = key_route_findings(
+            &one(".with_api_key_routes()\n.get(\"/board/rooms\", list_rooms)"),
+            Some("/board"),
+        );
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.contains("/board"), "{}", f[0].message);
+        assert!(f[0].message.contains("with_api_key_routes_at(\"/board/_keys\")"), "{}", f[0].message);
+    }
+
+    /// `shortlinks` in this repo: `path = "/"`, routes grouped under `/api`,
+    /// bare helper — and entirely correct. The first version of this check
+    /// inferred the mount from route shape and flagged it, which is exactly
+    /// the false positive that gets a check switched off.
+    #[test]
+    fn a_root_mounted_service_with_nested_routes_is_not_flagged() {
+        for mount in ["/", ""] {
+            assert!(
+                key_route_findings(
+                    &one(".with_api_key_routes()\n.get(\"/api/links\", list_links)"),
+                    Some(mount),
+                )
+                .is_empty(),
+                "mount {mount:?} owns the whole subtree — the bare form is correct"
+            );
+        }
+    }
+
+    /// With no manifest to consult the check says nothing rather than guessing.
+    #[test]
+    fn without_a_manifest_the_check_abstains() {
+        assert!(key_route_findings(
+            &one(".with_api_key_routes()\n.get(\"/board/rooms\", list_rooms)"),
+            None,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_explicit_at_form_is_never_flagged() {
+        assert!(key_route_findings(
+            &one(".with_api_key_routes_at(\"/board/_keys\")"),
+            Some("/board"),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_root_mounted_marker_suppresses_it() {
+        let src = "// root-mounted: boogy.toml declares path = \"/\"\n.with_api_key_routes()";
+        assert!(key_route_findings(&one(src), Some("/board")).is_empty());
+    }
+
+    /// Mutation control: a check that fires on everything would pass the
+    /// positive test above while being useless.
+    #[test]
+    fn a_service_without_key_routes_is_silent() {
+        assert!(
+            key_route_findings(&one(".get(\"/board/rooms\", list_rooms)"), Some("/board"))
+                .is_empty()
+        );
+    }
 }

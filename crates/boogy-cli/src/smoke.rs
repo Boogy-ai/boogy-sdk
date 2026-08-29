@@ -637,4 +637,133 @@ mod tests {
         );
         assert!(found.is_none());
     }
+
+    // ── Edge reachability ────────────────────────────────────────────────
+
+    /// The platform's own header is the signal, not the status code. A 403
+    /// from an `authenticated` service is a REACHABLE service — treating it
+    /// as a failure would fire the operator warning on every correct
+    /// private deploy, which is how a warning gets ignored.
+    #[test]
+    fn any_status_from_the_platform_counts_as_reachable() {
+        for status in [200, 301, 401, 403, 404, 500] {
+            assert_eq!(
+                crate::smoke::classify_probe(status, true),
+                crate::smoke::Reachability::PlatformAnswered,
+                "status {status} carried the platform header"
+            );
+        }
+    }
+
+    /// The failure this exists to name: the ingress default backend answers a
+    /// clean 404 that looks exactly like a service routing bug.
+    #[test]
+    fn a_404_without_the_platform_header_is_an_edge_gap() {
+        assert_eq!(
+            crate::smoke::classify_probe(404, false),
+            crate::smoke::Reachability::AnsweredByNonPlatform { status: 404 }
+        );
+    }
+
+    /// Even a 200 from something that is not the platform is an edge gap —
+    /// a parked page or a captive portal must not read as success.
+    #[test]
+    fn a_200_without_the_platform_header_is_still_an_edge_gap() {
+        assert_eq!(
+            crate::smoke::classify_probe(200, false),
+            crate::smoke::Reachability::AnsweredByNonPlatform { status: 200 }
+        );
+    }
+
+    #[test]
+    fn the_advice_points_away_from_the_service_code() {
+        let a = crate::smoke::unreachable_advice("https://alice.boogy.app/todos");
+        assert!(a.contains("https://alice.boogy.app/todos"));
+        assert!(a.contains("/logs"), "must name the decisive check: {a}");
+        assert!(
+            a.contains("not something to debug in your service code"),
+            "the whole point is to redirect the search: {a}"
+        );
+    }
+}
+
+// ─── Edge reachability ──────────────────────────────────────────────────────
+
+/// What a reachability probe of the printed service URL found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reachability {
+    /// The platform answered — the request reached the host. Any HTTP status
+    /// counts, including 401/403: an `authenticated` service refusing a
+    /// control-plane token has still proved that routing works.
+    PlatformAnswered,
+    /// Something answered, but it was not the platform. Almost always the
+    /// ingress controller's default backend, i.e. no route exists for this
+    /// host yet.
+    AnsweredByNonPlatform { status: u16 },
+    /// The connection or TLS handshake failed — no route and no certificate
+    /// for this host.
+    Unreachable { detail: String },
+}
+
+/// Classify a response by whether the platform produced it.
+///
+/// `x-boogy-deployment-id` rides every response the host emits, so its
+/// presence is a positive signal that the request was routed all the way in.
+/// Its absence means the bytes came from something else in the path.
+pub fn classify_probe(status: u16, has_deployment_header: bool) -> Reachability {
+    if has_deployment_header {
+        Reachability::PlatformAnswered
+    } else {
+        Reachability::AnsweredByNonPlatform { status }
+    }
+}
+
+/// The operator-facing explanation for a URL that is not being served.
+///
+/// This message exists because the failure is otherwise unattributable. The
+/// control plane reports the service healthy, the deploy prints a URL, and the
+/// URL answers a 404 that looks exactly like a bug in the service's own
+/// routing — so the first hours go into re-reading the router, which is the one
+/// place the problem is not.
+pub fn unreachable_advice(url: &str) -> String {
+    format!(
+        "  ⚠ {url} did not answer from the platform.
+             The deployment itself is fine — the control plane has it provisioned — but
+             nothing reaching that hostname is routed to it, so no request has arrived
+             at your service.
+             This is not something to debug in your service code. A placeholder TLS
+             certificate on that host, or a 404 carrying no platform response header,
+             is the same symptom. Confirm it with:
+               boogy list
+               curl -H \"Authorization: Bearer $BOOGY_TOKEN\" <host>/v1/services/<id>/logs
+             Zero log lines means the service has never executed — report the URL as
+             unreachable rather than redeploying."
+    )
+}
+
+/// Probe the deployed URL and report whether the platform answered.
+///
+/// Deliberately tolerant: a redirect, a 401, a 403 and a 404 *from the host*
+/// are all successes for this question. Only "the platform never saw it" is a
+/// failure, because that is the one condition the author cannot diagnose from
+/// their own code.
+pub async fn probe_reachable(url: &str) -> Reachability {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Reachability::Unreachable { detail: e.to_string() },
+    };
+    match client.get(url).send().await {
+        Ok(resp) => classify_probe(
+            resp.status().as_u16(),
+            resp.headers().contains_key("x-boogy-deployment-id"),
+        ),
+        Err(e) => Reachability::Unreachable {
+            // The TLS/connect cause is the actionable half — a hostname
+            // mismatch here names a missing certificate directly.
+            detail: e.to_string(),
+        },
+    }
 }
