@@ -153,6 +153,7 @@ macro_rules! wit_glue {
         use $bindings::boogy::platform::background_jobs as jobs_bindings;
         #[allow(unused_imports)]
         use $bindings::boogy::platform::websockets as ws_bindings;
+        use $bindings::boogy::platform::files as files_bindings;
         #[allow(unused_imports)]
         use $crate::json::{self, Deserialize, Serialize};
         #[allow(unused_imports)]
@@ -5721,6 +5722,144 @@ macro_rules! wit_glue {
                     $crate::jobs::JobStatusInfo::Cancelled
                 }
             }
+        }
+
+        // -- Files bridging --
+        //
+        // Same shape as websockets: clean SDK types in, WIT types out. The
+        // capability gate is host-side — with `[capabilities] files = false`
+        // every call returns CapabilityDenied.
+        //
+        // NOTE the WIT function is `list-files`, not `list`: `list` is a
+        // reserved WIT keyword. Authors still write `files_list`.
+
+        fn __files_error_to_sdk(
+            e: files_bindings::FilesError,
+        ) -> $crate::files::FilesError {
+            use $crate::files::FilesError as E;
+            match e {
+                files_bindings::FilesError::CapabilityDenied => E::CapabilityDenied,
+                files_bindings::FilesError::UnknownCollection(c) => E::UnknownCollection(c),
+                files_bindings::FilesError::NotFound => E::NotFound,
+                files_bindings::FilesError::TooLarge(n) => E::TooLarge(n),
+                files_bindings::FilesError::UnsupportedContentType(c) => {
+                    E::UnsupportedContentType(c)
+                }
+                files_bindings::FilesError::QuotaExceeded => E::QuotaExceeded,
+                files_bindings::FilesError::NotReady => E::NotReady,
+                files_bindings::FilesError::InvalidKey(m) => E::InvalidKey(m),
+                files_bindings::FilesError::RateLimited => E::RateLimited,
+                files_bindings::FilesError::DeniedInTransaction => E::DeniedInTransaction,
+                files_bindings::FilesError::Internal(m) => E::Internal(m),
+            }
+        }
+
+        fn __files_info_to_sdk(i: files_bindings::FileInfo) -> $crate::files::FileInfo {
+            $crate::files::FileInfo {
+                key: i.key,
+                collection: i.collection,
+                size: i.size,
+                content_type: i.content_type,
+                owner: i.owner,
+                created_at_millis: i.created_at_millis,
+                ready: i.ready,
+            }
+        }
+
+        fn files_create_upload(
+            collection: &str,
+            options: $crate::files::Upload,
+        ) -> ::core::result::Result<$crate::files::UploadTicket, $crate::files::FilesError> {
+            let wit = files_bindings::UploadOptions {
+                key: options.key,
+                content_type: options.content_type,
+                owner: options.owner,
+                ttl_seconds: options.ttl_seconds,
+                size_hint: options.size_hint,
+            };
+            match files_bindings::create_upload(&collection.to_string(), &wit) {
+                Ok(t) => Ok($crate::files::UploadTicket {
+                    url: t.url,
+                    method: t.method,
+                    headers: t.headers,
+                    key: t.key,
+                    expires_at_millis: t.expires_at_millis,
+                }),
+                Err(e) => Err(__files_error_to_sdk(e)),
+            }
+        }
+
+        fn files_stat(
+            collection: &str,
+            key: &str,
+        ) -> ::core::result::Result<$crate::files::FileInfo, $crate::files::FilesError> {
+            match files_bindings::stat(&collection.to_string(), &key.to_string()) {
+                Ok(i) => Ok(__files_info_to_sdk(i)),
+                Err(e) => Err(__files_error_to_sdk(e)),
+            }
+        }
+
+        fn files_list(
+            collection: &str,
+            owner: Option<&str>,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> ::core::result::Result<$crate::files::FilePage, $crate::files::FilesError> {
+            match files_bindings::list_files(
+                &collection.to_string(),
+                owner.map(|o| o.to_string()).as_ref().map(|o| o.as_str()),
+                cursor.map(|c| c.to_string()).as_ref().map(|c| c.as_str()),
+                limit,
+            ) {
+                Ok(p) => Ok($crate::files::FilePage {
+                    files: p.files.into_iter().map(__files_info_to_sdk).collect(),
+                    next_cursor: p.next_cursor,
+                }),
+                Err(e) => Err(__files_error_to_sdk(e)),
+            }
+        }
+
+        fn files_delete(
+            collection: &str,
+            key: &str,
+        ) -> ::core::result::Result<(), $crate::files::FilesError> {
+            files_bindings::delete(&collection.to_string(), &key.to_string())
+                .map_err(__files_error_to_sdk)
+        }
+
+        /// Mint a URL for a client. Call this at RENDER time; never store it.
+        fn files_url(
+            collection: &str,
+            key: &str,
+            ttl_seconds: Option<u32>,
+        ) -> ::core::result::Result<String, $crate::files::FilesError> {
+            files_bindings::url(&collection.to_string(), &key.to_string(), ttl_seconds)
+                .map_err(__files_error_to_sdk)
+        }
+
+        fn files_put_bytes(
+            collection: &str,
+            key: &str,
+            content_type: &str,
+            bytes: &[u8],
+        ) -> ::core::result::Result<$crate::files::FileInfo, $crate::files::FilesError> {
+            match files_bindings::put_bytes(
+                &collection.to_string(),
+                &key.to_string(),
+                &content_type.to_string(),
+                bytes,
+            ) {
+                Ok(i) => Ok(__files_info_to_sdk(i)),
+                Err(e) => Err(__files_error_to_sdk(e)),
+            }
+        }
+
+        fn files_read_bytes(
+            collection: &str,
+            key: &str,
+        ) -> ::core::result::Result<Vec<u8>, $crate::files::FilesError> {
+            files_bindings::read_bytes(&collection.to_string(), &key.to_string())
+                .map_err(__files_error_to_sdk)
         }
 
         // -- Websockets bridging --

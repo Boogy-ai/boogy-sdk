@@ -598,6 +598,43 @@ impl From<RpcError> for ApiError {
 /// log stream (request-correlated, owner-visible) so the developer
 /// debugging the service loses nothing. Handlers wanting a specific
 /// response can still match the variant before `?`.
+/// A files failure renders straight to HTTP.
+///
+/// Deliberately unlike `PublishError`, which does NOT convert: a websocket
+/// publish failure has no obvious status, while every files error does. This
+/// is what makes a bare `?` work on a files call inside a handler, which the
+/// `files` module's docs promise.
+///
+/// The two arms that are the SERVICE's own misconfiguration rather than the
+/// caller's fault are logged and rendered as 500 — the same treatment
+/// `PeerError::CapabilityDenied` gets, and for the same reason: a client can
+/// do nothing about a manifest that does not grant the capability, so telling
+/// them "403" would send them looking for credentials they do not need.
+impl From<crate::files::FilesError> for ApiError {
+    fn from(e: crate::files::FilesError) -> Self {
+        use crate::files::FilesError as F;
+        match &e {
+            F::CapabilityDenied | F::UnknownCollection(_) => {
+                crate::log::error!("files call misconfigured: {e} -> returned to client as 500");
+                ApiError::internal("file storage is not configured for this service")
+            }
+            F::Internal(m) => {
+                crate::log::error!("files call failed: {m}");
+                ApiError::internal("file storage error")
+            }
+            _ => ApiError {
+                kind: "/errors/file_storage".to_string(),
+                title: "File storage error".to_string(),
+                status: e.status(),
+                detail: Some(e.to_string()),
+                errors: Default::default(),
+                cause: None,
+                retry_after_secs: None,
+            },
+        }
+    }
+}
+
 impl From<crate::peer::PeerError> for ApiError {
     fn from(e: crate::peer::PeerError) -> Self {
         use crate::peer::PeerError as P;

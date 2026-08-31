@@ -1,0 +1,110 @@
+package boogy:platform@0.1.0;
+
+/// Large-object storage: files and static assets.
+///
+/// The component creates upload tickets, reads and writes metadata, and mints
+/// access URLs. All byte movement for real files happens on host-owned routes
+/// the component is never invoked for — so serving a file costs no compute
+/// and no instance-pool slot.
+///
+/// The only exceptions are `put-bytes` / `read-bytes`, which are hard-capped
+/// (`BOOGY_FILES_INLINE_MAX_BYTES`) and exist for small generated files:
+/// exports, thumbnails, parsing an uploaded CSV.
+interface files {
+    /// What the host knows about one stored file.
+    record file-info {
+        key: string,
+        collection: string,
+        size: u64,
+        content-type: string,
+        /// Set on principal-scoped collections.
+        owner: option<string>,
+        created-at-millis: u64,
+        /// False while an upload ticket is outstanding and the bytes have not
+        /// been observed. A file that is not ready does not serve.
+        ready: bool,
+    }
+
+    record upload-options {
+        /// Omit to have the host mint a collision-free, non-enumerable key.
+        /// Supplying one is the escape hatch, and it is validated.
+        key: option<string>,
+        content-type: option<string>,
+        /// Defaults to the calling request's principal.
+        owner: option<string>,
+        ttl-seconds: option<u32>,
+        /// Declared size, used to reserve quota and choose the transport.
+        size-hint: option<u64>,
+    }
+
+    record upload-ticket {
+        /// OPAQUE to the caller: either a host-owned route or a presigned
+        /// storage URL. The host chooses by declared size. Pass it to the
+        /// client unmodified — do not parse it, and do not store it.
+        url: string,
+        method: string,
+        headers: list<tuple<string, string>>,
+        key: string,
+        expires-at-millis: u64,
+    }
+
+    record file-page {
+        files: list<file-info>,
+        next-cursor: option<string>,
+    }
+
+    variant files-error {
+        capability-denied,
+        unknown-collection(string),
+        not-found,
+        /// Carries the collection's limit so the caller can report it.
+        too-large(u64),
+        unsupported-content-type(string),
+        quota-exceeded,
+        not-ready,
+        invalid-key(string),
+        rate-limited,
+        /// `put-bytes` / `delete` attempted inside an open transaction. A
+        /// transaction body is re-runnable, so it may hold no irreversible
+        /// external effect. Does NOT poison the transaction.
+        denied-in-transaction,
+        internal(string),
+    }
+
+    /// Create an upload. Writes a pending record and returns everything the
+    /// client needs to send the bytes. One call, whichever transport the host
+    /// picks.
+    create-upload: func(collection: string, options: upload-options)
+        -> result<upload-ticket, files-error>;
+
+    /// Metadata for one file. Never returns bytes.
+    stat: func(collection: string, key: string) -> result<file-info, files-error>;
+
+    /// One bounded page, newest first. `owner` filters to a principal.
+    list-files: func(collection: string, owner: option<string>, cursor: option<string>,
+               limit: u32) -> result<file-page, files-error>;
+
+    /// Remove a file and release its bytes. Immediate and permanent — files
+    /// are data, not schema, so this is not a soft drop and a deployment
+    /// rollback does not bring the bytes back.
+    delete: func(collection: string, key: string) -> result<_, files-error>;
+
+    /// A URL to hand a client. Public collection -> a permanent URL.
+    /// Otherwise -> a short-lived grant URL.
+    ///
+    /// Mint this at render time. Never store the result: it expires, and a
+    /// stored URL is the single most common way to get object storage wrong.
+    /// Store the collection and key instead.
+    url: func(collection: string, key: string, ttl-seconds: option<u32>)
+        -> result<string, files-error>;
+
+    /// Write a small file directly. Above the platform inline cap this
+    /// returns `too-large`, so the mistake surfaces in development rather
+    /// than as a memory blowup in production.
+    put-bytes: func(collection: string, key: string, content-type: string,
+                    bytes: list<u8>) -> result<file-info, files-error>;
+
+    /// Read a small file directly. Same cap, same reason.
+    read-bytes: func(collection: string, key: string)
+        -> result<list<u8>, files-error>;
+}
