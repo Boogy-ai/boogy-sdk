@@ -54,9 +54,13 @@ enum Commands {
         /// a warning, never a failure). Frontend deployments only.
         #[arg(long)]
         smoke: bool,
-        /// CSS selector expected to render non-empty content (smoke).
-        #[arg(long, default_value = "#app")]
+        /// CSS selector(s) expected to render non-empty content (smoke).
+        /// Comma-separated; the page passes if any one matches.
+        #[arg(long, default_value = "#app,#root,#__next")]
         smoke_selector: String,
+        /// Path under the service mount to load (smoke). Default the mount root.
+        #[arg(long, default_value = "/")]
+        smoke_path: String,
         /// Render-wait budget in milliseconds (smoke).
         #[arg(long, default_value_t = 10_000)]
         smoke_timeout: u64,
@@ -76,9 +80,13 @@ enum Commands {
         /// `deploy --smoke`.
         #[arg(long)]
         smoke: bool,
-        /// CSS selector expected to render non-empty content (smoke).
-        #[arg(long, default_value = "#app")]
+        /// CSS selector(s) expected to render non-empty content (smoke).
+        /// Comma-separated; the page passes if any one matches.
+        #[arg(long, default_value = "#app,#root,#__next")]
         smoke_selector: String,
+        /// Path under the service mount to load (smoke). Default the mount root.
+        #[arg(long, default_value = "/")]
+        smoke_path: String,
         /// Render-wait budget in milliseconds (smoke).
         #[arg(long, default_value_t = 10_000)]
         smoke_timeout: u64,
@@ -193,12 +201,14 @@ async fn main() -> anyhow::Result<()> {
             replace,
             smoke,
             smoke_selector,
+            smoke_path,
             smoke_timeout,
         } => {
             let token = resolve_token(&cli.token)?;
             let smoke_opts = smoke::SmokeOptions {
                 enabled: smoke,
                 selector: smoke_selector,
+                path: smoke_path,
                 timeout_ms: smoke_timeout,
             };
             deploy::run(&cli.host, &token, &manifest, replace, smoke_opts).await?
@@ -209,12 +219,14 @@ async fn main() -> anyhow::Result<()> {
             replace,
             smoke,
             smoke_selector,
+            smoke_path,
             smoke_timeout,
         } => {
             let token = resolve_token(&cli.token)?;
             let smoke_opts = smoke::SmokeOptions {
                 enabled: smoke,
                 selector: smoke_selector,
+                path: smoke_path,
                 timeout_ms: smoke_timeout,
             };
             provision::publish(&cli.host, &token, &manifest, provision, replace, smoke_opts).await?
@@ -343,12 +355,13 @@ mod tests {
     /// `deploy --smoke` flags: defaults present, overrides parsed.
     #[test]
     fn deploy_smoke_flags_parse() {
-        // Default: smoke off, selector `#app`, timeout 10000.
+        // Default: smoke off, the three common app roots, mount root, 10000ms.
         let cli = Cli::try_parse_from(["boogy", "deploy", "app.boogy.toml"]).expect("parse");
         match cli.command {
-            Commands::Deploy { smoke, smoke_selector, smoke_timeout, .. } => {
+            Commands::Deploy { smoke, smoke_selector, smoke_path, smoke_timeout, .. } => {
                 assert!(!smoke, "smoke must default off (explicit opt-in)");
-                assert_eq!(smoke_selector, "#app");
+                assert_eq!(smoke_selector, "#app,#root,#__next");
+                assert_eq!(smoke_path, "/");
                 assert_eq!(smoke_timeout, 10_000);
             }
             other => panic!("expected Deploy, got {other:?}"),
@@ -361,9 +374,10 @@ mod tests {
         ])
         .expect("parse");
         match cli.command {
-            Commands::Deploy { smoke, smoke_selector, smoke_timeout, .. } => {
+            Commands::Deploy { smoke, smoke_selector, smoke_path, smoke_timeout, .. } => {
                 assert!(smoke);
                 assert_eq!(smoke_selector, "#root");
+                assert_eq!(smoke_path, "/");
                 assert_eq!(smoke_timeout, 20_000);
             }
             other => panic!("expected Deploy, got {other:?}"),
@@ -381,7 +395,7 @@ mod tests {
             Commands::Publish { provision, smoke, smoke_selector, .. } => {
                 assert!(provision);
                 assert!(smoke);
-                assert_eq!(smoke_selector, "#app");
+                assert_eq!(smoke_selector, "#app,#root,#__next");
             }
             other => panic!("expected Publish, got {other:?}"),
         }

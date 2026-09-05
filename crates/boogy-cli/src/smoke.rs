@@ -144,15 +144,25 @@ impl SmokeReport {
 pub struct SmokeOptions {
     /// `--smoke`: run the smoke at all.
     pub enabled: bool,
-    /// `--smoke-selector`: the element expected to render non-empty.
+    /// `--smoke-selector`: comma-separated selectors; the page passes if any
+    /// one matches an element that has rendered non-empty content.
     pub selector: String,
+    /// `--smoke-path`: path under the service mount to load. `/` is the mount
+    /// root; a nested value checks a prerendered or deep client route, which is
+    /// where the mount root passing proves the least.
+    pub path: String,
     /// `--smoke-timeout`: render-wait budget in milliseconds.
     pub timeout_ms: u64,
 }
 
 impl Default for SmokeOptions {
     fn default() -> Self {
-        Self { enabled: false, selector: "#app".to_string(), timeout_ms: 10_000 }
+        Self {
+            enabled: false,
+            selector: "#app,#root,#__next".to_string(),
+            path: "/".to_string(),
+            timeout_ms: 10_000,
+        }
     }
 }
 
@@ -233,11 +243,13 @@ pub async fn run_post_deploy_smoke(
             return Ok(());
         }
     };
+    let url = format!("{}{}", url, opts.path.trim_start_matches('/'));
     println!("  Smoke: loading {url} via {} ...", browser.display());
+    let selectors = parse_selectors(&opts.selector);
     let report = run_smoke(
         &browser,
         &url,
-        &opts.selector,
+        &selectors,
         Duration::from_millis(opts.timeout_ms),
     )
     .await?;
@@ -261,18 +273,44 @@ fn origin_of(url: &str) -> Option<String> {
     Some(url[..authority_start + host_len].to_string())
 }
 
-/// JS expression that returns `true` when the target selector (or `body`) has
-/// rendered non-empty content. The selector is JSON-encoded to neutralize
-/// quotes.
-fn render_probe_js(selector: &str) -> String {
-    let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"#app\"".to_string());
+/// Split a comma-separated `--smoke-selector` value into individual selectors,
+/// dropping empties so a trailing comma cannot produce a `""` selector that can
+/// never match.
+fn parse_selectors(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// JS expression that returns `true` when at least one of `selectors` matches an
+/// element AND that element has rendered non-empty content.
+///
+/// There is deliberately **no `document.body` fallback**. The previous probe
+/// read `querySelector(sel) || document.body`, so a selector that matched
+/// nothing silently degraded into "did any HTML render at all" — which a blank
+/// SPA shell (`<div id="root"></div><script>`) passes. A smoke that passes a
+/// blank page is worse than a skipped one, because it is believed. To check the
+/// body, ask for it: `--smoke-selector body`.
+///
+/// Each selector is JSON-encoded to neutralize quotes.
+fn render_probe_js(selectors: &[String]) -> String {
+    let list = selectors
+        .iter()
+        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "\"#app\"".to_string()))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         r#"(() => {{
-  const el = document.querySelector({sel}) || document.body;
-  if (!el) return false;
-  const text = ((el.innerText || el.textContent) || "").trim();
-  const kids = el.children ? el.children.length : 0;
-  return text.length > 0 || kids > 0;
+  for (const sel of [{list}]) {{
+    const el = document.querySelector(sel);
+    if (!el) continue;
+    const text = ((el.innerText || el.textContent) || "").trim();
+    const kids = el.children ? el.children.length : 0;
+    if (text.length > 0 || kids > 0) return true;
+  }}
+  return false;
 }})()"#
     )
 }
@@ -282,12 +320,12 @@ fn render_probe_js(selector: &str) -> String {
 ///
 /// Launches the browser at `browser` (headless, no-sandbox), subscribes to the
 /// CDP console/exception/network event streams, navigates, waits up to
-/// `timeout` for `selector` (or `body`) to have non-empty content, then collects
+/// `timeout` for any of `selectors` to have non-empty content, then collects
 /// the captured signals. The browser process is closed on exit.
 pub async fn run_smoke(
     browser: &Path,
     url: &str,
-    selector: &str,
+    selectors: &[String],
     timeout: Duration,
 ) -> anyhow::Result<SmokeReport> {
     let config = BrowserConfig::builder()
@@ -378,7 +416,7 @@ pub async fn run_smoke(
 
         // Navigate and wait (bounded) for content to render.
         page.goto(url).await.context("navigating to deployed URL")?;
-        let probe = render_probe_js(selector);
+        let probe = render_probe_js(selectors);
         let deadline = Instant::now() + timeout;
         let mut rendered = false;
         while Instant::now() < deadline {
@@ -403,8 +441,9 @@ pub async fn run_smoke(
         let mut failures = Vec::new();
         if !rendered {
             failures.push(format!(
-                "page did not render non-empty content (selector `{selector}`) within {}ms",
-                timeout.as_millis()
+                "no selector rendered non-empty content within {}ms (tried: {})",
+                timeout.as_millis(),
+                selectors.join(", ")
             ));
         }
         let ok = rendered && console_errors.is_empty() && failed_requests.is_empty();
@@ -533,12 +572,41 @@ mod tests {
     }
 
     #[test]
-    fn render_probe_js_embeds_escaped_selector() {
-        let js = render_probe_js("#app");
-        assert!(js.contains("\"#app\""), "selector should be JSON-encoded: {js}");
-        // a selector with a quote must not break out of the JS string literal.
-        let js = render_probe_js("a[title=\"x\"]");
+    fn probe_does_not_fall_back_to_body() {
+        // The old probe read `querySelector(sel) || document.body`, so a
+        // selector matching nothing degraded into "did anything render at all",
+        // which a blank SPA shell passes. A missing selector must FAIL.
+        let js = render_probe_js(&["#app".to_string()]);
+        assert!(
+            !js.contains("document.body"),
+            "probe must not fall back to body:\n{js}"
+        );
+    }
+
+    #[test]
+    fn parse_selectors_splits_and_trims() {
+        assert_eq!(
+            parse_selectors("#app, #root ,#__next"),
+            vec!["#app".to_string(), "#root".to_string(), "#__next".to_string()]
+        );
+        // A single selector is still a one-element list.
+        assert_eq!(parse_selectors("#root"), vec!["#root".to_string()]);
+        // Empty entries are dropped rather than becoming an always-failing "".
+        assert_eq!(parse_selectors("#app,,"), vec!["#app".to_string()]);
+    }
+
+    #[test]
+    fn probe_embeds_every_selector_escaped() {
+        let js = render_probe_js(&["#app".to_string(), "a[title=\"x\"]".to_string()]);
+        assert!(js.contains("\"#app\""), "first selector missing: {js}");
         assert!(js.contains(r#""a[title=\"x\"]""#), "quotes must be escaped: {js}");
+    }
+
+    #[test]
+    fn default_selector_covers_the_common_app_roots() {
+        let d = SmokeOptions::default();
+        assert_eq!(d.selector, "#app,#root,#__next");
+        assert_eq!(d.path, "/");
     }
 
     /// Browser-gated end-to-end smoke (like the live-Redis tests): runs only
@@ -576,6 +644,17 @@ mod tests {
                             "<!doctype html><html><body><div id=\"app\"></div>\
                              <script>console.error(\"kaboom\"); fetch(\"/missing-asset.js\");\
                              throw new Error(\"render boom\");</script></body></html>".into()),
+                        // A blank framework app: the bundle never ran, so #root
+                        // is empty and #app does not exist at all. Under the old
+                        // `|| document.body` probe the render check returned
+                        // TRUE here (<body> has children), so nothing recorded a
+                        // render failure. `/bundle.js` is unserved and 404s,
+                        // which fails the overall check on its own — so the
+                        // render result is asserted directly below, not via
+                        // `ok`.
+                        "/blank-framework" => ("200 OK",
+                            "<!doctype html><html><body><div id=\"root\"></div>\
+                             <script src=\"/bundle.js\"></script></body></html>".into()),
                         _ => ("404 Not Found", "missing".into()),
                     };
                     let resp = format!(
@@ -591,12 +670,12 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
         let timeout = Duration::from_secs(8);
 
-        let good = run_smoke(&browser, &format!("{base}/good"), "#app", timeout)
+        let good = run_smoke(&browser, &format!("{base}/good"), &["#app".to_string()], timeout)
             .await
             .expect("run_smoke good");
         assert!(good.ok, "good page should pass, got: {good:?}");
 
-        let broken = run_smoke(&browser, &format!("{base}/broken"), "#app", timeout)
+        let broken = run_smoke(&browser, &format!("{base}/broken"), &["#app".to_string()], timeout)
             .await
             .expect("run_smoke broken");
         assert!(!broken.ok, "broken page should fail");
@@ -607,6 +686,33 @@ mod tests {
                 || !broken.console_errors.is_empty()
                 || !broken.failed_requests.is_empty(),
             "broken page should surface a captured failure: {broken:?}"
+        );
+
+        // Regression: a blank app whose root does not match the selector must
+        // FAIL the RENDER check specifically.
+        //
+        // `!blank.ok` alone does not pin that: this fixture's `/bundle.js` is
+        // same-origin and 404s, so it lands in `failed_requests` and `ok` is
+        // false whatever the probe returns — the old `|| document.body` probe
+        // would leave that assertion green. `failures` is the one field only
+        // the render check writes: under the old probe `rendered` was true and
+        // it stayed EMPTY; under this one it holds the "no selector rendered"
+        // entry.
+        let blank = run_smoke(
+            &browser,
+            &format!("{base}/blank-framework"),
+            &["#app".to_string()],
+            timeout,
+        )
+        .await
+        .expect("run_smoke blank");
+        assert!(
+            !blank.ok,
+            "a blank page whose root does not match the selector must fail: {blank:?}"
+        );
+        assert!(
+            !blank.failures.is_empty(),
+            "the render assertion specifically must fail: {blank:?}"
         );
     }
 
