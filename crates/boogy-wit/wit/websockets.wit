@@ -30,6 +30,25 @@ interface websockets {
     // presents it when subscribing on the streaming gateway.
     mint-subscribe-grant: func(channel: string, ttl-seconds: u32) -> result<string, grant-error>;
 
+    // Publish one frame to a REQUEST-SCOPED response stream.
+    //
+    // Unlike `publish`, the target is not a manifest-declared channel: it is
+    // the stream id the host minted for an in-flight request and delivered to
+    // the handler as `x-boogy-stream-id`. A background job carries that id in
+    // its payload and publishes to it as work completes.
+    //
+    // Authorisation needs no check and has none: the host addresses the
+    // channel as (caller-owner, caller-service, stream), taking the first two
+    // from the CALLER's own context. A different service publishing the same
+    // stream id therefore writes to a different channel, which the reader's
+    // relay never subscribes to.
+    stream-publish: func(stream-id: string, payload: string) -> result<_, publish-error>;
+
+    // Terminate a request-scoped stream, ending the reader's response cleanly.
+    // Without it a stream ends only at its idle timeout — correct, but it makes
+    // every client wait for that timeout before seeing the response finish.
+    stream-end: func(stream-id: string) -> result<_, publish-error>;
+
     // Publish to ONE principal's room under a class="principal" channel.
     publish-to-principal: func(channel: string, principal: string, payload: string)
         -> result<_, publish-error>;
