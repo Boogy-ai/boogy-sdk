@@ -21,7 +21,7 @@ boogy build path/to/my-api
 # Deploy a freshly-built component.
 boogy deploy path/to/my-api/boogy.toml
 
-# List your deployed services (--all: every owner's; admin scope).
+# List deployed services (also unauthenticated; useful as a smoke test).
 boogy list
 
 # Tear down a deployment.

@@ -76,7 +76,7 @@ impl Api for MyApi {
 
 Two worlds available in `wit_bindgen::generate!`:
 
-- `world: "service"` — REST/JSON-RPC/MCP only. The most common case.
+- `world: "service"` — REST / JSON-RPC / MCP / protobuf RPC. The most common case. Protobuf needs no separate world: a protobuf call arrives through the same `handle(http-request)` export as everything else.
 - `world: "service-with-jobs"` — adds the `job-handler` export. **If you use this world, you MUST also `impl bindings::exports::boogy::platform::job_handler::Guest for MyApi`** with a `handle_job(ctx, payload)` body, or the crate won't compile. Even a `fn handle_job(ctx, _) { Err(HandlerError::Terminal(format!("unknown handler: {}", ctx.handler))) }` stub is enough until you wire the real dispatch. See the tokenfeed example in the Boogy repository for the canonical pattern (uses scheduled handlers with `#[background_jobs.handlers.*]`).
 
 ### Cargo.toml conventions
@@ -1592,6 +1592,133 @@ fn search_notes(p: SearchParams) -> Result<SearchResult, RpcError> {
 
 JSON-RPC handlers use `RpcError` for failures — propagate
 `auth::find_owned` / `auth::load_owned` errors with `?` directly.
+
+## Protobuf RPC (gRPC / Connect / gRPC-Web)
+
+For a typed contract you want existing gRPC tooling to consume — `grpcurl`,
+generated stubs in another language, a Connect client — mount a protobuf
+service with `Router::grpc`. One mount serves **three wire protocols**
+(Connect, gRPC, gRPC-Web), chosen by the caller's request content-type; you
+write one handler.
+
+Four pieces, and only the last two are code you author:
+
+1. **A `.proto`** in your crate (e.g. `proto/notes.proto`), `proto3`, with a
+   package so every service name is fully qualified.
+2. **A `build.rs`** that compiles it. No `protoc`, no `buf`, no toolchain to
+   install — the compiler is pure Rust:
+
+```rust ignore-snippet: a build.rs, not guest code — it runs on the host at build time and boogy-proto-build is a build-dependency, absent from the guest dependency graph the gate crate models
+fn main() {
+    boogy_proto_build::compile(&["proto/notes.proto"], &["proto"])
+        .expect("compile notes.proto");
+}
+```
+
+   Cargo.toml — `boogy-proto-build` ships from the same repository and at the
+   same rev as `boogy-sdk` and `boogy-wit`, so take it the same way you
+   already take those, and put it under **`[build-dependencies]`**: never
+   `[dependencies]`, because it pulls the codegen toolchain and that must
+   never enter the wasm's own dependency graph.
+
+```toml
+[dependencies]
+boogy-sdk = { git = "https://github.com/Boogy-ai/boogy-sdk", rev = "<pin-rev>" }
+# The wasm-safe protobuf runtime the generated message types use.
+buffa = { version = "0.9", features = ["json"] }
+
+[build-dependencies]
+boogy-proto-build = { git = "https://github.com/Boogy-ai/boogy-sdk", rev = "<pin-rev>" }
+```
+
+   `buffa`'s `json` feature is **not** optional: the generated code
+   references buffa's JSON helpers unconditionally, so without it the crate
+   fails to compile whether or not you ever serve a JSON-codec request.
+
+3. **A `[grpc]` manifest block** naming the proto and the fully-qualified
+   services you serve. `[routing] methods` must include `POST` — the gRPC
+   wire is POST-only, and a manifest that omits it is rejected at parse:
+
+```toml
+[service]
+id = "notes"
+version = "0.1.0"
+wasm = "target/wasm32-wasip2/release/notes.wasm"
+
+[routing]
+path = "/notes"
+methods = ["GET", "POST"]
+
+[grpc]
+proto = "proto/notes.proto"
+services = ["notes.v1.NotesService"]
+# reflection = true   # the default: serves gRPC server reflection
+#                     # and GET <mount>/descriptor.bin
+```
+
+4. **The mount and the handlers.** `include_protos!()` splices in the
+   generated message types; you never name the codegen crate or `connectrpc`
+   in your own source:
+
+```rust ignore-snippet: needs a build.rs-generated OUT_DIR module to expand against — include_protos! and the notes::v1 message types do not exist without a compiled .proto
+boogy_sdk::include_protos!();
+// The generated PROTOBUF messages. Distinct from your #[derive(Model)] store
+// structs: these describe the wire, those describe the table. Map between them
+// in the handler — do not try to make one type do both jobs.
+use notes::v1::{GetNoteRequest, NoteReply};
+use boogy_sdk::grpc::{GrpcDispatcher, Response, RpcStatus};
+
+Router::new()
+    .grpc("notes.v1.NotesService", || {
+        GrpcDispatcher::new("notes.v1.NotesService")
+            .method("GetNote", get_note)
+    });
+
+fn get_note(_req: &mut Req<'_>, msg: GetNoteRequest) -> Result<Response<NoteReply>, RpcStatus> {
+    // `Note` here is the #[derive(Model)] struct, which owns Note::TABLE.
+    let row = auth::load_owned(Note::TABLE, DEFAULT_OWNER_COL, &msg.id)
+        .map_err(|e| RpcStatus::internal(e.to_string()))?
+        .ok_or_else(|| RpcStatus::not_found("no such note"))?;
+    Ok(Response::new(NoteReply {
+        id: msg.id,
+        title: row.text(Note::TITLE),
+        ..Default::default()
+    }))
+}
+```
+
+A method handler is `Fn(&mut Req<'_>, P) -> Result<Response<R>, RpcStatus>`
+— deliberately the same shape as `rpc::Dispatcher::method`, so the same
+business logic can back REST, JSON-RPC and protobuf without reshaping. You
+get a real `&mut Req<'_>`, so guards, `Ctx`, `auth::current_principal()` and
+`req.header(..)` all work exactly as in any other handler.
+
+**Errors are `RpcStatus`, not `ApiError`.** Constructors for the common
+codes (`not_found`, `invalid_argument`, `permission_denied`, `internal`,
+`unimplemented`, `unauthenticated` — deliberately message-free, since an
+authentication failure that explains itself is an enumeration oracle), plus
+`with_header` / `with_trailer` / `with_detail` (gRPC's rich error model — a
+typed message packed as a `google.protobuf.Any`). `Response::new(body)` (or
+`body.into()`) is the success arm; chain `.with_header` / `.with_trailer` on
+it when a *successful* call needs to set metadata too.
+
+**Deploying.** `cargo build --target wasm32-wasip2 --release` first — the
+build script writes the compiled descriptor next to your manifest, and
+`boogy deploy` ships it beside the wasm. A `[grpc]` deployment whose
+descriptor is missing fails the deploy with that instruction; one whose
+descriptor does not contain a declared service, or whose `.proto` declares a
+**streaming** method (`stream` on either side — only unary is served), is
+refused with a **409 at provision** and never becomes routable.
+
+**JSON over the same methods comes free.** A Connect client sending JSON
+reaches the identical handler; decoding goes through the generated types'
+own serde impls (protobuf's canonical JSON mapping), so there is no second
+code path to write or keep in step.
+
+**Choose protobuf for the contract, not for speed.** Measured against the
+same handler, protobuf is *slower* than plain REST JSON on this platform,
+and the encoding is not where the difference lives. What it buys is a typed
+schema, generated clients in other languages, and reflection-driven tooling.
 
 ## MCP (Model Context Protocol)
 

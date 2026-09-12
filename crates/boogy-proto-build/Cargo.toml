@@ -1,0 +1,11 @@
+[package]
+name = "boogy-proto-build"
+version = "0.1.0"
+edition = "2021"
+description = "Compile .proto files for a Boogy service — no protoc required."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+protox = { workspace = true }
+prost = { workspace = true }
+connectrpc-build = { workspace = true }

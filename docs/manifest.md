@@ -105,6 +105,9 @@ The `[capabilities]` section is **optional** — a missing or empty one grants n
 | `background_jobs` | bool | `false` | Enqueue and manage background jobs (`jobs::enqueue` / `jobs::cancel` / `jobs::status`). |
 | `signing` | bool | `false` | Produce cryptographic signatures (ECDSA secp256k1 / P-256, Ed25519) with a private key the host holds and your code never sees — only a public key and the signature come back. |
 | `websockets` | bool | `false` | Publish real-time messages to end-user clients over channels declared in `[[websockets.channels]]`. |
+| `files` | bool | `false` | Store and serve files (uploads, images, documents, exports) through the platform, so the bytes never pass through your service. Also needs a file-collection block declaring each collection and its ceilings — see the `boogy-file-storage` skill for its shape. |
+
+There is no capability for serving protobuf: it is an *inbound* surface that grants your wasm nothing, so it is declared in [`[grpc]`](#grpc) instead.
 
 ---
 
@@ -342,6 +345,54 @@ Declaring handlers without granting `capabilities.background_jobs = true` is val
 | `backoff_ms` | u32 | `1000` | Delay between retry attempts (ms). |
 | `max_concurrent_per_tenant` | u32 or null | `null` (unlimited) | Per-tenant in-flight cap for this handler. Omit for no per-handler limit; the global tenant cap still applies. Must be > 0 when set. |
 | `schedule` | string or null | `null` | 6-field cron expression (`sec min hour day month dow`). When set, the host materialises a scheduled job that fires this handler on the given cadence. Example: `"0 0 * * * *"` = top of every hour. |
+
+---
+
+## `[grpc]`
+
+Serve a **protobuf** surface — gRPC, Connect and gRPC-Web, all three from one
+mount, chosen by the caller's request content-type. Optional: omit the section
+(or leave `services` empty) and protobuf is off for this deployment.
+
+Not a capability. Protobuf is an *inbound* surface, so nothing new is granted to
+your wasm and deny-by-default is untouched.
+
+```toml
+[routing]
+path = "/notes"
+methods = ["GET", "POST"]   # POST is REQUIRED when [grpc] is present
+
+[grpc]
+proto = "proto/notes.proto"
+services = ["notes.v1.NotesService"]
+# reflection = true   # the default
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `proto` | string | `""` | Path to the `.proto`, relative to your crate root. Required when `services` is non-empty. Must be a safe relative path (no `..`, no leading `/`). |
+| `services` | string array | `[]` | The **fully-qualified** service names this deployment serves (`notes.v1.NotesService`, not `NotesService`). Empty = protobuf off. |
+| `reflection` | bool | `true` | Serve gRPC server reflection, plus the compiled descriptor set verbatim at `GET <mount>/descriptor.bin`. Both inherit this service's `[ingress]` policy — on a `public` service they publish your `.proto` shape. |
+
+**`[routing] methods` must include `POST`.** The gRPC wire is POST-only, and a
+`[grpc]` block without it is rejected when the manifest is parsed.
+
+**Build before you deploy.** A build script compiles the `.proto` (pure Rust — no
+`protoc` or `buf` to install) and writes the compiled descriptor into your crate;
+the deploy step ships it beside the wasm. Deploying without building stops with
+exactly that instruction.
+
+**Two ways a `[grpc]` deployment is refused with a 409 at provision**, before it
+ever becomes routable — deliberately at deploy time rather than per request:
+
+- `services` names something the compiled descriptor does not contain (usually a
+  package or service-name typo between the manifest and the `.proto`).
+- A method is **streaming**. Only unary methods are served; `stream` on either
+  side of any declared method refuses the whole deployment. Make the method
+  unary, or leave that service out of `services`.
+
+Where a previous version exists the platform restores it so your service keeps
+serving; the 409 body says whether that restore succeeded.
 
 ---
 

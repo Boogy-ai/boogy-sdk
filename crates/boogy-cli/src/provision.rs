@@ -6,9 +6,19 @@ use serde_json::json;
 
 use crate::frontend::tar_gz_dir;
 
+/// Where the compiled protobuf descriptor lands, relative to the manifest's
+/// directory. Must agree with `boogy_proto_build::DESCRIPTOR_REL_PATH`, which
+/// is what actually writes the file: that crate is a **build-dependency** of a
+/// service crate, and taking it as an ordinary dependency here would pull the
+/// whole protobuf codegen toolchain into the CLI to share one path literal.
+/// So the literal is duplicated — keep the two in step.
+const DESCRIPTOR_REL_PATH: &str = ".boogy/descriptor.bin";
+
 /// What a manifest carries for publishing: the raw TOML, plus the optional
-/// wasm and optional frontend bundle. A deployment must carry at least one of
-/// the two (a wasm service, a static frontend, or both).
+/// wasm, optional frontend bundle, and optional protobuf descriptor. A
+/// deployment must carry at least one of the wasm/frontend two (a wasm
+/// service, a static frontend, or both).
+#[derive(Debug)]
 struct PublishArtifacts {
     manifest_content: String,
     /// `(full_path, bytes)` of the wasm, when `service.wasm` is present.
@@ -16,6 +26,12 @@ struct PublishArtifacts {
     /// Gzipped tarball of `[frontend].root`, when a `[frontend]` section is
     /// present.
     frontend_tar_gz: Option<Vec<u8>>,
+    /// Compiled protobuf `FileDescriptorSet` bytes
+    /// (`DESCRIPTOR_REL_PATH`, written by `boogy_proto_build::compile` at the
+    /// author's build time), when `[grpc]` is declared with a non-empty
+    /// `services` list. `None` when `[grpc]` is absent/disabled — never an
+    /// error in that case.
+    descriptor: Option<Vec<u8>>,
 }
 
 /// Read a manifest toml + resolve and read the wasm bytes relative to the
@@ -87,10 +103,44 @@ fn read_publish_artifacts(manifest_path: &str) -> Result<PublishArtifacts> {
         );
     }
 
+    // Optional [grpc] section: ship the compiled descriptor beside the wasm.
+    // The CLI carries no protobuf toolchain of its own (same precedent as the
+    // frontend pipeline transpiling TS in Rust rather than shelling out) — the
+    // descriptor is produced once, at the author's `cargo build` time, by
+    // `boogy_proto_build::compile` (invoked from the service crate's
+    // `build.rs`), which writes it to `DESCRIPTOR_REL_PATH` at the crate
+    // root. This just reads that file back.
+    //
+    // "Enabled" here means the same thing the manifest schema means by it:
+    // a non-empty `[grpc] services` list. The CLI parses the manifest as raw
+    // TOML rather than deserializing the typed schema, so that one rule is
+    // restated here — keep the two in step. A `[grpc]` block with no
+    // `services` (or no block at all) needs no descriptor.
+    let grpc_enabled = manifest
+        .get("grpc")
+        .and_then(|g| g.get("services"))
+        .and_then(|s| s.as_array())
+        .is_some_and(|services| !services.is_empty());
+    let descriptor = if grpc_enabled {
+        let descriptor_path = manifest_dir.join(DESCRIPTOR_REL_PATH);
+        let bytes = std::fs::read(&descriptor_path).with_context(|| {
+            format!(
+                "[grpc] is declared but {} is missing.\n\
+                 Run `cargo build --target wasm32-wasip2 --release` first — the build \
+                 script writes the descriptor there.",
+                descriptor_path.display()
+            )
+        })?;
+        Some(bytes)
+    } else {
+        None
+    };
+
     Ok(PublishArtifacts {
         manifest_content,
         wasm,
         frontend_tar_gz,
+        descriptor,
     })
 }
 
@@ -167,6 +217,7 @@ pub async fn publish(
         manifest_content,
         wasm,
         frontend_tar_gz,
+        descriptor,
     } = read_publish_artifacts(manifest_path)?;
     // Capture before the bundle is consumed into the multipart form — the smoke
     // step only applies to deployments that actually serve a frontend.
@@ -190,6 +241,9 @@ pub async fn publish(
     if let Some(tar_gz) = &frontend_tar_gz {
         println!("  Frontend: bundled ({} bytes gzipped)", tar_gz.len());
     }
+    if let Some(bytes) = &descriptor {
+        println!("  Protobuf: descriptor bundled ({} bytes)", bytes.len());
+    }
     if provision {
         println!("  Provision: true (publisher's own service)");
     }
@@ -208,6 +262,12 @@ pub async fn publish(
                 .file_name("frontend.tar.gz")
                 .mime_str("application/gzip")
                 .context("failed to set frontend part mime")?,
+        );
+    }
+    if let Some(bytes) = descriptor {
+        form = form.part(
+            "descriptor",
+            multipart::Part::bytes(bytes).file_name("descriptor.bin"),
         );
     }
     if provision {
@@ -267,8 +327,7 @@ pub async fn publish(
     }
 
     println!("  Provisioned: {provisioned}");
-    // The host returns the canonical tenant URL (`https://<handle>.<base><mount>`,
-    // the service's `[routing] path` — not necessarily `/<id>`);
+    // The host returns the canonical tenant URL (`https://<handle>.<base>/<id>`);
     // it is both what we print and what the smoke must load.
     let service_url = body.get("service_url").and_then(|u| u.as_str());
     if let Some(url) = service_url {
@@ -499,5 +558,84 @@ mod tests {
             err.to_string().contains("[service]") || err.to_string().contains("[api]"),
             "error should mention [service] or [api], got: {err}"
         );
+    }
+
+    // ── The descriptor rides beside the wasm ───────────────────────────
+
+    const GRPC_MANIFEST: &str = "\
+[service]\nname = \"echo\"\nwasm = \"echo.wasm\"\n\n\
+[grpc]\nproto = \"proto/echo.proto\"\nservices = [\"echo.v1.EchoService\"]\n";
+
+    /// The author declared `[grpc]` but never ran the build that writes
+    /// `.boogy/descriptor.bin` — the CLI must refuse LOCALLY (no network
+    /// call) and say exactly what to run, not surface a confusing 400 from
+    /// the host or silently publish a `[grpc]` service with no descriptor.
+    #[test]
+    fn grpc_manifest_without_descriptor_names_the_build_step() {
+        let (_dir, manifest) =
+            setup_test_dir("grpc-no-descriptor", GRPC_MANIFEST, Some("echo.wasm"));
+        // Deliberately no `.boogy/descriptor.bin` written.
+        let err = read_publish_artifacts(manifest.to_str().unwrap()).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("cargo build"), "must name the fix, got: {msg}");
+        assert!(
+            msg.contains(".boogy/descriptor.bin"),
+            "must name the missing file, got: {msg}"
+        );
+    }
+
+    /// The happy path: `[grpc]` declared, the build ran, `.boogy/descriptor.bin`
+    /// exists — the CLI reads and bundles those exact bytes.
+    #[test]
+    fn grpc_manifest_with_descriptor_bundles_it() {
+        let (dir, manifest) =
+            setup_test_dir("grpc-with-descriptor", GRPC_MANIFEST, Some("echo.wasm"));
+        let boogy_dir = dir.join(".boogy");
+        std::fs::create_dir_all(&boogy_dir).expect("mkdir .boogy");
+        let descriptor_bytes = b"\x0a\x05hello-descriptor-bytes".to_vec();
+        std::fs::write(boogy_dir.join("descriptor.bin"), &descriptor_bytes)
+            .expect("write descriptor.bin");
+
+        let arts = read_publish_artifacts(manifest.to_str().unwrap()).expect("must succeed");
+        assert_eq!(
+            arts.descriptor.as_deref(),
+            Some(descriptor_bytes.as_slice()),
+            "must read the exact descriptor bytes from .boogy/descriptor.bin"
+        );
+    }
+
+    /// A manifest with no `[grpc]` section never looks for a descriptor —
+    /// no error, and no `descriptor` part to bundle, even if a stray
+    /// `.boogy/descriptor.bin` happens to sit next to it (e.g. leftover from
+    /// a different manifest in the same dir during local iteration).
+    #[test]
+    fn non_grpc_manifest_has_no_descriptor() {
+        let toml = "[service]\nname = \"hello\"\nwasm = \"hello.wasm\"\n";
+        let (dir, manifest) = setup_test_dir("non-grpc-no-descriptor", toml, Some("hello.wasm"));
+        let boogy_dir = dir.join(".boogy");
+        std::fs::create_dir_all(&boogy_dir).expect("mkdir .boogy");
+        std::fs::write(boogy_dir.join("descriptor.bin"), b"unrelated").expect("write stray file");
+
+        let arts = read_publish_artifacts(manifest.to_str().unwrap()).expect("must succeed");
+        assert!(
+            arts.descriptor.is_none(),
+            "a non-grpc manifest must never bundle a descriptor"
+        );
+    }
+
+    /// A `[grpc]` block with an empty `services` list is the same as absent —
+    /// no descriptor required, none bundled. This is the manifest schema's own
+    /// rule (a `[grpc]` block is enabled iff `services` is non-empty), restated
+    /// here because the CLI reads the manifest as raw TOML rather than
+    /// deserializing the typed schema — see the comment on
+    /// `read_publish_artifacts`.
+    #[test]
+    fn grpc_block_with_empty_services_is_treated_as_disabled() {
+        let toml = "[service]\nname = \"hello\"\nwasm = \"hello.wasm\"\n\n[grpc]\nservices = []\n";
+        let (_dir, manifest) = setup_test_dir("grpc-empty-services", toml, Some("hello.wasm"));
+        // No .boogy/descriptor.bin written — if this manifest were (wrongly)
+        // treated as grpc-enabled, this would fail with the missing-descriptor error.
+        let arts = read_publish_artifacts(manifest.to_str().unwrap()).expect("must succeed");
+        assert!(arts.descriptor.is_none());
     }
 }

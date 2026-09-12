@@ -31,6 +31,17 @@ serde_urlencoded = { workspace = true }
 aes = "0.8"
 base64 = "0.22"
 boogy-sdk-macros = { path = "../boogy-sdk-macros" }
+# Protobuf RPC (Router::grpc / GrpcDispatcher). buffa is the wasm-safe
+# runtime generated message types depend on — never `connectrpc` from a
+# guest, which pulls `wasm-bindgen-futures` on any wasm32 target and which
+# a guest never needs, since it dispatches through `GrpcDispatcher` rather
+# than connectrpc's own router or client. Default features only: the JSON
+# codec goes through `serde_json` directly against the generated types' own
+# `Serialize`/`Deserialize` impls (which buffa's codegen emits
+# unconditionally, not behind a Cargo feature), not through a `buffa::json`
+# encode/decode entry point — no such function exists in buffa 0.9.2. See
+# `grpc.rs`'s `CODEC_HEADER` dispatch for the codec selection this feeds.
+buffa = { workspace = true }
 
 [dev-dependencies]
 # Compile-fail harness for the counter-column index rejection. A plain version

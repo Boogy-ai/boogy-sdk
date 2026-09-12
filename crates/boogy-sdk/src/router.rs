@@ -907,6 +907,8 @@ impl Router {
                         crate::spec::SpecEntry::Mcp { path, guarded: true },
                     crate::spec::SpecEntry::Rpc { path, .. } =>
                         crate::spec::SpecEntry::Rpc { path, guarded: true },
+                    crate::spec::SpecEntry::Grpc { path, service, .. } =>
+                        crate::spec::SpecEntry::Grpc { path, service, guarded: true },
                 }
             } else {
                 entry
@@ -1217,6 +1219,51 @@ impl Router {
         self.route_inner("POST", path, handler)
     }
 
+    /// Mount a protobuf service. The wire path is `/{service_name}/{method}`
+    /// beneath this deployment's mount prefix.
+    ///
+    /// Takes a builder rather than a built dispatcher for the same reason
+    /// [`Router::rpc`] does: `build_router()` re-runs on every request, so
+    /// building eagerly would pay every method registration on every
+    /// request. Unlike `Router::rpc`, `service_name` is a required
+    /// parameter rather than read off a built dispatcher — the host routes
+    /// on path alone and never consults a descriptor, so nothing here
+    /// needs `build()` to run before an actual request lands on this
+    /// mount. There is no `grpc_specs` analogue of `rpc_specs`, and that is
+    /// not a gap: gRPC server reflection is the per-method catalog, so a
+    /// `.grpc()` mount records only the same kind of protocol stub
+    /// `Router::mcp`/`Router::rpc` record for themselves.
+    ///
+    /// ```ignore, ignore_snippet: a method's P/R must implement buffa::Message, which only build-time protobuf codegen produces and which the snippet gate's crate cannot depend on, so no compilable form of this example exists
+    /// use boogy_sdk::grpc::GrpcDispatcher;
+    ///
+    /// // `get_note` / `list_notes` are your own handlers, each
+    /// // `Fn(&mut Req<'_>, P) -> Result<Response<R>, RpcStatus>` over the
+    /// // message types your `.proto` generated.
+    /// Router::new()
+    ///     .grpc("notes.v1.NotesService", || GrpcDispatcher::new("notes.v1.NotesService")
+    ///         .method("GetNote", get_note)
+    ///         .method("ListNotes", list_notes));
+    /// ```
+    pub fn grpc<F>(mut self, service_name: &str, build: F) -> Self
+    where
+        F: Fn() -> crate::grpc::GrpcDispatcher + 'static,
+    {
+        let guarded = !self.group_guards.is_empty();
+        let path = format!("/{service_name}/{{method}}");
+        let build = Rc::new(build);
+        if !self.undocumented {
+            self.specs.push(crate::spec::SpecEntry::Grpc {
+                path: path.clone(),
+                service: service_name.to_string(),
+                guarded,
+            });
+        }
+        let build_for_handler = build.clone();
+        let handler: Handler = Rc::new(move |req: &mut Req<'_>| build_for_handler().handle(req));
+        self.route_inner("POST", &path, handler)
+    }
+
     /// Mount an MCP dispatch handler at `path` (registered as POST) and
     /// record it as an MCP endpoint in the generated OpenAPI document.
     /// Capability discovery stays in-protocol (`tools/list` etc.).
@@ -1314,12 +1361,12 @@ impl Router {
     }
 }
 
-/// Closure receiver for [`Router::group`] — exposes only route-registration
-/// methods. (`rpc()`/`mcp()` are intentionally absent: protocol mounts
-/// carry spec-registry side effects that must record the group's guard
-/// state — mount them on the `Router` and `.nest()` the result instead.) Has no `.group()` method by design, so guards declared at the
-/// enclosing `.group([...], |g| ...)` cannot be extended from inside the
-/// closure body.
+/// Closure receiver for [`Router::group`] — exposes route-registration
+/// methods plus the protocol mounts ([`RouteSet::mcp`], [`RouteSet::rpc`],
+/// [`RouteSet::grpc`]) that need to carry the group's guard state; see each
+/// method's own doc for why the mirror exists. Has no `.group()` method by
+/// design, so guards declared at the enclosing `.group([...], |g| ...)`
+/// cannot be extended from inside the closure body.
 ///
 /// To attach a different guard set to a different route subset, call
 /// `.group()` again on the outer `Router` — each `.group()` call is its
@@ -1406,6 +1453,16 @@ impl RouteSet {
         F: Fn() -> crate::rpc::Dispatcher + 'static,
     {
         Self(self.0.rpc(path, build))
+    }
+
+    /// Mount a protobuf service inside this group, so it carries the
+    /// group's guards. Same semantics as [`Router::grpc`], and present for
+    /// the same reason as [`RouteSet::mcp`] above.
+    pub fn grpc<F>(self, service_name: &str, build: F) -> Self
+    where
+        F: Fn() -> crate::grpc::GrpcDispatcher + 'static,
+    {
+        Self(self.0.grpc(service_name, build))
     }
 }
 

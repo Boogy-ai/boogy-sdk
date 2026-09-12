@@ -16,12 +16,7 @@ struct SmokeApi;
 
 impl Api for SmokeApi {
     fn build_router() -> Router {
-        Router::new()
-            // Doc identity + a per-route summary: they flow into the served
-            // openapi.json, and `boogy check` refuses a router without them.
-            .info("My Service", "0.1.0", Some("Minimal Boogy service."))
-            .summary("Health ping")
-            .get("/api/ping", ping)
+        Router::new().get("/api/ping", ping)
     }
 }
 

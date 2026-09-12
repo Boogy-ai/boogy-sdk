@@ -52,6 +52,7 @@ pub mod expr;
 pub mod extract;
 pub mod glue;
 pub mod files;
+pub mod grpc;
 pub mod idempotency;
 pub mod ids;
 pub mod job_router;

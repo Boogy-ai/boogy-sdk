@@ -113,6 +113,23 @@ pub enum SpecEntry {
         /// `true` when the mount was registered inside a guarded group.
         guarded: bool,
     },
+    /// A protobuf/gRPC (Connect) service mount, from [`crate::Router::grpc`].
+    /// `path` carries the `/{method}` template segment (matchit's `{name}`
+    /// syntax, same as any other route param), so — unlike `Mcp`/`Rpc`,
+    /// which are each a single concrete endpoint — one entry here stands
+    /// in for every method on the service. There is no per-method
+    /// analogue of `rpc_specs`/`openrpc.json`: reflection is a later
+    /// task's job, so this is a protocol stub only, same as `Mcp`/`Rpc`.
+    Grpc {
+        path: String,
+        /// Fully-qualified protobuf service name (e.g.
+        /// `notes.v1.NotesService`) — kept alongside `path` (which also
+        /// carries the `/{method}` template segment) so the stub
+        /// description can name the service directly.
+        service: String,
+        /// `true` when the mount was registered inside a guarded group.
+        guarded: bool,
+    },
 }
 
 impl SpecEntry {
@@ -121,7 +138,8 @@ impl SpecEntry {
         match &mut self {
             SpecEntry::Rest { path, .. }
             | SpecEntry::Mcp { path, .. }
-            | SpecEntry::Rpc { path, .. } => {
+            | SpecEntry::Rpc { path, .. }
+            | SpecEntry::Grpc { path, .. } => {
                 *path = new_path;
             }
         }
@@ -132,7 +150,8 @@ impl SpecEntry {
         match self {
             SpecEntry::Rest { path, .. }
             | SpecEntry::Mcp { path, .. }
-            | SpecEntry::Rpc { path, .. } => path,
+            | SpecEntry::Rpc { path, .. }
+            | SpecEntry::Grpc { path, .. } => path,
         }
     }
 
@@ -143,7 +162,9 @@ impl SpecEntry {
             // request this runs on, and avoids caching a value nothing else
             // needs to see (`build_openapi` resolves it again independently).
             SpecEntry::Rest { guarded, describe, .. } => *guarded || describe().requires_principal,
-            SpecEntry::Mcp { guarded, .. } | SpecEntry::Rpc { guarded, .. } => *guarded,
+            SpecEntry::Mcp { guarded, .. }
+            | SpecEntry::Rpc { guarded, .. }
+            | SpecEntry::Grpc { guarded, .. } => *guarded,
         }
     }
 }
@@ -263,6 +284,14 @@ pub fn build_openapi(info: &DocInfo, reg: &SpecRegistry) -> Value {
                 insert_protocol_stub(&mut paths, path,
                     "JSON-RPC 2.0 endpoint. Method catalog: GET the sibling `openrpc.json` \
                      document, or call the in-protocol `rpc.discover` method.");
+            }
+            SpecEntry::Grpc { path, service, .. } => {
+                insert_protocol_stub(&mut paths, path, &format!(
+                    "gRPC/Connect protobuf service `{service}`. Method routing is by path \
+                     (this entry stands in for every method); the body is an opaque protobuf \
+                     message (or Connect+JSON, per the `x-boogy-rpc` header) — see the \
+                     service's .proto definition for the method catalog."
+                ));
             }
         }
     }

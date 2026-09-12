@@ -1,38 +1,23 @@
 use anyhow::{Context, Result};
 
-/// List deployed services.
-///
-/// Without `all`: the caller's OWN services via the owner-scoped
-/// `GET /v1/services` (any signed-in user; ownership derived from the token).
-/// With `all`: every owner's services via `GET /_admin/services`, which
-/// needs admin scope. Until 2026-09-12 `boogy list` only ever hit the admin
-/// endpoint, so the quickstart's "verify with `boogy list`" step answered a
-/// normal user with `403 Forbidden`.
-pub async fn list(host: &str, token: &str, all: bool) -> Result<()> {
+pub async fn list(host: &str, token: &str) -> Result<()> {
     let client = reqwest::Client::new();
-    let (url, what) = if all {
-        (format!("{host}/_admin/services"), "admin")
-    } else {
-        (format!("{host}/v1/services"), "owner")
-    };
     let resp = client
-        .get(&url)
+        .get(format!("{host}/_admin/services"))
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
         .context("failed to reach host")?;
 
-    match resp.status() {
-        reqwest::StatusCode::UNAUTHORIZED => anyhow::bail!(
-            "list failed (401 Unauthorized): token invalid or expired — \
-             set --token or BOOGY_TOKEN to a valid token, or run `boogy login`"
-        ),
-        reqwest::StatusCode::FORBIDDEN if all => anyhow::bail!(
-            "list --all failed (403 Forbidden): listing every owner's services needs \
-             admin scope. Drop --all to list your own services."
-        ),
-        s if !s.is_success() => anyhow::bail!("list failed ({s}, {what} listing)"),
-        _ => {}
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!(
+            "list failed (401 Unauthorized): token invalid or missing admin scope — \
+             set --token or BOOGY_TOKEN to a valid admin token"
+        );
+    }
+
+    if !resp.status().is_success() {
+        anyhow::bail!("list failed ({})", resp.status());
     }
 
     let body: serde_json::Value = resp.json().await?;
