@@ -132,7 +132,12 @@ struct MyService;
 
 impl Api for MyService {
     fn build_router() -> Router {
-        Router::new().get("/api/ping", ping)
+        Router::new()
+            // Doc identity + a per-route summary: they flow into the served
+            // openapi.json, and `boogy check` refuses a router without them.
+            .info("My Service", "0.1.0", Some("Minimal Boogy service."))
+            .summary("Health ping")
+            .get("/api/ping", ping)
     }
 }
 
@@ -146,7 +151,7 @@ fn ping(_req: &mut Req<'_>) -> Json<Pong> {
 }
 ```
 
-`wit_glue!` wires the WIT bindings to your `Api` impl. `Router`, `Req`, `Json`, `Serialize`, and friends are re-exported by `boogy_sdk` and brought into scope by `wit_glue!`.
+`wit_glue!` wires the WIT bindings to your `Api` impl. `Router`, `Req`, `Json`, `Serialize`, and friends are re-exported by `boogy_sdk` and brought into scope by `wit_glue!`. `.info(...)` names the service in its generated `openapi.json` and `.summary(...)` documents the route that follows it; `boogy check` (below) fails a router that has neither.
 
 ---
 
@@ -178,7 +183,7 @@ version = "0.1.0"
 wasm = "target/wasm32-wasip2/release/my_service.wasm"
 
 [routing]
-path = "/api/ping"
+path = "/api"
 methods = ["GET"]
 
 [capabilities]
@@ -201,6 +206,8 @@ There's no `owner` field here on purpose: you're authenticated when you deploy, 
 
 `service.id` must be ASCII alphanumeric plus `-` and `_` (no dots, slashes, or Unicode). See [`manifest.md`](manifest.md) for the full field reference.
 
+`[routing] path` is the **mount**: the service owns that subtree of its owner's subdomain, so this service answers at `https://<your-handle>.boogy.app/api/ping`. The id is the name you manage the deployment by (`boogy remove my-service`); it is not part of the URL unless you mount at `/my-service`.
+
 ---
 
 ## 5. Deploy
@@ -214,7 +221,7 @@ A first-time user signs in to get a bearer token. Three ways — the first two u
 If your coding agent is already connected to Boogy's MCP server, no install needed. The agent:
 
 1. Calls the `login` tool → receives a `user_code`, a `verification_uri_complete`, and a `device_code`.
-2. Shows you the URL and code — open the URL in your browser, confirm the on-screen code matches (anti-phishing), sign in with your provider (Google, GitHub, …), and approve. A first-time user picks a **handle** during this step. **Your handle IS your subdomain** — a DNS label: lowercase `[a-z0-9-]` only (no `_`, `.`, or spaces). Your services are reached at `https://<handle>.<base>/<service>/<path>`. Messy input is coerced to a valid label (`my_app` → `my-app`) and you're told the final handle; if it's reserved or already taken, you pick another.
+2. Shows you the URL and code — open the URL in your browser, confirm the on-screen code matches (anti-phishing), sign in with your provider (Google, GitHub, …), and approve. A first-time user picks a **handle** during this step. **Your handle IS your subdomain** — a DNS label: lowercase `[a-z0-9-]` only (no `_`, `.`, or spaces). Your services are reached at `https://<handle>.<base>` + each service's `[routing] path`. Messy input is coerced to a valid label (`my_app` → `my-app`) and you're told the final handle; if it's reserved or already taken, you pick another.
 3. Polls the `login_status` tool with the `device_code` until it returns `{status: "complete", token, handle}`.
 
 The returned `token` is your Boogy bearer token. Set it as `BOOGY_TOKEN` in the session (or pass `--token` per command) for any subsequent CLI calls.
@@ -271,16 +278,19 @@ with `BOOGY_HOST_URL` or `--host https://your-boogy-host.example.com`.)
 boogy deploy boogy.toml
 ```
 
-`deploy` is `publish + provision` in one shot: it uploads the manifest and Wasm binary, then provisions a running service instance for your user ID.
+`deploy` is `publish + provision` in one shot: it uploads the manifest and Wasm binary, then provisions a running service instance under your handle. On success it prints the live URL — `https://<your-handle>.boogy.app` plus your `[routing] path` — and probes it, so a deploy that provisioned but is not reachable is reported on the spot.
 
 The platform API is self-describing: `GET <host>/openapi.json` returns an OpenAPI 3.1 document covering the full deploy lifecycle (`/_agents/*`, `/_admin/*`, `/v1/*`); anonymous fetch OK.
 
 ### Verify
 
 ```bash
-boogy list                          # list deployed services (requires admin scope)
-curl https://<your-handle>.boogy.app/my-service/api/ping
+boogy list                          # your deployed services (--all: every owner; admin scope)
+boogy check .                       # lint the crate for Boogy conventions
+curl https://<your-handle>.boogy.app/api/ping
 ```
+
+Expect `{"message":"pong"}`. The URL is the one `boogy deploy` printed: your subdomain plus the manifest's `[routing] path`.
 
 ### Other useful commands
 
@@ -288,15 +298,15 @@ curl https://<your-handle>.boogy.app/my-service/api/ping
 # Build the wasm from a crate directory
 boogy build path/to/my-service
 
-# Remove a service
-boogy remove <owner-user-id> <service-id>
+# Remove a service you own (ownership comes from your token)
+boogy remove <service-id>
 ```
 
 ---
 
 ## 6. Next steps
 
-- **Your service self-describes.** Once deployed, `GET https://<your-handle>.boogy.app/<service-id>/openapi.json` returns an OpenAPI 3.0.3 document for your service automatically — no extra code required. Add `schemars::JsonSchema` to your DTO types and the schema will include request/response shapes. See `boogy:boogy-api-specs` in the skills catalog for the full spec-endpoint reference.
+- **Your service self-describes.** Once deployed, `GET https://<your-handle>.boogy.app/api/openapi.json` (your `[routing] path` + `/openapi.json`) returns an OpenAPI 3.0.3 document for your service automatically — no extra code required; its `servers[0]` is the live URL. Add `schemars::JsonSchema` to your DTO types and the schema will include request/response shapes. See `boogy:boogy-api-specs` in the skills catalog for the full spec-endpoint reference.
 - **Handler reference**: [`../crates/boogy-sdk/AGENTS.md`](../crates/boogy-sdk/AGENTS.md) — the canonical guide for writing handlers, guards, store access, auth patterns, MCP tools, and more. Feed this to your coding agent before writing service code.
 - **Manifest reference**: [`manifest.md`](manifest.md) — every manifest field, all ingress modes, outbound HTTP policy, secrets, background jobs, and common errors.
 - **`smoke/` template**: [`../smoke/`](../smoke/) in this repo — the working template this quickstart is based on.

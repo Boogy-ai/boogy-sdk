@@ -267,7 +267,8 @@ pub async fn publish(
     }
 
     println!("  Provisioned: {provisioned}");
-    // The host returns the canonical tenant URL (`https://<handle>.<base>/<id>`);
+    // The host returns the canonical tenant URL (`https://<handle>.<base><mount>`,
+    // the service's `[routing] path` — not necessarily `/<id>`);
     // it is both what we print and what the smoke must load.
     let service_url = body.get("service_url").and_then(|u| u.as_str());
     if let Some(url) = service_url {
