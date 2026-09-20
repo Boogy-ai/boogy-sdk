@@ -17,6 +17,7 @@ world service {
     import background-jobs;
     import websockets;
     import files;
+    import pricing;
 }
 
 // Superset world for APIs that also process background jobs. Targets
@@ -42,4 +43,5 @@ world service-with-jobs {
     import background-jobs;
     import websockets;
     import files;
+    import pricing;
 }

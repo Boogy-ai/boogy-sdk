@@ -109,8 +109,12 @@ enum Commands {
         #[arg(long)]
         to: String,
     },
-    /// List deployed services (requires admin scope)
-    List,
+    /// List your deployed services (owner-scoped; any signed-in user)
+    List {
+        /// List EVERY owner's services instead (requires admin scope)
+        #[arg(long)]
+        all: bool,
+    },
     /// Remove a deployed service you own (no admin scope required)
     Remove {
         /// Service ID to remove
@@ -250,9 +254,9 @@ async fn main() -> anyhow::Result<()> {
             let token = resolve_token(&cli.token)?;
             provision::upgrade(&cli.host, &token, &service_id, &to).await?
         }
-        Commands::List => {
+        Commands::List { all } => {
             let token = resolve_token(&cli.token)?;
-            manage::list(&cli.host, &token).await?
+            manage::list(&cli.host, &token, all).await?
         }
         Commands::Remove { owner, service_id } => {
             let token = resolve_token(&cli.token)?;

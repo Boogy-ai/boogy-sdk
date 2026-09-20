@@ -30,6 +30,7 @@ Wasm components export the inbound `http-handler` (so the host can dispatch HTTP
 | `http-handler.wit` | `http-request` (method, path, headers, params, body) + `http-response`. The single export every component implements. |
 | `outbound-http.wit` | `outbound-request` / `outbound-response` / `fetch-error` + `fetch(request)`. Mediated by the host: per-service allowlist, SSRF firewall, secret injection, rate limit. |
 | `peer.wit` | Cross-service in-process dispatch. `peer-request` / `peer-response` / `fetch-error` + `fetch(target, request)`. Target is a `boogy://<owner>/services/<service_id>` URI; the host strips identity-bearing headers on every hop. |
+| `pricing.wit` | `report-units(unit, quantity)` — for a route priced by rate, report how much of a declared unit this request consumed. The platform computes and caps the charge; nothing here reads or changes a price, a balance, or who pays. Ungated: it grants nothing. |
 | `runtime.wit` | `now-ms()`, `random-bytes()`, `log()`. Capability-gated time / entropy / logging. |
 | `store.wit` | Per-service store surface. `insert` / `update` / `delete` / `find` / `execute` / `query`, plus a `transaction` resource type for atomic multi-row writes. |
 
@@ -45,5 +46,6 @@ Package version: `boogy:platform@0.1.0`. Pre-1.0 — every change is a breaking 
 | `http-handler` | Host linker (calls the wasm export, which dispatches through `Api::build_router`) | `wit_glue!` macro |
 | `outbound-http` | Host capability (outbound) | `outbound_http::*`, emitted by `wit_glue!` |
 | `peer` | Host capability (peer.rs) | `boogy_sdk::peer::*` |
+| `pricing` | Host capability (pricing.rs) | `boogy_sdk::pricing::report_units` |
 | `runtime` | Host capability (runtime.rs) | (used directly by SDK macros) |
 | `store` | Host capability (store.rs) | `boogy_sdk` table builder + `tx()` |

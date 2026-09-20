@@ -1,0 +1,15 @@
+package boogy:platform@0.1.0;
+
+/// Report how much of a declared unit this request consumed, for a route
+/// priced by rate. The platform computes and caps the charge; nothing here
+/// reads or changes a price, a balance, or who pays.
+interface pricing {
+    variant report-error {
+        /// This request did not match a route priced by rate.
+        not-priced,
+        /// The matched route does not rate this unit.
+        unknown-unit(string),
+    }
+
+    report-units: func(unit: string, quantity: u64) -> result<_, report-error>;
+}

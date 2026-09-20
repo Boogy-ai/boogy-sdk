@@ -75,7 +75,8 @@
 /// - Store: `store` (the WIT bindings module), `Row`, `Table`,
 ///   `DEFAULT_OWNER_COL`.
 /// - Other bindings modules: `peer_bindings`, `secrets_bindings`,
-///   `signing_bindings`, `jobs_bindings`, `ws_bindings`.
+///   `signing_bindings`, `jobs_bindings`, `ws_bindings`, `files_bindings`,
+///   `pricing_bindings`.
 /// - Random: `Alphabet`.
 ///
 /// `Val` is **not** among them — see the note below on why it is deliberately
@@ -154,6 +155,23 @@ macro_rules! wit_glue {
         #[allow(unused_imports)]
         use $bindings::boogy::platform::websockets as ws_bindings;
         use $bindings::boogy::platform::files as files_bindings;
+        #[allow(unused_imports)]
+        use $bindings::boogy::platform::pricing as pricing_bindings;
+
+        #[doc(hidden)]
+        fn __sdk_report_units(
+            unit: &str,
+            quantity: u64,
+        ) -> ::core::result::Result<(), $crate::pricing::ReportError> {
+            $crate::pricing::_bridge_report_result(
+                pricing_bindings::report_units(&unit.to_string(), quantity),
+                |e| match e {
+                    pricing_bindings::ReportError::NotPriced => $crate::pricing::ReportError::NotPriced,
+                    pricing_bindings::ReportError::UnknownUnit(u) => $crate::pricing::ReportError::UnknownUnit(u),
+                },
+            )
+        }
+
         #[allow(unused_imports)]
         use $crate::json::{self, Deserialize, Serialize};
         #[allow(unused_imports)]
@@ -6059,6 +6077,7 @@ macro_rules! wit_glue {
                     );
                 }
                 $crate::log::_register_runtime_log(__sdk_runtime_log);
+                $crate::pricing::_register_report_units(__sdk_report_units);
 
                 let request_id = req
                     .headers
@@ -6211,6 +6230,8 @@ macro_rules! wit_glue {
                 ::std::vec::Vec<u8>,
                 $bindings::exports::boogy::platform::job_handler::HandlerError,
             > {
+                $crate::pricing::_register_report_units(__sdk_report_units);
+
                 // Same per-request state setup as the HTTP path so identity-scoped
                 // helpers (`auth::current_principal`, `auth::load_owned`/`find_owned`,
                 // the `Principal` extractor) work inside job handlers. The job's

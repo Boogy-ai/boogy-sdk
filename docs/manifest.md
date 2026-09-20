@@ -396,6 +396,83 @@ serving; the 409 body says whether that restore succeeded.
 
 ---
 
+## `[pricing]`
+
+Charge callers for your routes. Optional: omit it and every route is free.
+
+Each priced route declares **what it costs** — a fixed `price`, a `rate` over a unit,
+or both — and **who pays**. Money comes from the payer's prepaid balance: the
+platform sets aside the route's maximum before your handler runs, charges the
+actual amount after it completes, and returns the rest. Your service's owner
+account receives the charge.
+
+```toml
+[routing]
+path = "/api"
+methods = ["GET", "POST"]
+
+[pricing.units.tokens]
+source = "guest"          # your code reports this unit
+
+[pricing.routes.summarize]
+match = { path = "/summarize", methods = ["POST"] }
+payer = "principal"       # the user who sent the request pays
+price = "0.0005"          # fixed part, USD
+rate = { unit = "tokens", per = 1000, price = "0.0020" }
+max = "0.0500"            # required with rate; the most one call can cost
+
+[pricing.routes.lookup]
+match = { path = "/items/{id}", methods = ["GET"] }
+payer = "caller_service"  # the service that called you pays
+price = "0.0001"
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `match` | table | Exactly one of: `path` (+ optional `methods`), `grpc = "pkg.Service/Method"`, `path` + `jsonrpc_method`, or `path` + `mcp_tool`. `path` is relative to `[routing] path` and uses the same `{param}` / `{*rest}` syntax as your router. A route naming `GET` also covers `HEAD`; leaving `methods` out covers every method except `OPTIONS`. A `grpc` rule also prices a POST to `/<package.Service>/<Method>` under your mount, however the call arrives. |
+| `payer` | `"principal"` \| `"caller_service"` | `principal`: the signed-in user who sent the request. `caller_service`: the owner of the service that called yours; a direct call from outside is refused. |
+| `price` | decimal string | Fixed amount in USD, up to 6 decimal places. Write it as a **string** — `"0.0010"`, not `0.001`. |
+| `rate` | table | `unit`, `per` (a positive integer) and `price`: the charge adds `ceil(units x price / per)`. |
+| `max` | decimal string | Required with `rate`. The most one call can cost; also the amount set aside before it runs. |
+| `ceiling` | table | Module authors only: `price`, `rate_price`, `max` upper bounds that a provisioner of your module may not exceed. |
+| `refund_if_request_fails` | bool | Default `false`. When `true`, this route charges nothing if the request that reached it ultimately fails with a server error. |
+
+**Units.** `fuel`, `wall_ms`, `request_bytes` and `response_bytes` are measured by the
+platform and need no declaration. A unit your code reports is declared with
+`source = "guest"` and reported per request with `boogy_sdk::pricing::report_units`.
+Because your own code reports it, a guest unit is bounded by `max`: callers see
+`max` as the most a call can cost.
+
+**When a call is charged.** Only when your handler completes without a server error.
+A 5xx, a crash, or a timeout charges nothing. A 4xx is charged: your handler ran.
+
+**Who needs extra permission.** A user's own signed-in request may spend their
+balance. A service acting on a user's behalf, a background job running as the user,
+or an app calling a service other than its own may spend it only under a spending
+grant the user created.
+
+**Discovery.** Every priced service serves its price list at
+`GET <mount>/pricing.json`, and its `openapi.json` operations carry an
+`x-boogy-pricing` extension written by the platform. On a priced service
+`/pricing.json` is reserved: a route of yours at that path is not reachable.
+
+**Refusals** are JSON, `{"error": "<code>", "route": "<id>", "required": "<amount>"}`:
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 401 | `payment_requires_identity` | A `principal`-paid route was called without signing in. |
+| 402 | `insufficient_funds` | The payer's balance is below the route's `max` (or `price`). |
+| 402 | `payer_unavailable` | No one can pay: a `caller_service` route called directly, or a `principal` route called by a service identity. |
+| 402 | `spending_grant_required` | Someone other than the user is spending the user's balance without a grant. |
+| 402 | `spend_limit` / `request_budget` | The payer's own spending limit, or the request's `X-Boogy-Max-Charge-Usd`, would be exceeded. |
+| 400 | `non_canonical_path` / `ambiguous_envelope` | The request path or JSON body is ambiguous about which route it is. |
+| 503 | `ledger_contended` / `ledger_unavailable` | Try again later. |
+
+Every response carries `X-Boogy-Charged`, so a client can see what a request cost —
+including one that failed.
+
+---
+
 ## `[store]`
 
 Reserved section. The platform provides isolated, transactional storage to any service with `capabilities.store = true`. No configuration knobs are available today — the section may be omitted or left empty.
@@ -450,3 +527,14 @@ Must be in the range 1–600000. Zero or values above 600000 are rejected.
 **Invalid handler name**
 
 Background-job handler names must start with an ASCII letter and contain only ASCII alphanumerics or `_`, max 64 chars. Names that don't meet this rule are rejected at deploy time.
+
+**A price written as a number**
+
+`price = 0.001` is rejected: prices are decimal **strings** (`price = "0.001"`), so no
+amount is ever rounded by a floating-point parse. More than 6 decimal places, a
+negative amount, and `rate` without `max` are rejected too.
+
+**Two priced routes that can match the same request**
+
+Rejected at deploy. Every request matches at most one priced route, so which price
+applies is never a matter of declaration order.

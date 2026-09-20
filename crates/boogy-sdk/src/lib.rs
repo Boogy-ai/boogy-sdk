@@ -63,6 +63,7 @@ pub mod log;
 pub mod mcp;
 pub mod pagination;
 pub mod peer;
+pub mod pricing;
 pub mod query;
 pub mod random;
 pub mod relations;

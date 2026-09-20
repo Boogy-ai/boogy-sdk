@@ -115,6 +115,20 @@ Enqueue, cancel, and query background jobs from inside HTTP handlers (or from in
 
 **SDK wrapper**: `jobs::enqueue(handler, payload, opts)`, `jobs::cancel()`, `jobs::status()`. See [`crates/boogy-sdk/AGENTS.md`](../boogy-sdk/AGENTS.md).
 
+### pricing
+
+**Gated by**: Always present. No manifest gate — it grants nothing.
+
+For a route the service's own `[pricing]` block prices by rate over a declared `guest` unit, report how much of that unit this request consumed. The platform multiplies by the declared rate, caps the charge at the route's `max`, and settles it after the handler returns.
+
+| Function | Signature | Notes |
+|---|---|---|
+| `report-units(unit, quantity)` | `result<_, report-error>` | Adds (saturating) to this request's count for `unit`. `not-priced` when the request matched no rate route; `unknown-unit` when the matched route does not rate `unit`. |
+
+There is no function that reads a price, a balance, a payer or a reservation. A route that streams its response settles when the handler returns, so units reported afterwards by a background job are not counted.
+
+**SDK wrapper**: `boogy_sdk::pricing::report_units(unit, quantity) -> Result<(), ReportError>`.
+
 ### job-handler (callee)
 
 **Gated by**: No import gate (host exports to you, not vice versa). Implement only if your manifest has `[background_jobs.handlers.*]` blocks and you target `world: "service-with-jobs"`.

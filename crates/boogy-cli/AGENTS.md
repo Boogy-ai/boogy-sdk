@@ -93,14 +93,15 @@ deployment (if any) stays live.
 
 ### `boogy list`
 
-Lists all APIs currently registered in the host's routing table.
+Lists your deployed services — or, with `--all`, every owner's.
 
 ```bash
-boogy list
+boogy list                     # your services: GET /v1/services (any signed-in user)
+boogy list --all               # every owner's: GET /_admin/services (admin scope)
 boogy --host https://boogy.example.com list
 ```
 
-Calls `GET /_admin/services` and pretty-prints the JSON response. Each
+`--all` calls `GET /_admin/services` and pretty-prints the JSON response. Each
 entry includes `service_id`, `user_id`, the route path pattern, and the
 allowed methods.
 
