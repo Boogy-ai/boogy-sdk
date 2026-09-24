@@ -15,6 +15,13 @@ package boogy:platform@0.1.0;
 /// Boogy workload"; outbound-http is "fetch but to any URL with
 /// host-mediated policy."
 interface outbound-http {
+    /// Names a declared OAuth connection (`[connections.<connection>]`) and
+    /// the subject whose tokens to use. See the `connections` interface.
+    record connection-ref {
+        connection: string,
+        subject: string,
+    }
+
     record outbound-request {
         /// HTTP method. Validated against RFC 7230 token rules at
         /// the host edge; invalid characters return
@@ -51,6 +58,12 @@ interface outbound-http {
         /// Undeclared, unbound, or unresolvable refs fail closed as
         /// `unknown-secret(<ref>)`.
         secret-headers: list<tuple<string, string>>,
+        /// Authenticate this request with an OAuth connection the platform
+        /// holds. The host injects `Authorization: Bearer <access token>` at
+        /// the wire edge — refreshing it first when due — and ONLY when the
+        /// URL's host is in that connection's declared `inject_hosts`. The
+        /// component never sees the token. `none` → no connection auth.
+        connection-auth: option<connection-ref>,
     }
 
     record outbound-response {
@@ -103,6 +116,17 @@ interface outbound-http {
         /// manifest's `[secrets]` block, or the named secret has no
         /// value bound for this deployment.
         unknown-secret(string),
+        /// `connection-auth` named a connection that cannot supply a token:
+        /// not declared, the subject never connected, the connection needs
+        /// the subject to reconnect (see `connections.status`), or the
+        /// `subject` is empty or over the platform's length bound — the same
+        /// bound `connections.begin`, `status` and `revoke` apply, refused
+        /// here before anything is sent. The string says which.
+        connection-unavailable(string),
+        /// `connection-auth` was set on a request whose URL host is not in
+        /// that connection's declared `inject_hosts`, or whose URL is not
+        /// `https`. Nothing was sent.
+        connection-host-not-allowed(string),
         /// Internal host error (TLS error not covered above, panic,
         /// pool exhausted, etc.). String for human consumption only.
         internal(string),

@@ -1014,12 +1014,15 @@ The whole call tree shares one 5s / 10MB store transaction envelope.
 
 **Denied inside a tx:** `outbound_http`, every `signing` **write**
 (`signing_create_key` / `signing_sign_digest` / `signing_sign_message` /
-`signing_remove_key`), and `background_jobs` cancel/status are refused while a
+`signing_remove_key`), `connections_begin` / `connections_revoke`, and
+`background_jobs` cancel/status are refused while a
 transaction is open (they surface as their capability/backend errors — signing
 as `SignError::CapabilityDenied("signing is not allowed inside a transaction…")`,
-the same variant an ungranted capability gives; match the variant, not the
+the same variant an ungranted capability gives; connections as
+`ConnectionError::CapabilityDenied`; match the variant, not the
 message).
-`signing_list_keys` is a read and is allowed. `background_jobs` enqueue is
+`signing_list_keys` and `connections_status` are reads and are allowed.
+`background_jobs` enqueue is
 allowed inside a transaction — the job is submitted only if the transaction
 commits.
 
@@ -1031,6 +1034,12 @@ would therefore mint one signature (and one audit row) per attempt. **Sign
 before opening the transaction** — or after it commits — and record the
 signature inside it. A denial does **not** poison the transaction: handle the
 error and the transaction can still commit.
+
+`connections_begin` and `connections_revoke` are denied for the same reason
+in a different shape: `begin` writes a single-use authorization row and hands
+back a provider URL, `revoke` deletes tokens and calls the provider, and a
+re-run closure can neither un-start an authorization nor un-revoke a grant.
+Link or unlink **outside** the transaction and record the outcome inside it.
 
 The built-in engine is the sole per-service store engine, so `tx` is always
 available.
@@ -2031,6 +2040,126 @@ another service's channels. Public channels need no grant; private
 channels require the caller to present a grant minted by the owning
 service.
 
+## Connections (OAuth on a user's behalf)
+
+A service can call a third-party API **as one of its users** without ever
+holding that user's access token. Declare the provider in the manifest, send
+the user through consent once, then name the connection on an outbound
+request — the platform injects a fresh bearer at the wire edge, refreshing it
+when due, and only to the hosts you declared.
+
+**Manifest:**
+```toml
+[capabilities]
+outbound_http = true          # required; there is no `connections` capability
+
+[outbound]
+allowed_hosts = ["www.googleapis.com", "oauth2.googleapis.com", "accounts.google.com"]
+
+[secrets]
+google_client_id     = { usage = ["oauth-client"] }
+google_client_secret = { usage = ["oauth-client"] }
+
+[connections.google]
+authorize_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url     = "https://oauth2.googleapis.com/token"
+revoke_url    = "https://oauth2.googleapis.com/revoke"
+scopes        = ["https://www.googleapis.com/auth/youtube.readonly"]
+client_id     = "google_client_id"
+client_secret = "google_client_secret"
+inject_hosts  = ["www.googleapis.com"]   # where the token may be sent
+```
+
+Declaring the block is the gate — there is no `[capabilities] connections`
+flag, the same way `[secrets]` works. An `oauth-client` secret may **not**
+also carry `outbound-header`; the manifest is refused if it does, because a
+guest could otherwise attach the OAuth client secret to its own request.
+
+**`revoke_url` is optional, and omitting it has a cost at delete time.**
+It is what the platform calls to hand a user's grant back when a connection
+is revoked or the service is deleted. Without it there is nothing to call:
+those rows are still removed at teardown — no wait makes an endpoint that
+was never declared reachable — but the user's grant stays live at the
+provider with the last handle on it gone, leaving them only the provider's
+own account page. The same applies to rows of a connection you stop
+declaring while links for it still exist, so remove a
+`[connections.<name>]` block only once its users are unlinked. Declare
+`revoke_url` unless the provider has no revocation endpoint at all.
+
+**SDK functions** (available unqualified after `wit_glue!`):
+
+| Function | Purpose |
+|---|---|
+| `connections_begin(connection, subject, return_to) -> Result<String, ConnectionError>` | Start an authorization for `subject`; returns the provider URL to send the browser to. `return_to` must point at this service's own origin (compared as a real origin — scheme, host and port — never a string prefix), and the platform redirects there once the exchange completes. **Denied inside a `tx`, and from a background job.** At most 4 per execution context (per request, and per peer hop). |
+| `connections_status(connection, subject) -> Result<ConnectionStatus, ConnectionError>` | `{ state, scopes, connected_at_ms, refreshed_at_ms, last_error }` — never token material; `last_error` is a failure CLASS. A read, allowed inside a `tx`. |
+| `connections_revoke(connection, subject) -> Result<(), ConnectionError>` | Forget the tokens, and revoke them at the provider (best effort). **Denied inside a `tx`.** |
+
+**Enums** (`boogy_sdk::connections`):
+
+- `ConnectionState` (three): `Connected`, `NeedsReconnect`, `Absent`. Only
+  `Connected` means "call the API"; the other two mean "send the user through
+  `connections_begin`".
+- `ConnectionError` (four): `UnknownConnection`, `CapabilityDenied`,
+  `BadReturnTo`, `Internal`. Match the **variant**, not the message.
+
+**`subject` decides whose account this is, and the platform takes it at face
+value.** `status`, `revoke` and the injected token all key on exactly the
+string you pass. **Derive it from `auth::current_principal()` — never from a
+path segment, query parameter or body.** A handler that forwards request input
+into `subject` lets any caller link, inspect, revoke *and use* another user's
+account at the provider with your service's credentials, and nothing on the
+platform can tell that call apart from the legitimate one.
+
+**Usage example:**
+
+```rust
+use boogy_sdk::connections::ConnectionState;
+
+fn start_link(_req: &mut Req<'_>) -> Result<Json<String>, ApiError> {
+    let subject = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
+    let url = connections_begin("google", &subject, "https://acme.example.com/linked")
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(url))
+}
+
+fn linked(_req: &mut Req<'_>) -> Result<Json<bool>, ApiError> {
+    let subject = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
+    let s = connections_status("google", &subject)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(matches!(s.state, ConnectionState::Connected)))
+}
+```
+
+**Using the connection is a field on the outbound request, not a call** — set
+`connection_auth: Some(ConnectionRef { connection, subject })` on
+`outbound_http::OutboundRequest` and leave `secret_headers` empty; neither
+`headers` nor `secret_headers` can carry a connection token. Two `FetchError`
+variants are specific to it: `connection-unavailable` (not declared, never
+connected, needs reconnecting, or a `subject` that is empty or over the
+platform's length bound) and `connection-host-not-allowed` (the URL's host is
+not in that connection's `inject_hosts`).
+
+The consent callback is served by the platform at
+`https://<handle>.<base>/boogy/connections/callback` — a provisioner registers
+exactly that URL with the provider, and no guest code runs for it. Full
+authoring guidance, including the `inject_hosts` and provider-limit traps, is
+in the `boogy-oauth-connections` skill.
+
+**Deleting the service does not revoke its grants on the request path.** The
+`DELETE` returns **202** (`{"state": "deleting"}`) and destroys nothing: the
+service stops serving at once, but its deployment, its data and its connection
+rows all survive the call, because the platform needs the live deployment to
+know each connection's `revoke_url` and client credentials. It then revokes
+each grant at its provider in the background and deletes that row only once
+the grant is settled, retrying a provider outage rather than stranding it, and
+performs the real delete when none remain. A provider that refuses
+indefinitely does not make the service undeletable — past a bounded number of
+attempts or a bounded age the platform deletes it anyway and records
+`service.deleted_with_unrevoked_grants` in the owner's audit tail. Do not
+unbind the `oauth-client` secret until the teardown has finished: without it
+the revoke call cannot authenticate, which is a failure that never resolves
+itself.
+
 ## API keys (`api_keys_glue!`)
 
 If you invoke `boogy_sdk::api_keys_glue!(bindings)`:
@@ -2095,7 +2224,7 @@ use crate::bindings;  // if you need to reach into raw WIT bindings
 
 | Category | Names |
 |---|---|
-| Modules | `store` (= WIT `bindings::boogy::platform::store`), `auth`, `bindings`, the `peer`/`secrets`/`signing`/`background_jobs`/`websockets` binding modules, plus `response` and `json` |
+| Modules | `store` (= WIT `bindings::boogy::platform::store`), `auth`, `bindings`, the `peer`/`secrets`/`signing`/`connections`/`background_jobs`/`websockets` binding modules, plus `response` and `json` |
 | Router / request | `Router`, `Req`, `Params`, `Request`, `Path`, `FromRequest`, `Principal`, `Ctx`, `QueryExtractor` (the `Query` *request extractor*, aliased so it doesn't clash with the `Query` DSL builder — both are in scope) |
 | Response wrappers | `Json`, `Created`, `NoContent`, `Redirect`, `IntoResponse` |
 | Errors / parsing | `ApiError`, `parse_body`, `validate_body` |
@@ -2104,6 +2233,7 @@ use crate::bindings;  // if you need to reach into raw WIT bindings
 | Schema | `create_table_from`, `migration`, `migrations`. **`Schema` itself is NOT emitted** — it is the `Api::schema` parameter type and travels with the trait, so import the pair: `use boogy_sdk::{schema_decl::Schema, Api};`. This is the one line in a service's `lib.rs` that is an import rather than an injected name, and omitting it fails as `cannot find type Schema in this scope` on the canonical `fn schema(s: &mut Schema)`. |
 | Row reads | `to_sdk_row`, `get_row`, `find_all_rows`, `find_row_by`, `find_rows_by`, `find_rows`, `upsert_increment`, `UpsertColumns` (the builder with `none`/`always`/`on_insert_only` — **not** `store::UpsertColumns`), `for_each_batch` |
 | Transactions | `tx` (no-arg closure, generic over error type; call the same `store::*`/`db_*`/`find_row_by` fns inside) |
+| Connections (OAuth) | `connections_begin`, `connections_status`, `connections_revoke` — emitted unconditionally, like `signing_*` and `ws_*`; usable only where `[connections.<name>]` is declared. See [Connections](#connections-oauth-on-a-users-behalf) |
 | Helpers | `filter_eq` (+ `filter_neq`/`filter_gt`/`filter_gte`/`filter_lt`/`filter_lte`/`filter_like`/`filter_not_like`/`filter_is_null`/`filter_is_not_null`/`filter_in`), `sort_asc`/`sort_desc`, `page`, `now_millis`, `peer_fetch` (checked default — `Err` on non-2xx), `peer_fetch_raw` (opt-in — always `Ok` on any status) |
 
 If `api_keys_glue!` is also invoked, add: the `api_key_routes` module

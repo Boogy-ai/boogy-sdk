@@ -1,0 +1,46 @@
+package boogy:platform@0.1.0;
+
+/// OAuth connections the platform holds on this service's behalf. Tokens are
+/// never returned: name the connection on an outbound request
+/// (`outbound-request.connection-auth`) and the platform injects a fresh
+/// access token, only to that connection's declared `inject_hosts`.
+interface connections {
+    variant connection-error {
+        /// There is no usable connection here: no `[connections.<name>]`, the
+        /// service lacks outbound_http, or this subject has never completed
+        /// the flow / must run it again. The remedy is always `begin`.
+        unknown-connection(string),
+        /// The call was refused and the caller can fix it: `begin`/`revoke`
+        /// inside a transaction, `begin` from a background job, a `subject`
+        /// outside the accepted length, or a destination the connection's
+        /// `inject_hosts` does not cover. The message says which.
+        capability-denied(string),
+        /// `return-to` is not a URL on this service's own origin (scheme,
+        /// host and port must all match the origin the browser is on).
+        bad-return-to(string),
+        internal(string),
+    }
+    enum connection-state { connected, needs-reconnect, absent }
+    record connection-status {
+        state: connection-state,
+        scopes: list<string>,
+        connected-at-ms: option<s64>,
+        refreshed-at-ms: option<s64>,
+        last-error: option<string>,
+    }
+    /// Start an authorization for `subject`; returns the provider URL to send
+    /// the user's browser to. After consent the platform finishes the exchange
+    /// and redirects to `return-to`.
+    ///
+    /// `subject` names WHOSE connection this is, and the platform takes it at
+    /// face value on every op — `status`, `revoke` and the token injected for
+    /// `connection-auth` all key on it. Derive it from the authenticated
+    /// caller (`auth::current-principal`), never from a path segment, query
+    /// parameter or request body: a service that forwards request input here
+    /// lets any caller link, inspect, revoke and USE another user's account
+    /// at the provider.
+    begin: func(connection: string, subject: string, return-to: string) -> result<string, connection-error>;
+    status: func(connection: string, subject: string) -> result<connection-status, connection-error>;
+    /// Forget the tokens (and revoke them at the provider, best effort).
+    revoke: func(connection: string, subject: string) -> result<_, connection-error>;
+}

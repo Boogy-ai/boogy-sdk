@@ -79,7 +79,10 @@ pub async fn remove(host: &str, token: &str, service_id: &str) -> Result<()> {
     }
 
     if resp.status().is_success() {
-        println!("Removed service: {service_id}");
+        // The route accepts (202) and begins a background delete — it does
+        // not remove the service synchronously. See
+        // docs/superpowers/specs/2026-09-22-draining-service-delete-design.md.
+        println!("Service is being deleted: {service_id}");
     } else {
         anyhow::bail!("failed to remove service: {}", resp.status());
     }
@@ -112,7 +115,9 @@ pub async fn remove_admin(host: &str, token: &str, owner: &str, service_id: &str
     }
 
     if resp.status().is_success() {
-        println!("Removed service: {owner}/{service_id}");
+        // Same two-phase delete as the owner-scoped route above: accepted
+        // (202), not removed synchronously.
+        println!("Service is being deleted: {owner}/{service_id}");
     } else {
         anyhow::bail!("failed to remove service: {}", resp.status());
     }

@@ -74,6 +74,7 @@ pub mod rpc;
 pub mod migration_registry;
 pub mod schema_decl;
 pub mod schema_resolve;
+pub mod connections;
 pub mod secrets;
 pub mod signing;
 pub mod spec;

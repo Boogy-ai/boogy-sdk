@@ -151,6 +151,8 @@ macro_rules! wit_glue {
         #[allow(unused_imports)]
         use $bindings::boogy::platform::signing as signing_bindings;
         #[allow(unused_imports)]
+        use $bindings::boogy::platform::connections as connections_bindings;
+        #[allow(unused_imports)]
         use $bindings::boogy::platform::background_jobs as jobs_bindings;
         #[allow(unused_imports)]
         use $bindings::boogy::platform::websockets as ws_bindings;
@@ -5630,6 +5632,105 @@ macro_rules! wit_glue {
             match signing_bindings::remove_key(&label.to_string()) {
                 Ok(()) => Ok(()),
                 Err(e) => Err(__signing_error_to_sdk(e)),
+            }
+        }
+
+        // -- OAuth connections bridge --
+        //
+        // Same shape as the signing bridge: SDK types in and out, WIT types
+        // only inside. A token never appears in any of these signatures —
+        // a connection is USED by naming it on an outbound request
+        // (`connection_auth`), and the platform injects the token at the
+        // wire edge.
+
+        fn __connections_error_to_sdk(
+            e: connections_bindings::ConnectionError,
+        ) -> $crate::connections::ConnectionError {
+            match e {
+                connections_bindings::ConnectionError::UnknownConnection(s) => {
+                    $crate::connections::ConnectionError::UnknownConnection(s)
+                }
+                connections_bindings::ConnectionError::CapabilityDenied(s) => {
+                    $crate::connections::ConnectionError::CapabilityDenied(s)
+                }
+                connections_bindings::ConnectionError::BadReturnTo(s) => {
+                    $crate::connections::ConnectionError::BadReturnTo(s)
+                }
+                connections_bindings::ConnectionError::Internal(s) => {
+                    $crate::connections::ConnectionError::Internal(s)
+                }
+            }
+        }
+
+        fn __connections_status_to_sdk(
+            s: connections_bindings::ConnectionStatus,
+        ) -> $crate::connections::ConnectionStatus {
+            $crate::connections::ConnectionStatus {
+                state: match s.state {
+                    connections_bindings::ConnectionState::Connected => {
+                        $crate::connections::ConnectionState::Connected
+                    }
+                    connections_bindings::ConnectionState::NeedsReconnect => {
+                        $crate::connections::ConnectionState::NeedsReconnect
+                    }
+                    connections_bindings::ConnectionState::Absent => {
+                        $crate::connections::ConnectionState::Absent
+                    }
+                },
+                scopes: s.scopes,
+                connected_at_ms: s.connected_at_ms,
+                refreshed_at_ms: s.refreshed_at_ms,
+                last_error: s.last_error,
+            }
+        }
+
+        /// Start an authorization for `subject`. Returns the provider URL to
+        /// send the user's browser to; after consent the platform finishes the
+        /// exchange and redirects to `return_to`, which must be a URL on this
+        /// service's own origin — same scheme, host and port as the origin the
+        /// browser is on. Refused inside a transaction, and
+        /// from a background job.
+        #[allow(dead_code)]
+        fn connections_begin(
+            connection: &str,
+            subject: &str,
+            return_to: &str,
+        ) -> ::core::result::Result<::std::string::String, $crate::connections::ConnectionError> {
+            match connections_bindings::begin(
+                &connection.to_string(),
+                &subject.to_string(),
+                &return_to.to_string(),
+            ) {
+                Ok(url) => Ok(url),
+                Err(e) => Err(__connections_error_to_sdk(e)),
+            }
+        }
+
+        /// Whether `subject` is connected, with which scopes. No token material.
+        #[allow(dead_code)]
+        fn connections_status(
+            connection: &str,
+            subject: &str,
+        ) -> ::core::result::Result<
+            $crate::connections::ConnectionStatus,
+            $crate::connections::ConnectionError,
+        > {
+            match connections_bindings::status(&connection.to_string(), &subject.to_string()) {
+                Ok(s) => Ok(__connections_status_to_sdk(s)),
+                Err(e) => Err(__connections_error_to_sdk(e)),
+            }
+        }
+
+        /// Forget this subject's tokens (revoked upstream too, best effort).
+        /// Refused inside a transaction.
+        #[allow(dead_code)]
+        fn connections_revoke(
+            connection: &str,
+            subject: &str,
+        ) -> ::core::result::Result<(), $crate::connections::ConnectionError> {
+            match connections_bindings::revoke(&connection.to_string(), &subject.to_string()) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(__connections_error_to_sdk(e)),
             }
         }
 
