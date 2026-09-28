@@ -6,6 +6,7 @@ mod domain;
 mod frontend;
 mod login;
 mod manage;
+mod new;
 mod provision;
 mod secret;
 mod skills;
@@ -33,6 +34,26 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Start a new frontend project from the platform's template
+    New {
+        /// Service name (also the directory name unless --dir is given).
+        /// Not used with --upgrade.
+        #[arg(required_unless_present = "upgrade")]
+        name: Option<String>,
+        /// Refresh the scaffold-owned parts of an existing project (in --dir,
+        /// default the current directory) instead of creating one
+        #[arg(long)]
+        upgrade: bool,
+        /// Who builds the frontend: the platform (source) or you, with Vite (dist)
+        #[arg(long, value_enum, default_value_t = new::BuildMode::Source)]
+        build: new::BuildMode,
+        /// Read the template from a local directory instead of the host
+        #[arg(long)]
+        template_dir: Option<std::path::PathBuf>,
+        /// Write into this directory instead of ./<name>
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
     /// Sign in via your browser (OAuth device flow)
     Login,
     /// Build a service to wasm32-wasip2
@@ -140,6 +161,10 @@ enum Commands {
     Check {
         /// Path to scan (default: current directory)
         path: Option<String>,
+        /// Also enforce the @boogy/web layout conventions (no media queries,
+        /// no sqrt(pow()), no pixel sizes outside theme.css)
+        #[arg(long)]
+        layout: bool,
     },
     /// Manage custom domains for your services
     Domain(domain::DomainArgs),
@@ -296,7 +321,15 @@ async fn main() -> anyhow::Result<()> {
                 skills::run(dest.as_deref(), "updated", agent)?
             }
         },
-        Commands::Check { path } => check::run(path.as_deref())?,
+        Commands::Check { path, layout } => check::run(path.as_deref(), layout)?,
+        Commands::New { name, upgrade, build, template_dir, dir } => {
+            if upgrade {
+                new::run_upgrade(cli.host.clone(), template_dir, dir).await?
+            } else {
+                let name = name.expect("clap requires NAME unless --upgrade");
+                new::run(name, build, cli.host.clone(), template_dir, dir).await?
+            }
+        }
         Commands::Domain(args) => {
             let token = resolve_token(&cli.token)?;
             domain::run(&cli.host, &token, args).await?

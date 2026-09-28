@@ -147,6 +147,7 @@ derives the **deployment shape**:
 | `build` | string | `"ts"` | `"ts"` (platform transpiles TypeScript) or `"none"` (assets are already built). |
 | `private` | bool | `false` | `true` gates asset serving behind the service ingress (a private app). Default public. |
 | `allow_cdn` | bool | `false` | When a bare import isn't vendored under `/vendor/`, resolve it to an `esm.sh` CDN URL in the generated import map instead of failing the build. |
+| `jsx_import_source` | string | `"preact"` | Module specifier the automatic JSX runtime imports from — the emitted import is `<value>/jsx-runtime`. Only affects `.tsx`/`.jsx` sources under `build = "ts"`. |
 | `minify` | bool | on when `build = "ts"` | Minify (compact) the transpiled `.ts` → `.js` output at deploy. Defaults on whenever the bundle is transpiled; set `minify = false` to ship readable JS for debugging. Compaction only (whitespace/optional tokens); passthrough `.js` is served verbatim. |
 | `csp` | string | — | Opt-in `Content-Security-Policy`, emitted verbatim on served responses. Unset = no CSP header. A safe baseline (`X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`) is always on. |
 | `frame_options` | string | `"same_origin"` | `same_origin` (→ `SAMEORIGIN`), `deny` (→ `DENY`), or `none` (omit the header, for apps meant to be embedded). |
@@ -266,7 +267,7 @@ Opt-in, host-enforced cross-origin allowlist. Absent = no CORS headers emitted (
 | `allowed_origins` | string array | `[]` | Exact origins (`https://app.example.com`), or `["*"]` to allow any — permitted only when `allow_credentials = false`. |
 | `allowed_methods` | string array | `[]` | Methods echoed on preflight. Empty = a safe default set. |
 | `allowed_headers` | string array | `[]` | Request headers echoed on preflight. |
-| `allow_credentials` | bool | `false` | Allow cookie/`Authorization` requests. `true` forbids `allowed_origins = ["*"]` (rejected at deploy). |
+| `allow_credentials` | bool | `false` | Emit `Access-Control-Allow-Credentials: true`, which lets the browser attach **cookies** to a cross-origin request. `true` forbids `allowed_origins = ["*"]` (rejected at deploy). **You do not need this for an `Authorization: Bearer` header** — that is admitted by listing `authorization` in `allowed_headers`, and it works alongside the `["*"]` wildcard. Reach for a bearer rather than a cookie when callers come from origins you cannot enumerate in advance. |
 | `max_age` | u64 | — | Preflight cache lifetime in seconds. |
 
 ```toml

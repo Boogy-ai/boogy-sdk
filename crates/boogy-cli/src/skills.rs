@@ -152,8 +152,14 @@ websockets, MCP/REST surfaces, background jobs, and deploy.\n\
 /// Idempotent: running twice yields the same result with exactly one block.
 /// Content outside the BEGIN/END markers is never modified.
 fn upsert_managed_block(existing: &str, block: &str) -> String {
-    if let (Some(start), Some(end_at)) = (existing.find(POINTER_BEGIN), existing.find(POINTER_END)) {
-        let end = end_at + POINTER_END.len();
+    upsert_marked_block(existing, block, POINTER_BEGIN, POINTER_END)
+}
+
+/// [`upsert_managed_block`] for any pair of markers — shared with `boogy new
+/// --upgrade`, which manages its own block in a project's `AGENTS.md`.
+pub(crate) fn upsert_marked_block(existing: &str, block: &str, begin: &str, end_marker: &str) -> String {
+    if let (Some(start), Some(end_at)) = (existing.find(begin), existing.find(end_marker)) {
+        let end = end_at + end_marker.len();
         if end > start {
             let mut out = String::with_capacity(existing.len());
             out.push_str(&existing[..start]);
