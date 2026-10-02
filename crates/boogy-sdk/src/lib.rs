@@ -47,6 +47,7 @@
 
 pub mod api_keys;
 pub mod ctx;
+pub mod discovery;
 pub mod error;
 pub mod expr;
 pub mod extract;

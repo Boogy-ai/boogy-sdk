@@ -122,13 +122,18 @@ enum Commands {
         #[arg(long)]
         overrides: Option<String>,
     },
-    /// Upgrade a provisioned service to a newer module version
+    /// Upgrade a provisioned service to a module version — the current one, to
+    /// change only its overrides
     Upgrade {
         /// Service id to upgrade
         service_id: String,
         /// Target module version
         #[arg(long)]
         to: String,
+        /// Path to a TOML file of sparse manifest overrides that REPLACES the
+        /// instance's own (omit to keep them; an empty file clears them)
+        #[arg(long)]
+        overrides: Option<String>,
     },
     /// List your deployed services (owner-scoped; any signed-in user)
     List {
@@ -275,9 +280,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        Commands::Upgrade { service_id, to } => {
+        Commands::Upgrade { service_id, to, overrides } => {
             let token = resolve_token(&cli.token)?;
-            provision::upgrade(&cli.host, &token, &service_id, &to).await?
+            provision::upgrade(&cli.host, &token, &service_id, &to, overrides.as_deref()).await?
         }
         Commands::List { all } => {
             let token = resolve_token(&cli.token)?;

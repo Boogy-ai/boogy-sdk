@@ -497,6 +497,32 @@ Advanced: controls who may provision a service instance from a published module 
 
 ---
 
+## `[discovery]`
+
+Lets other services find an account's instance of this module, and says what each instance publishes for them. With it, a service can ask the platform "does `dave` run this module, and where?" and get an answer instead of assuming a service id. Use it when instances of one module talk to each other, as in a messenger where every person runs their own copy.
+
+```toml
+[discovery]
+listed = true                        # the default whenever routes are declared
+
+[[discovery.routes]]
+name = "peer-messages"               # the stable name a caller looks for
+path = "/chats/api/peer/messages"    # the module's own path
+version = 1                          # bump when this route's contract changes
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `listed` | boolean | `true` if any routes are declared, else `false` | Whether an instance can be found by a lookup. The one `[discovery]` field a provisioner may override, at provision or later through an upgrade's overrides, so whoever runs an instance can hide theirs (or list it, if the author left it off). |
+| `routes` | array of `{ name, path, version }` | `[]` | What every instance publishes. Set by the module author alone: a provision override may not add, remove or change them. |
+
+- **No `[discovery]` section means an instance is never listed**, whatever a provisioner's override says: discovery is the author's opt-in.
+- **A route's `path` is the module's own path**, as the module declares its routes, not a mounted one. A call from another service reaches it on every instance, whatever path that instance was mounted at when it was provisioned. `path` must be absolute, with no `..`, query or fragment. `version` starts at 1.
+- **An unlisted instance and no instance look the same** to whoever asks.
+- **How to look one up:** from a service, `discovery::lookup(handle, &Module::Same)` returns the instances of the module the calling service runs (see the SDK reference). Over HTTP, `GET /v1/registry/instances/{handle}?module=<author>/<name>` works for anyone signed in.
+
+---
+
 ## Common errors
 
 **Capability used but not granted**

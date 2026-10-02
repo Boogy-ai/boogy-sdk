@@ -4482,6 +4482,32 @@ macro_rules! wit_glue {
         // Both deny-by-existence-mask: missing row and other-owner
         // map to the same 404, preventing enumeration via guess + 403.
 
+        /// Finding another account's instance of a module, through the
+        /// platform's instance lookup (`boogy_sdk::discovery`). Needs
+        /// `[capabilities] peer = true`.
+        pub mod discovery {
+            /// `handle`'s listed instances of `module` — at most 10, ordered
+            /// by service id — or an empty list: an unlisted or absent
+            /// instance reads the same. A transport failure is the peer
+            /// error; an answer that does not parse is `Internal`. Call it
+            /// while handling a request: a background job cannot reach the
+            /// platform registry, and there this fails with `TargetNotFound`
+            /// (naming the registry, not the instance asked about).
+            #[allow(dead_code)]
+            pub fn lookup(
+                handle: &str,
+                module: &$crate::discovery::Module,
+            ) -> ::core::result::Result<::std::vec::Vec<$crate::discovery::Instance>, $crate::peer::PeerError> {
+                let resp = super::peer_fetch(
+                    $crate::discovery::REGISTRY,
+                    &$crate::peer::PeerRequest::get($crate::discovery::lookup_path(handle, module)),
+                )?;
+                $crate::discovery::parse_answer(resp.body_bytes()).map_err(|e| {
+                    $crate::peer::PeerError::Internal(::std::format!("instance lookup answer: {e}"))
+                })
+            }
+        }
+
         pub mod auth {
             /// Configuration for the [`owns_resource`] guard. Built via
             /// the free function and registered with `Router::guard(...)`

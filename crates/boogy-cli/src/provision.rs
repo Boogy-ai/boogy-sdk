@@ -432,17 +432,36 @@ pub async fn provision(
     Ok(())
 }
 
-/// Upgrade a provisioned service to a newer module version.
-pub async fn upgrade(host: &str, token: &str, service_id: &str, to: &str) -> Result<()> {
+/// The upgrade request: `overrides` only when given, so its absence carries
+/// the instance's own overrides forward.
+fn upgrade_body(to: &str, overrides: Option<String>) -> serde_json::Value {
+    let mut body = json!({ "to_version": to });
+    if let Some(o) = overrides {
+        body["overrides"] = serde_json::Value::String(o);
+    }
+    body
+}
+
+/// Upgrade a provisioned service to a module version (the current one, to
+/// change only its overrides). `overrides_path`, when given, REPLACES the
+/// instance's overrides; otherwise they carry forward.
+pub async fn upgrade(host: &str, token: &str, service_id: &str, to: &str, overrides_path: Option<&str>) -> Result<()> {
+    let overrides = match overrides_path {
+        Some(p) => Some(std::fs::read_to_string(p).context("failed to read overrides file")?),
+        None => None,
+    };
     println!("Upgrading service...");
     println!("  Service: {service_id}");
     println!("  To version: {to}");
+    if overrides.is_some() {
+        println!("  Overrides: replaced");
+    }
 
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{host}/v1/services/{service_id}/upgrade"))
         .header("Authorization", format!("Bearer {token}"))
-        .json(&json!({ "to_version": to }))
+        .json(&upgrade_body(to, overrides))
         .send()
         .await
         .context("failed to reach host")?;
@@ -479,6 +498,17 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn an_upgrade_carries_overrides_forward_unless_given_a_file() {
+        // No file: the key is absent, so the host carries the instance's own
+        // overrides forward. A file: its text replaces them ("" clears them).
+        assert_eq!(upgrade_body("1.2.0", None), json!({ "to_version": "1.2.0" }));
+        assert_eq!(
+            upgrade_body("1.2.0", Some("[discovery]\nlisted = false\n".into())),
+            json!({ "to_version": "1.2.0", "overrides": "[discovery]\nlisted = false\n" })
+        );
+    }
 
     /// Write a manifest file + optional wasm file into a unique temp subdir.
     /// Returns the manifest path. Caller is responsible for cleanup (dir is

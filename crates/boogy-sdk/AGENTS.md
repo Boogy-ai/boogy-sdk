@@ -1947,6 +1947,42 @@ generic relay/proxy route, or a caller that wants to map the callee's status
 to its own domain error instead of the generic 502. **Probing a peer's
 status from inside a transaction requires this explicit opt-in.**
 
+### Finding another account's instance (`discovery`)
+
+A service id is chosen by whoever provisions an instance, so a peer's
+address can't be built from a handle. Ask the platform instead:
+`discovery::lookup(handle, &module)` returns that handle's **listed**
+instances of a module. `Module::Same` means the module this service runs,
+which is how a module finds other instances of itself. You get at most ten,
+ordered by service id, each with an `address` (the `peer_fetch` target), its
+`module_version`, a browser `url`, and the `routes` its module publishes
+under `[discovery]`.
+
+```rust
+use boogy_sdk::discovery::Module;
+
+fn peer_for(handle: &str) -> Result<Option<String>, ApiError> {
+    let found = discovery::lookup(handle, &Module::Same)?;
+    Ok(found.first().map(|i| i.address.clone()))
+}
+```
+
+- **Empty means unlisted or absent.** An empty list is the same answer for
+  "no instance" and "an instance its owner unlisted".
+- **Route paths are the module's own.** A published route's `path` reaches
+  every instance, whatever path it is mounted at.
+- **Needs `peer = true`.** It's a `peer_fetch` to the platform registry, so
+  a failure lifts to 502 like any peer call. Lookups are rate limited per
+  caller: look up when a relationship starts and store the address.
+- **From a request, not a background job.** A background job cannot reach the
+  platform registry today: there `lookup` fails with `TargetNotFound`, which
+  names the registry, not the instance you asked about. Look up while handling
+  a request (with or without a signed-in person) and store the address.
+- **A failure is not "absent".** If the platform cannot answer (a 503 from
+  the registry), `lookup` returns an error, never an empty list.
+- **The pure types are in `boogy_sdk::discovery`:** `Module`, `Instance`,
+  `PublishedRoute`, `lookup_path` and `parse_answer`.
+
 ## Websockets (real-time channels)
 
 A service can broadcast real-time messages to subscribers over declared
@@ -2224,7 +2260,7 @@ use crate::bindings;  // if you need to reach into raw WIT bindings
 
 | Category | Names |
 |---|---|
-| Modules | `store` (= WIT `bindings::boogy::platform::store`), `auth`, `bindings`, the `peer`/`secrets`/`signing`/`connections`/`background_jobs`/`websockets` binding modules, plus `response` and `json` |
+| Modules | `store` (= WIT `bindings::boogy::platform::store`), `auth`, `discovery` (`discovery::lookup` — see [Finding another account's instance](#finding-another-accounts-instance-discovery)), `bindings`, the `peer`/`secrets`/`signing`/`connections`/`background_jobs`/`websockets` binding modules, plus `response` and `json` |
 | Router / request | `Router`, `Req`, `Params`, `Request`, `Path`, `FromRequest`, `Principal`, `Ctx`, `QueryExtractor` (the `Query` *request extractor*, aliased so it doesn't clash with the `Query` DSL builder — both are in scope) |
 | Response wrappers | `Json`, `Created`, `NoContent`, `Redirect`, `IntoResponse` |
 | Errors / parsing | `ApiError`, `parse_body`, `validate_body` |
