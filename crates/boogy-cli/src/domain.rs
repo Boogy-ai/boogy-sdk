@@ -15,7 +15,7 @@ pub enum DomainCmd {
     Add {
         /// Fully-qualified domain name (e.g. api.example.com)
         fqdn: String,
-        /// Service's route segment — the path prefix it's served under (the token after your handle in a subdomain URL, e.g. `api` for `<handle>.boogy.app/api/...`). This is NOT the manifest service id.
+        /// The service id — your service's `[service] id` (as `boogy list` shows it). The domain serves that one service at its root.
         #[arg(long)]
         service: String,
     },
@@ -60,6 +60,23 @@ struct DomainEntry {
     domain: String,
     service_id: String,
     status: String,
+    /// Why the platform disabled the binding, when it did.
+    #[serde(default)]
+    disabled_reason: Option<String>,
+}
+
+/// One line per domain the platform disabled, saying why and what to do.
+fn disabled_notes(domains: &[DomainEntry]) -> Vec<String> {
+    domains
+        .iter()
+        .filter_map(|d| {
+            let reason = d.disabled_reason.as_deref()?;
+            Some(format!(
+                "  {}: disabled — {reason}. Run `boogy domain add {} --service <service id>` to bind it again.",
+                d.domain, d.domain
+            ))
+        })
+        .collect()
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -82,7 +99,7 @@ pub(crate) fn print_dns_records(domain: &str, status: &str, records: &[DnsRecord
         println!("No DNS records returned — check the platform dashboard.");
         return;
     }
-    println!("Your service's route segment will be served at the domain root once verified.");
+    println!("Your service will be served at the domain root once verified.");
     println!();
     println!("Create the following DNS records at your registrar:");
     println!();
@@ -156,7 +173,7 @@ async fn add(host: &str, token: &str, fqdn: &str, service: &str) -> Result<()> {
     }
     if status == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!(
-            "add failed (404 Not Found): service '{service}' not found or not owned by you"
+            "add failed (404 Not Found): you have no deployed service with the id '{service}'"
         );
     }
     if !status.is_success() {
@@ -230,6 +247,13 @@ async fn list(host: &str, token: &str) -> Result<()> {
             svc_w = svc_w,
         );
     }
+    let notes = disabled_notes(&domains);
+    if !notes.is_empty() {
+        println!();
+        for note in notes {
+            println!("{note}");
+        }
+    }
     Ok(())
 }
 
@@ -269,6 +293,21 @@ async fn remove(host: &str, token: &str, fqdn: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disabled_domain_says_why_and_how_to_bind_it_again() {
+        let entries: Vec<DomainEntry> = serde_json::from_value(serde_json::json!([
+            { "domain": "app.acme.com", "service_id": "api", "status": "disabled",
+              "disabled_reason": "the binding named a route segment, not a service" },
+            { "domain": "www.acme.com", "service_id": "site", "status": "verified", "disabled_reason": null },
+            { "domain": "old.acme.com", "service_id": "site", "status": "disabled" },
+        ]))
+        .expect("entries");
+        let notes = disabled_notes(&entries);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("app.acme.com") && notes[0].contains("route segment"), "{}", notes[0]);
+        assert!(notes[0].contains("boogy domain add app.acme.com --service"), "{}", notes[0]);
+    }
 
     #[test]
     fn domains_url_path() {

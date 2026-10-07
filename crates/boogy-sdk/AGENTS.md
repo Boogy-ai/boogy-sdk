@@ -1606,9 +1606,11 @@ JSON-RPC handlers use `RpcError` for failures — propagate
 
 For a typed contract you want existing gRPC tooling to consume — `grpcurl`,
 generated stubs in another language, a Connect client — mount a protobuf
-service with `Router::grpc`. One mount serves **three wire protocols**
+service with `Router::grpc`. One mount understands **three wire protocols**
 (Connect, gRPC, gRPC-Web), chosen by the caller's request content-type; you
-write one handler.
+write one handler. Connect and gRPC-Web are served on the service's own
+address, at `https://<service address>/<pkg.Service>/<Method>`; native gRPC is
+not served by the platform at present, so give consumers a Connect client.
 
 Four pieces, and only the last two are code you author:
 
@@ -1655,17 +1657,17 @@ version = "0.1.0"
 wasm = "target/wasm32-wasip2/release/notes.wasm"
 
 [routing]
-path = "/notes"
+path = "/"            # every new service: the base never appears in a URL
 methods = ["GET", "POST"]
 
 [grpc]
 proto = "proto/notes.proto"
 services = ["notes.v1.NotesService"]
 # reflection = true   # the default: serves gRPC server reflection
-#                     # and GET <mount>/descriptor.bin
+#                     # and GET /descriptor.bin at the service's address
 ```
 
-4. **The mount and the handlers.** `include_protos!()` splices in the
+4. **The handlers.** `include_protos!()` splices in the
    generated message types; you never name the codegen crate or `connectrpc`
    in your own source:
 
@@ -1880,19 +1882,22 @@ A `{param}`-style route at the same position does NOT capture them.
 when the manifest `[routing] methods` list excludes GET. No manifest
 change needed.
 
-**Mount path is external.** A provision-time `[routing] path` override
-relocates the instance's external URL (so one module can run as several
-instances at distinct mounts). The guest keeps serving its own module
-routes — the host rewrites the mount prefix transparently on the way in,
-and remaps the served `openapi.json`/`openrpc.json` path keys to the mount.
-Write handlers against the module's own paths; don't hardcode the mount.
-Mounts are unique per owner (a colliding/overlapping mount is rejected 409).
+**The declared base never appears in a URL.** Every service is served at the
+root of its own address, `https://<name>-<suffix>.<base>/` (the `URL:`
+`boogy deploy` prints), and the host relocates each request to the module's
+declared `[routing] path` before the guest sees it — so declare `path = "/"`,
+and your routes, your `[[ingress.routes]]` paths and your URLs are one string.
+Under any other base the guest sees the base in front of every path, and the
+served `openapi.json`/`openrpc.json` path keys are rewritten back to the
+address root. One module runs as several instances by provisioning it under
+several service ids, each with its own address; a provision-time
+`[routing] path` override is accepted but addresses nothing.
 
 **Module-intrinsic vs deployment config.** Two tiers in the manifest.
 *Module-intrinsic* (author-fixed, never changed by a provisioner):
 `[capabilities]`, declared `[[websockets.channels]]`, declared secret
 **names**, routing methods + internal base path. *Deployment config* (set
-per instance at provision time): service id, mount path, `[ingress]`,
+per instance at provision time): service id (which names the address), `[ingress]`,
 `[limits]`, `[outbound] allowed_hosts`, and secret **values**. The shipped
 `[limits]` are defaults — a provisioner may raise or lower each within the
 **platform caps** (not the module's value); capabilities can never be
@@ -2175,9 +2180,10 @@ connected, needs reconnecting, or a `subject` that is empty or over the
 platform's length bound) and `connection-host-not-allowed` (the URL's host is
 not in that connection's `inject_hosts`).
 
-The consent callback is served by the platform at
-`https://<handle>.<base>/boogy/connections/callback` — a provisioner registers
-exactly that URL with the provider, and no guest code runs for it. Full
+The consent callback is served by the platform at the service's own address,
+`https://<service address>/boogy/connections/callback` — `boogy deploy`
+prints it as the `OAuth redirect URI`, a provisioner registers exactly that
+URL with the provider, and no guest code runs for it. Full
 authoring guidance, including the `inject_hosts` and provider-limit traps, is
 in the `boogy-oauth-connections` skill.
 

@@ -26,7 +26,7 @@ category = "productivity"
 owner = "alice"   # optional — the platform sets this to your handle at deploy; normally omit it
 
 [routing]
-path = "/api/notes"
+path = "/"
 methods = ["GET", "POST", "PUT", "DELETE"]
 
 [capabilities]
@@ -85,7 +85,7 @@ Both fields are **required**.
 
 | Field | Type | Required / Default | Meaning |
 |---|---|---|---|
-| `path` | string | **required** | URL path prefix your service owns, e.g. `"/api/notes"`. The host resolves the owner from the subdomain (`<handle>.boogy.app`) and internally synthesizes a `/{owner}/{path}` routing key; the `/{owner}` prefix is stripped before your handler sees the URL. Use `"/"` to own the full owner subtree. |
+| `path` | string | **required** | The base your service's own router sees. **Use `"/"`** — every new service should. The service is served at the root of its own address, `https://<name>-<suffix>.boogy.app` (the name from `[service] id`, the suffix random; `boogy deploy` prints it), and the platform relocates each request to this base before your handler sees it, so the base never appears in a URL: with `"/"`, a route `/notes` is at `https://notes-7k3q.boogy.app/notes`; with `"/api"` the router must register `/api/notes` for that same URL. |
 | `methods` | string array | **required** | HTTP methods to accept: `["GET", "POST"]`. Use `["*"]` to match any method. |
 
 ---
@@ -278,6 +278,23 @@ allowed_methods = ["GET", "POST"]
 allow_credentials = false
 ```
 
+### `[ingress.app_tokens]`
+
+For a service **without** a `[frontend]`: the exact URLs a sign-in for an **app token** may return to. A page on another origin signs the service's people in and calls it with `Authorization: Bearer`; the one-time code comes back in the fragment of one of these URLs, so only the pages you list can receive it. Absent = no page can obtain an app token for this service.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `redirect_uris` | string array | — | 1 to 20 absolute URLs. A sign-in's `redirect` must equal one of them byte for byte — no extra query, other path or other spelling. Each must be `https://` (`http://` only for `localhost`, `*.localhost` or `127.0.0.1`), on a host written in lowercase letters, digits, `-` and `.` (no IPv6 literal such as `[::1]`: use `localhost`), carry no `#fragment` and no userinfo, be written in canonical form (`https://app.example.com/`, not `https://app.example.com`), and be on an origin `[ingress.cors] allowed_origins` names by itself (a `"*"` entry names no page). Rejected at deploy otherwise. |
+
+```toml
+[ingress.cors]
+allowed_origins = ["https://app.example.com"]
+allowed_headers = ["authorization", "content-type"]
+
+[ingress.app_tokens]
+redirect_uris = ["https://app.example.com/signed-in"]
+```
+
 ---
 
 ## `[outbound]`
@@ -353,15 +370,18 @@ Declaring handlers without granting `capabilities.background_jobs = true` is val
 ## `[grpc]`
 
 Serve a **protobuf** surface — gRPC, Connect and gRPC-Web, all three from one
-mount, chosen by the caller's request content-type. Optional: omit the section
-(or leave `services` empty) and protobuf is off for this deployment.
+`Router::grpc` mount, chosen by the caller's request content-type. Connect and
+gRPC-Web are served on the service's own address, at
+`/<package.Service>/<Method>`; native gRPC is not served by the platform at
+present. Optional: omit the section (or leave `services` empty) and protobuf is
+off for this deployment.
 
 Not a capability. Protobuf is an *inbound* surface, so nothing new is granted to
 your wasm and deny-by-default is untouched.
 
 ```toml
 [routing]
-path = "/notes"
+path = "/"
 methods = ["GET", "POST"]   # POST is REQUIRED when [grpc] is present
 
 [grpc]
@@ -374,7 +394,7 @@ services = ["notes.v1.NotesService"]
 |---|---|---|---|
 | `proto` | string | `""` | Path to the `.proto`, relative to your crate root. Required when `services` is non-empty. Must be a safe relative path (no `..`, no leading `/`). |
 | `services` | string array | `[]` | The **fully-qualified** service names this deployment serves (`notes.v1.NotesService`, not `NotesService`). Empty = protobuf off. |
-| `reflection` | bool | `true` | Serve gRPC server reflection, plus the compiled descriptor set verbatim at `GET <mount>/descriptor.bin`. Both inherit this service's `[ingress]` policy — on a `public` service they publish your `.proto` shape. |
+| `reflection` | bool | `true` | Serve gRPC server reflection, plus the compiled descriptor set verbatim at `GET /descriptor.bin` on the service's address. Both inherit this service's `[ingress]` policy — on a `public` service they publish your `.proto` shape. |
 
 **`[routing] methods` must include `POST`.** The gRPC wire is POST-only, and a
 `[grpc]` block without it is rejected when the manifest is parsed.
@@ -410,7 +430,7 @@ account receives the charge.
 
 ```toml
 [routing]
-path = "/api"
+path = "/"
 methods = ["GET", "POST"]
 
 [pricing.units.tokens]
@@ -431,7 +451,7 @@ price = "0.0001"
 
 | Field | Type | Meaning |
 |---|---|---|
-| `match` | table | Exactly one of: `path` (+ optional `methods`), `grpc = "pkg.Service/Method"`, `path` + `jsonrpc_method`, or `path` + `mcp_tool`. `path` is relative to `[routing] path` and uses the same `{param}` / `{*rest}` syntax as your router. A route naming `GET` also covers `HEAD`; leaving `methods` out covers every method except `OPTIONS`. A `grpc` rule also prices a POST to `/<package.Service>/<Method>` under your mount, however the call arrives. |
+| `match` | table | Exactly one of: `path` (+ optional `methods`), `grpc = "pkg.Service/Method"`, `path` + `jsonrpc_method`, or `path` + `mcp_tool`. `path` is relative to `[routing] path` — with `path = "/"`, the URL path — and uses the same `{param}` / `{*rest}` syntax as your router. A route naming `GET` also covers `HEAD`; leaving `methods` out covers every method except `OPTIONS`. A `grpc` rule also prices a POST to `/<package.Service>/<Method>` at the service's address, however the call arrives. |
 | `payer` | `"principal"` \| `"caller_service"` | `principal`: the signed-in user who sent the request. `caller_service`: the owner of the service that called yours; a direct call from outside is refused. |
 | `price` | decimal string | Fixed amount in USD, up to 6 decimal places. Write it as a **string** — `"0.0010"`, not `0.001`. |
 | `rate` | table | `unit`, `per` (a positive integer) and `price`: the charge adds `ceil(units x price / per)`. |
@@ -454,7 +474,7 @@ or an app calling a service other than its own may spend it only under a spendin
 grant the user created.
 
 **Discovery.** Every priced service serves its price list at
-`GET <mount>/pricing.json`, and its `openapi.json` operations carry an
+`GET /pricing.json` on its address, and its `openapi.json` operations carry an
 `x-boogy-pricing` extension written by the platform. On a priced service
 `/pricing.json` is reserved: a route of yours at that path is not reachable.
 
@@ -517,7 +537,7 @@ version = 1                          # bump when this route's contract changes
 | `routes` | array of `{ name, path, version }` | `[]` | What every instance publishes. Set by the module author alone: a provision override may not add, remove or change them. |
 
 - **No `[discovery]` section means an instance is never listed**, whatever a provisioner's override says: discovery is the author's opt-in.
-- **A route's `path` is the module's own path**, as the module declares its routes, not a mounted one. A call from another service reaches it on every instance, whatever path that instance was mounted at when it was provisioned. `path` must be absolute, with no `..`, query or fragment. `version` starts at 1.
+- **A route's `path` is the module's own path**, as the module declares its routes. A call from another service reaches it at that path on every instance. `path` must be absolute, with no `..`, query or fragment. `version` starts at 1.
 - **An unlisted instance and no instance look the same** to whoever asks.
 - **How to look one up:** from a service, `discovery::lookup(handle, &Module::Same)` returns the instances of the module the calling service runs (see the SDK reference). Over HTTP, `GET /v1/registry/instances/{handle}?module=<author>/<name>` works for anyone signed in.
 

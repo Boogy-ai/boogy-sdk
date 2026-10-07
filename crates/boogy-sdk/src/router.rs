@@ -113,7 +113,7 @@ impl<'a> Req<'a> {
         &self.request.method
     }
 
-    /// Request path, including any owner prefix the host did not strip.
+    /// The request path, as the guest's router sees it.
     pub fn path(&self) -> &str {
         &self.request.path
     }

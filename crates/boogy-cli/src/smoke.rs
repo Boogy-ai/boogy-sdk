@@ -38,33 +38,6 @@ pub fn resolve_browser_in(names: &[&str], dirs: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-/// Fallback URL derivation from the control `host` + the provision response's
-/// `service` URI, used only when the host did not return a canonical
-/// `service_url` (older servers). Prefer `resolve_smoke_url`, which uses the
-/// server-provided URL first.
-///
-/// `("https://boogy.ai", "boogy://alice/services/todos")` →
-/// `Some("https://boogy.ai/alice/todos/")`. Returns `None` for any URI that is
-/// not a 3-component `boogy://<owner>/services/<id>` (e.g. a `modules` URI).
-///
-/// NOTE: this assembles a **path-based URL on the control host**, which is NOT
-/// where tenants actually serve (tenants are subdomain-based on the public base
-/// domain, e.g. `https://<handle>.boogy.app/<service>/`). It is a last-resort
-/// fallback; the authoritative URL is the response's `service_url`.
-pub fn deployed_url(host: &str, service_uri: &str) -> Option<String> {
-    let rest = service_uri.strip_prefix("boogy://")?;
-    // Exactly three components: <owner>/<kind>/<id>, with kind == "services".
-    let mut parts = rest.splitn(3, '/');
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    let kind = parts.next()?;
-    let id = parts.next().filter(|s| !s.is_empty())?;
-    if kind != "services" || id.contains('/') {
-        return None;
-    }
-    let host = host.trim_end_matches('/');
-    Some(format!("{host}/{owner}/{id}/"))
-}
-
 /// Known browser executable names, in preference order.
 const BROWSER_NAMES: &[&str] = &[
     "google-chrome",
@@ -166,23 +139,6 @@ impl Default for SmokeOptions {
     }
 }
 
-/// Derive the provisioned service URI from a published module URI.
-/// `boogy://alice/modules/todos@1.2.0` → `Some("boogy://alice/services/todos")`.
-/// (`deploy` / `publish --provision` provision the publisher's own service:
-/// owner == publisher, service id == module name.)
-pub fn service_uri_from_module(module_uri: &str) -> Option<String> {
-    let rest = module_uri.strip_prefix("boogy://")?;
-    let mut parts = rest.splitn(3, '/');
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    let kind = parts.next()?;
-    let name_at_version = parts.next()?;
-    if kind != "modules" {
-        return None;
-    }
-    let name = name_at_version.split('@').next().filter(|s| !s.is_empty())?;
-    Some(format!("boogy://{owner}/services/{name}"))
-}
-
 /// Append a trailing `/` to a service-root URL so a relative SPA index resolves,
 /// unless it already ends in `/` or carries a query/fragment.
 /// `"https://h.boogy.app/shout"` → `"https://h.boogy.app/shout/"`.
@@ -194,19 +150,13 @@ fn with_trailing_slash(url: &str) -> String {
     }
 }
 
-/// Resolve the URL the smoke should load.
-///
-/// **Prefer the canonical `service_url` the host returned** in the provision
-/// response — the same value printed as `URL:` — because it already encodes the
-/// real tenant origin (`https://<handle>.<base>/<service>/`). Only when the
-/// server returned none (older host) fall back to deriving a path-based URL from
-/// the control `host` + module-derived `service_uri`. Returns `None` when
-/// neither yields a URL.
-fn resolve_smoke_url(service_url: Option<&str>, host: &str, service_uri: Option<&str>) -> Option<String> {
-    if let Some(u) = service_url.map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(with_trailing_slash(u));
-    }
-    service_uri.and_then(|u| deployed_url(host, u))
+/// Resolve the URL the smoke should load: the `service_url` the host returned
+/// in the provision response — the root of the service's own label, the same
+/// value printed as `URL:`. There is nothing to fall back to: the label's
+/// suffix is chosen by the host, so no other address names the service.
+/// `None` when the host returned none.
+fn resolve_smoke_url(service_url: Option<&str>) -> Option<String> {
+    service_url.map(str::trim).filter(|s| !s.is_empty()).map(with_trailing_slash)
 }
 
 /// Run the opt-in post-deploy smoke. Best-effort: a missing browser, a
@@ -214,9 +164,7 @@ fn resolve_smoke_url(service_url: Option<&str>, host: &str, service_uri: Option<
 /// return — only a browser that ran and failed its assertions is an error.
 pub async fn run_post_deploy_smoke(
     opts: &SmokeOptions,
-    host: &str,
     service_url: Option<&str>,
-    service_uri: Option<&str>,
     has_frontend: bool,
 ) -> anyhow::Result<()> {
     if !opts.enabled {
@@ -226,10 +174,10 @@ pub async fn run_post_deploy_smoke(
         println!("  Smoke: skipped (no [frontend] to render)");
         return Ok(());
     }
-    let url = match resolve_smoke_url(service_url, host, service_uri) {
+    let url = match resolve_smoke_url(service_url) {
         Some(u) => u,
         None => {
-            println!("  Smoke: skipped (could not derive a deployed URL)");
+            println!("  Smoke: skipped (the host returned no service URL)");
             return Ok(());
         }
     };
@@ -261,7 +209,7 @@ pub async fn run_post_deploy_smoke(
 }
 
 /// Extract the `scheme://host[:port]` origin of a URL (string-only; no dep).
-/// `"https://boogy.ai/alice/todos/"` → `Some("https://boogy.ai")`.
+/// `"https://todos-k3v9.boogy.app/tasks/"` → `Some("https://todos-k3v9.boogy.app")`.
 fn origin_of(url: &str) -> Option<String> {
     let scheme_end = url.find("://")?;
     let authority_start = scheme_end + 3;
@@ -495,24 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn deployed_url_from_service_uri() {
-        assert_eq!(
-            deployed_url("https://boogy.ai", "boogy://alice/services/todos").as_deref(),
-            Some("https://boogy.ai/alice/todos/"),
-        );
-        // a trailing slash on the host is tolerated.
-        assert_eq!(
-            deployed_url("https://boogy.ai/", "boogy://alice/services/todos").as_deref(),
-            Some("https://boogy.ai/alice/todos/"),
-        );
-        // non-service URIs (modules) → None.
-        assert!(deployed_url("https://boogy.ai", "boogy://alice/modules/todos@1.0.0").is_none());
-        // missing scheme / wrong shape → None.
-        assert!(deployed_url("https://boogy.ai", "alice/services/todos").is_none());
-        assert!(deployed_url("https://boogy.ai", "boogy://alice/services").is_none());
-    }
-
-    #[test]
     fn with_trailing_slash_appends_only_when_needed() {
         assert_eq!(with_trailing_slash("https://h.boogy.app/shout"), "https://h.boogy.app/shout/");
         assert_eq!(with_trailing_slash("https://h.boogy.app/shout/"), "https://h.boogy.app/shout/");
@@ -522,49 +452,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_smoke_url_prefers_server_canonical_url() {
-        // The server-provided canonical tenant URL wins over the control host —
-        // this is the bug fix: smoke must hit <handle>.boogy.app, not the
-        // path-based control-host derivation.
-        let url = resolve_smoke_url(
-            Some("https://allowing-swordtail.boogy.app/shout"),
-            "https://api.boogy.ai",
-            Some("boogy://allowing-swordtail/services/shout"),
-        );
-        assert_eq!(url.as_deref(), Some("https://allowing-swordtail.boogy.app/shout/"));
+    fn the_smoke_loads_the_label_url_the_host_returned() {
+        // The host's `service_url` is the root of the service's own label, and
+        // it is the only address the smoke may load: the label's suffix is
+        // random, so nothing the CLI holds can derive it.
+        let url = resolve_smoke_url(Some("https://shout-k3v9.boogy.app"));
+        assert_eq!(url.as_deref(), Some("https://shout-k3v9.boogy.app/"));
+        let url = resolve_smoke_url(Some("http://shout-k3v9.localhost:3000/"));
+        assert_eq!(url.as_deref(), Some("http://shout-k3v9.localhost:3000/"));
     }
 
     #[test]
-    fn resolve_smoke_url_falls_back_to_derivation_without_server_url() {
-        // Older host returns no service_url → fall back to host + service_uri.
-        let url = resolve_smoke_url(None, "https://boogy.ai", Some("boogy://alice/services/todos"));
-        assert_eq!(url.as_deref(), Some("https://boogy.ai/alice/todos/"));
-        // An empty/whitespace server URL is treated as absent.
-        let url = resolve_smoke_url(Some("   "), "https://boogy.ai", Some("boogy://alice/services/todos"));
-        assert_eq!(url.as_deref(), Some("https://boogy.ai/alice/todos/"));
-        // Neither available → None.
-        assert!(resolve_smoke_url(None, "https://boogy.ai", None).is_none());
-    }
-
-    #[test]
-    fn service_uri_from_module_derives_services_uri() {
-        assert_eq!(
-            service_uri_from_module("boogy://alice/modules/todos@1.2.0").as_deref(),
-            Some("boogy://alice/services/todos"),
-        );
-        // version is optional in the derivation.
-        assert_eq!(
-            service_uri_from_module("boogy://alice/modules/todos").as_deref(),
-            Some("boogy://alice/services/todos"),
-        );
-        // a services URI is not a module URI.
-        assert!(service_uri_from_module("boogy://alice/services/todos").is_none());
-        assert!(service_uri_from_module("nonsense").is_none());
+    fn without_a_label_url_there_is_nothing_to_smoke() {
+        // No fallback: the path form on the control host addresses no service.
+        assert!(resolve_smoke_url(None).is_none());
+        assert!(resolve_smoke_url(Some("   ")).is_none());
     }
 
     #[test]
     fn origin_of_strips_path() {
-        assert_eq!(origin_of("https://boogy.ai/alice/todos/").as_deref(), Some("https://boogy.ai"));
+        assert_eq!(origin_of("https://todos-k3v9.boogy.app/tasks/").as_deref(), Some("https://todos-k3v9.boogy.app"));
         assert_eq!(origin_of("https://boogy.ai").as_deref(), Some("https://boogy.ai"));
         assert_eq!(origin_of("http://localhost:3000/a/b/").as_deref(), Some("http://localhost:3000"));
         assert!(origin_of("not-a-url").is_none());
@@ -783,8 +690,8 @@ mod tests {
 
     #[test]
     fn the_advice_points_away_from_the_service_code() {
-        let a = crate::smoke::unreachable_advice("https://alice.boogy.app/todos");
-        assert!(a.contains("https://alice.boogy.app/todos"));
+        let a = crate::smoke::unreachable_advice("https://todos-k3v9.boogy.app");
+        assert!(a.contains("https://todos-k3v9.boogy.app"));
         assert!(a.contains("/logs"), "must name the decisive check: {a}");
         assert!(
             a.contains("not something to debug in your service code"),

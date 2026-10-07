@@ -327,12 +327,18 @@ pub async fn publish(
     }
 
     println!("  Provisioned: {provisioned}");
-    // The host returns the canonical tenant URL (`https://<handle>.<base><mount>`,
-    // the service's `[routing] path` — not necessarily `/<id>`);
-    // it is both what we print and what the smoke must load.
+    // The host returns the canonical URL — the root of the service's own
+    // address, `https://<slug>-<suffix>.<base>` — which is both what we print
+    // and what the smoke must load.
     let service_url = body.get("service_url").and_then(|u| u.as_str());
     if let Some(url) = service_url {
         println!("  URL: {url}");
+        if let Some(note) = label_note_line(&body) {
+            println!("{note}");
+        }
+        if let Some(line) = connections_callback_line(&body) {
+            println!("{line}");
+        }
         // Printing a URL is a claim, so check it. A provisioned service whose
         // hostname has no route at the edge answers from the ingress default
         // backend — indistinguishable, from the author's side, from their own
@@ -357,15 +363,7 @@ pub async fn publish(
     // serving — i.e. provision succeeded. Best-effort otherwise.
     if smoke.enabled {
         if provision && provisioned {
-            let service_uri = crate::smoke::service_uri_from_module(module);
-            crate::smoke::run_post_deploy_smoke(
-                &smoke,
-                host,
-                service_url,
-                service_uri.as_deref(),
-                has_frontend,
-            )
-            .await?;
+            crate::smoke::run_post_deploy_smoke(&smoke, service_url, has_frontend).await?;
         } else {
             println!(
                 "  Smoke: skipped (requires a provisioned service — \
@@ -427,9 +425,34 @@ pub async fn provision(
     println!("  Deployment: {deployment_id}");
     if let Some(url) = body.get("service_url").and_then(|u| u.as_str()) {
         println!("  URL: {url}");
+        if let Some(note) = label_note_line(&body) {
+            println!("{note}");
+        }
+        if let Some(line) = connections_callback_line(&body) {
+            println!("{line}");
+        }
     }
 
     Ok(())
+}
+
+/// The line `boogy deploy` prints for a service that declares OAuth
+/// connections: the redirect URI to register with each provider, from the
+/// response's `connections_callback_url`.
+fn connections_callback_line(body: &serde_json::Value) -> Option<String> {
+    let url = body.get("connections_callback_url").and_then(|u| u.as_str())?;
+    Some(format!("  OAuth redirect URI: {url}  (register it with every provider this service connects to)"))
+}
+
+/// The line `boogy deploy` prints beside the URL when the service's address
+/// does not carry its name, from the response's `label_note`.
+fn label_note_line(body: &serde_json::Value) -> Option<String> {
+    let note = body.get("label_note").and_then(|n| n.as_str())?;
+    Some(match note {
+        "denied" => "  Note: the service's name is reserved for the platform, so its address uses `svc` instead.".to_string(),
+        "empty" => "  Note: the service's name has no characters an address can use, so its address uses `svc` instead.".to_string(),
+        other => format!("  Note: the service's address does not use its name ({other})."),
+    })
 }
 
 /// The upgrade request: `overrides` only when given, so its absence carries
@@ -489,6 +512,9 @@ pub async fn upgrade(host: &str, token: &str, service_id: &str, to: &str, overri
     println!("Upgraded: {service}");
     println!("  Module version: {module_version}");
     println!("  Deployment: {deployment_id}");
+    if let Some(line) = connections_callback_line(&body) {
+        println!("{line}");
+    }
 
     Ok(())
 }
@@ -498,6 +524,30 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// The deploy output says why a service's address does not carry its
+    /// name: `denied` (the name would impersonate the platform) or `empty`
+    /// (nothing usable was left). Nothing when the name was kept.
+    #[test]
+    fn a_replaced_name_is_explained_beside_the_url() {
+        let denied = label_note_line(&json!({ "service_url": "https://svc-k3v9.boogy.app", "label_note": "denied" }));
+        assert!(denied.as_deref().is_some_and(|l| l.contains("svc") && l.contains("reserved")), "{denied:?}");
+        let empty = label_note_line(&json!({ "service_url": "https://svc-k3v9.boogy.app", "label_note": "empty" }));
+        assert!(empty.as_deref().is_some_and(|l| l.contains("svc")), "{empty:?}");
+        assert_ne!(denied, empty, "two different reasons");
+        assert_eq!(label_note_line(&json!({ "service_url": "https://notes-k3v9.boogy.app" })), None);
+        assert_eq!(label_note_line(&json!({ "label_note": "something-new" })).is_some(), true, "an unknown reason is still shown");
+    }
+
+    /// A service that declares OAuth connections is told the redirect URI to
+    /// register with each provider; one that declares none is told nothing.
+    #[test]
+    fn the_oauth_redirect_uri_is_printed_when_the_service_has_one() {
+        let url = "https://yt-k3v9.boogy.app/boogy/connections/callback";
+        let line = connections_callback_line(&json!({ "service_url": "https://yt-k3v9.boogy.app", "connections_callback_url": url }));
+        assert!(line.as_deref().is_some_and(|l| l.contains(url)), "{line:?}");
+        assert_eq!(connections_callback_line(&json!({ "service_url": "https://notes-k3v9.boogy.app" })), None);
+    }
 
     #[test]
     fn an_upgrade_carries_overrides_forward_unless_given_a_file() {

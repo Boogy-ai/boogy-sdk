@@ -102,8 +102,11 @@ boogy --host https://boogy.example.com list
 ```
 
 `--all` calls `GET /_admin/services` and pretty-prints the JSON response. Each
-entry includes `service_id`, `user_id`, the route path pattern, and the
-allowed methods.
+entry includes `service_id`, `user_id`, `path` — the service's declared
+`[routing] path`, the base its own router sees, which is never part of its
+URL — and the allowed methods. A service's address is the root of its own
+label, `service_url` in `GET /v1/services` (what `boogy list` without `--all`
+prints).
 
 `/_admin/services` does **not** require admin scope — it is unauthenticated
 and is used as a compose healthcheck. The CLI sends no bearer token for
@@ -116,7 +119,7 @@ Example output:
   {
     "service_id": "hello-api",
     "user_id": "alice",
-    "path": "/api/hello",
+    "path": "/",
     "methods": ["GET", "POST"]
   }
 ]
@@ -218,8 +221,12 @@ wasm = "../../../target/wasm32-wasip2/release/hello_api.wasm"
 # owner from the deploying principal. Written values are overwritten.
 owner = "alice"
 
+# "/" for every new service. The service is served at the root of its own
+# address (`boogy deploy` prints it, e.g. https://hello-api-k3v9.boogy.app),
+# and this base is only what its router sees — it never appears in a URL, so a
+# route `/api/hello` is at https://hello-api-k3v9.boogy.app/api/hello.
 [routing]
-path = "/api/hello"
+path = "/"
 methods = ["GET", "POST"]
 
 # Required. Exposure is stated, never inferred — a manifest with no [ingress]

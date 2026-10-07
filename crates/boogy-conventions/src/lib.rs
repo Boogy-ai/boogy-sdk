@@ -248,8 +248,8 @@ pub fn lint_file(file: &str, src: &str) -> Vec<Finding> {
 pub fn key_route_findings(files: &[(String, String)], routing_path: Option<&str>) -> Vec<Finding> {
     let mut out = Vec::new();
 
-    // A service that owns the whole owner subtree has no prefix to carry, so
-    // the bare helper is correct there.
+    // A service declaring the root base has no prefix to carry, so the bare
+    // helper is correct there.
     let Some(mount) = routing_path else { return out };
     let mount = mount.trim_end_matches('/');
     if mount.is_empty() {
