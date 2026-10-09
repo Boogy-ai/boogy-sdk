@@ -221,6 +221,18 @@ fn origin_of(url: &str) -> Option<String> {
     Some(url[..authority_start + host_len].to_string())
 }
 
+/// The platform's own sign-in probe: on a signed-out load the SDK posts
+/// `/boogy/renew`, and the platform answers 401 when no renewal cookie exists.
+/// Narrow on purpose: that path, that status, the page's own origin.
+/// (`/boogy/me` answers 200 with `null` when signed out, so it needs no exemption.)
+fn is_expected_signin_probe(origin: Option<&str>, status: i64, resp_url: &str) -> bool {
+    let Some(origin) = origin else { return false };
+    status == 401
+        && resp_url
+            .strip_prefix(origin)
+            .is_some_and(|rest| rest.split(['?', '#']).next() == Some("/boogy/renew"))
+}
+
 /// Split a comma-separated `--smoke-selector` value into individual selectors,
 /// dropping empties so a trailing comma cannot produce a `""` selector that can
 /// never match.
@@ -356,7 +368,11 @@ pub async fn run_smoke(
                     .next()
                     .unwrap_or(resp_url)
                     .ends_with("/favicon.ico");
-                if status >= 400 && same_origin && !is_favicon {
+                if status >= 400
+                    && same_origin
+                    && !is_favicon
+                    && !is_expected_signin_probe(origin_for_net.as_deref(), status, resp_url)
+                {
                     fr.lock().unwrap().push(format!("{status} {resp_url}"));
                 }
             }
@@ -624,6 +640,16 @@ mod tests {
     }
 
     #[test]
+    fn signed_out_renew_401_is_not_a_failure_but_everything_else_is() {
+        let o = Some("https://notes-k3v9.boogy.app");
+        assert!(is_expected_signin_probe(o, 401, "https://notes-k3v9.boogy.app/boogy/renew"));
+        assert!(!is_expected_signin_probe(o, 401, "https://notes-k3v9.boogy.app/api/x"));
+        assert!(!is_expected_signin_probe(o, 500, "https://notes-k3v9.boogy.app/boogy/renew"));
+        assert!(!is_expected_signin_probe(o, 401, "https://other-a2b4.boogy.app/boogy/renew"));
+        assert!(!is_expected_signin_probe(o, 401, "https://notes-k3v9.boogy.app.evil.com/boogy/renew"));
+    }
+
+    #[test]
     fn smoke_report_render_pass_and_fail() {
         let pass = SmokeReport { ok: true, ..Default::default() };
         assert!(pass.render().contains("PASS"));
@@ -688,6 +714,58 @@ mod tests {
         );
     }
 
+    /// **The probe reads the header off a real response**, not just through the
+    /// classifier: a label's frontend document (a 200 `text/html` page no guest
+    /// wrote) and an `authenticated` service's refusal both count when they
+    /// name a deployment, and the same document without the header does not.
+    /// The classifier tests above cannot catch a probe that sends to the wrong
+    /// place or reads the wrong header name; this does.
+    #[tokio::test]
+    async fn the_probe_reads_the_deployment_header_off_the_wire() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/");
+                    let named = "x-boogy-deployment-id: 01a121c9-bcc4-7841-af00-7af71a2e4fbb\r\n";
+                    let (status, extra, body) = match path {
+                        "/document" => ("200 OK", named, "<!doctype html><title>site</title>"),
+                        "/refused" => ("401 Unauthorized", named, "{\"error\":\"unauthenticated\"}"),
+                        _ => ("200 OK", "", "<!doctype html><title>parked</title>"),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        assert_eq!(
+            crate::smoke::probe_reachable(&format!("{base}/document")).await,
+            crate::smoke::Reachability::PlatformAnswered,
+            "a frontend document naming its deployment is the platform answering"
+        );
+        assert_eq!(
+            crate::smoke::probe_reachable(&format!("{base}/refused")).await,
+            crate::smoke::Reachability::PlatformAnswered,
+            "an ingress refusal naming its deployment is the platform answering"
+        );
+        assert_eq!(
+            crate::smoke::probe_reachable(&format!("{base}/parked")).await,
+            crate::smoke::Reachability::AnsweredByNonPlatform { status: 200 },
+            "the same page with no deployment named is something else answering"
+        );
+    }
+
     #[test]
     fn the_advice_points_away_from_the_service_code() {
         let a = crate::smoke::unreachable_advice("https://todos-k3v9.boogy.app");
@@ -718,11 +796,15 @@ pub enum Reachability {
     Unreachable { detail: String },
 }
 
-/// Classify a response by whether the platform produced it.
+/// Classify a response by whether a deployment produced it.
 ///
-/// `x-boogy-deployment-id` rides every response the host emits, so its
-/// presence is a positive signal that the request was routed all the way in.
-/// Its absence means the bytes came from something else in the path.
+/// `x-boogy-deployment-id` rides every answer a deployment gives: its guest's
+/// responses, its frontend's document and assets, and its declared ingress
+/// refusing the caller (a 401 or 403). Those are everything an anonymous `GET`
+/// of a live service's root can receive, so the header's presence is a
+/// positive signal that the request was routed all the way in. Its absence
+/// means the bytes came from something else in the path — or from the
+/// platform's own pages on that host, which name no deployment either.
 pub fn classify_probe(status: u16, has_deployment_header: bool) -> Reachability {
     if has_deployment_header {
         Reachability::PlatformAnswered
