@@ -1,0 +1,8 @@
+[package]
+name = "boogy-web-sdk-conventions"
+version = "0.1.0"
+edition = "2021"
+description = "The conventions of an app built on @boogy/web, checked over its authored source (shared by the CLI, the builder MCP and the platform's publish step)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]

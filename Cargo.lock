@@ -194,6 +194,7 @@ dependencies = [
  "base64 0.22.1",
  "boogy-conventions",
  "boogy-seal",
+ "boogy-web-sdk-conventions",
  "chromiumoxide",
  "clap",
  "dirs",
@@ -269,6 +270,10 @@ dependencies = [
  "thiserror 2.0.21",
  "zeroize",
 ]
+
+[[package]]
+name = "boogy-web-sdk-conventions"
+version = "0.1.0"
 
 [[package]]
 name = "boogy-wit"

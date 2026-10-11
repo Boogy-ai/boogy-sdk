@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use boogy_conventions::{
     counter_findings, key_route_findings, lint_file, route_findings, Finding, Severity,
 };
+use boogy_web_sdk_conventions::{check_frontend, AppFacts, FrontendFacts, FrontendReport};
 
 /// Recursively collect `*.rs` files under `root`, skipping build/output dirs.
 fn collect_rs_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -95,7 +96,7 @@ fn collect_fe_into(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(root: Option<&str>, layout: bool) -> anyhow::Result<()> {
+pub fn run(root: Option<&str>) -> anyhow::Result<()> {
     let root = PathBuf::from(root.unwrap_or("."));
     let files = collect_rs_files(&root)?;
 
@@ -113,14 +114,20 @@ pub fn run(root: Option<&str>, layout: bool) -> anyhow::Result<()> {
             println!("  [FAIL] frontend: {e}");
         }
         fe_errors = fe_err;
-        if layout {
-            // Build output is not source: skip a local `dist/` (a Vite build).
-            let sources: Vec<(String, String)> =
-                fe_files.iter().filter(|(p, _)| !p.starts_with("dist/")).cloned().collect();
-            for l in layout_findings(&sources) {
-                println!("  [FAIL] layout: {l}");
-                fe_errors.push(l);
-            }
+    }
+
+    // The @boogy/web conventions, whenever the project serves a frontend: the
+    // same rules `boogy deploy` runs before uploading and the platform runs at
+    // publish.
+    match frontend_report(&root.join("boogy.toml")) {
+        Ok(Some(report)) => {
+            print_frontend_report(&report);
+            fe_errors.extend(report.findings.iter().map(|f| f.to_string()));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            println!("  [FAIL] frontend: {e:#}");
+            fe_errors.push(format!("{e:#}"));
         }
     }
 
@@ -171,6 +178,73 @@ pub fn run(root: Option<&str>, layout: bool) -> anyhow::Result<()> {
         Ok(())
     } else {
         std::process::exit(1);
+    }
+}
+
+/// The @boogy/web conventions over the project's authored frontend source.
+/// `Ok(None)`: the manifest declares no `[frontend]`. The source is `[frontend]
+/// root` for `build = "source"`, and the paths `[frontend] source` lists for a
+/// pre-built (`dist`) frontend, whose root holds build output.
+pub fn frontend_report(manifest: &Path) -> anyhow::Result<Option<FrontendReport>> {
+    let dir = manifest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let raw = match fs::read_to_string(manifest) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    let doc: toml::Value = raw.parse().context("parsing boogy.toml")?;
+    let Some(fe) = doc.get("frontend") else { return Ok(None) };
+    let s = |v: Option<&toml::Value>| v.and_then(|v| v.as_str()).map(str::to_string);
+    let root = s(fe.get("root")).context("[frontend] has no `root`")?;
+    let build = s(fe.get("build")).unwrap_or_else(|| "source".into());
+    let index = s(fe.get("index")).unwrap_or_else(|| "index.html".into());
+    let facts = FrontendFacts {
+        app: Some(AppFacts {
+            board_background: s(doc.get("boards").and_then(|b| b.get("background"))).as_deref() == Some("board"),
+            standalone_only: s(fe.get("frame_options")).as_deref() == Some("deny"),
+            index: index.clone(),
+        }),
+    };
+    let prebuilt = matches!(build.as_str(), "dist" | "none");
+    let files = if prebuilt {
+        let sources: Vec<String> = fe
+            .get("source")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        if sources.is_empty() {
+            anyhow::bail!(
+                "[frontend] build = \"{build}\" serves built output, so the manifest must name the authored source it was built from: \
+                 `source = [\"index.html\", \"web\"]` (the paths, relative to boogy.toml)"
+            );
+        }
+        // A source equal to the root is a hand-written root: its files are
+        // checked as the root's, with their root-relative paths.
+        if sources == [root.clone()] {
+            collect_frontend_files(&dir.join(&root))?
+        } else {
+            let mut files = Vec::new();
+            for src in &sources {
+                let p = dir.join(src);
+                anyhow::ensure!(p.exists(), "[frontend] source names `{src}`, which does not exist");
+                for (rel, text) in collect_frontend_files(&p)? {
+                    let rel = if p.is_dir() { format!("{src}/{rel}") } else { src.clone() };
+                    files.push((rel, text));
+                }
+            }
+            files
+        }
+    } else {
+        collect_frontend_files(&dir.join(&root))?
+    };
+    Ok(Some(check_frontend(&facts, &files)))
+}
+
+pub fn print_frontend_report(r: &FrontendReport) {
+    for f in &r.findings {
+        println!("  [FAIL] {f}");
+    }
+    for w in &r.waivers {
+        println!("  [waived] {}:{} [{}] {}", w.path, w.line, w.rule, w.reason);
     }
 }
 
@@ -332,129 +406,6 @@ fn report(findings: &[Finding], scanned: usize, frontend_errors: usize) {
         println!("    {}:{} — {}", f.file, f.line, f.message);
         println!("    ↳ {}\n", f.hint);
     }
-}
-
-/// Layout conventions for a project built on the `@boogy/web` foundation
-/// (`boogy check --layout`). Opt-in, because a project written before the
-/// foundation legitimately uses media queries and pixel sizes. Checks
-/// `.css`/`.ts`/`.tsx` sources and returns `path:line — message` findings:
-///   * no media queries — size from the container units instead;
-///   * no `sqrt(pow(...))` — unsupported in CSS today and silently dropped;
-///     `hypot()` is the supported spelling;
-///   * no pixel sizes above 1px outside `theme.css`, the one file whose job
-///     is to hold fixed values;
-///   * no one-off `var(--u)` multiples outside a custom-property definition:
-///     sizes come from the named scale.
-pub fn layout_findings(files: &[(String, String)]) -> Vec<String> {
-    let mut out = Vec::new();
-    for (path, src) in files {
-        let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !matches!(ext, "css" | "ts" | "tsx") {
-            continue;
-        }
-        let is_theme = Path::new(path).file_name().and_then(|n| n.to_str()) == Some("theme.css");
-        let code = strip_comments(src, ext != "css");
-        for (i, line) in code.lines().enumerate() {
-            let at = format!("{path}:{}", i + 1);
-            // `prefers-*` (reduced motion, colour scheme, contrast) and the
-            // pointer/hover queries describe the USER and the DEVICE, not the
-            // layout, and have no container-query equivalent.
-            let about_device = ["prefers-", "pointer", "hover"].iter().any(|k| line.contains(k));
-            if line.contains("@media") && !about_device {
-                out.push(format!("{at} — media query; size with scale()/surface() and container units instead"));
-            }
-            let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-            if squashed.contains("sqrt(pow(") {
-                out.push(format!("{at} — sqrt(pow(...)) is dropped by browsers; use hypot()"));
-            }
-            // Sizes come from the named scale (--space-*, --control-*, --fs-*…).
-            // Multiplying the unit directly is how a token is DEFINED, and
-            // nowhere else: a one-off multiplier in a rule is a magic number.
-            let defines_token = line.trim_start().starts_with("--");
-            if line.contains("var(--u)") && !defines_token {
-                out.push(format!("{at} — a one-off multiple of --u; use a size token (--space-*, --control-*, --icon-*, --fs-*), or define a named token for it"));
-            }
-            if !is_theme && has_px_size_above_one(line) {
-                out.push(format!("{at} — pixel size; use a multiple of var(--u) or a token, or move it to theme.css"));
-            }
-        }
-    }
-    out
-}
-
-/// `src` with comments replaced by spaces, newlines kept so line numbers
-/// still match. Block comments always; `//` line comments only in script
-/// (`line_comments`), and never inside a string literal.
-fn strip_comments(src: &str, line_comments: bool) -> String {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    let mut quote: Option<char> = None;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if let Some(q) = quote {
-            out.push(c);
-            if c == '\\' {
-                if let Some(n) = next {
-                    out.push(n);
-                    i += 1;
-                }
-            } else if c == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '/' && next == Some('*') {
-            i += 2;
-            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
-                out.push(if chars[i] == '\n' { '\n' } else { ' ' });
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-        if line_comments && c == '/' && next == Some('/') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if line_comments && matches!(c, '"' | '\'' | '`') {
-            quote = Some(c);
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-/// True when `line` holds a `<number>px` whose value is above 1 (0px and 1px
-/// hairlines are allowed everywhere).
-fn has_px_size_above_one(line: &str) -> bool {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    while let Some(off) = line[i..].find("px") {
-        let end = i + off;
-        let mut start = end;
-        while start > 0 && (bytes[start - 1].is_ascii_digit() || bytes[start - 1] == b'.') {
-            start -= 1;
-        }
-        // A letter, `-`, `_` or `/` before the number means it is part of a
-        // name or a path (`h12px`, `/assets/12px.svg`), not a size.
-        let preceded_by_word = start > 0
-            && (bytes[start - 1].is_ascii_alphabetic() || matches!(bytes[start - 1], b'-' | b'_' | b'/'));
-        if start < end && !preceded_by_word {
-            if let Ok(v) = line[start..end].parse::<f64>() {
-                if v > 1.0 {
-                    return true;
-                }
-            }
-        }
-        i = end + 2;
-    }
-    false
 }
 
 #[cfg(test)]
@@ -625,88 +576,58 @@ fn routing_path(root: &std::path::Path) -> Option<String> {
 }
 
 #[cfg(test)]
-mod layout_tests {
+mod frontend_rules_tests {
     use super::*;
 
-    fn f(path: &str, src: &str) -> (String, String) {
-        (path.to_string(), src.to_string())
+    fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, src) in files {
+            let p = dir.path().join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, src).unwrap();
+        }
+        dir
     }
 
-    #[test]
-    fn a_media_query_is_a_finding() {
-        let out = layout_findings(&[f("web/app.css", "@media (min-width: 40rem) { a { color: red } }")]);
-        assert_eq!(out.len(), 1);
-        assert!(out[0].contains("web/app.css:1"), "{out:?}");
-        assert!(out[0].contains("media"), "{out:?}");
-    }
+    const MAIN: &str = "import { installFoundation, connectPane } from '@boogy/web';\ninstallFoundation();\nconnectPane({ service: 'x' });";
 
     #[test]
-    fn sqrt_of_pow_is_a_finding() {
-        let out = layout_findings(&[f("web/app.css", "a { width: calc(sqrt(pow(1cqi, 2))); }")]);
-        assert!(out.iter().any(|m| m.contains("hypot")), "{out:?}");
-    }
-
-    #[test]
-    fn a_px_size_outside_theme_css_is_a_finding_but_hairlines_are_not() {
-        let out = layout_findings(&[
-            f("web/app.css", "a { padding: 12px; border: 1px solid; margin: 0px; }"),
-            f("web/app.tsx", "const s = { width: '24px' };"),
-            f("web/theme.css", "a { padding: 12px; }"),
+    fn a_source_build_is_checked_from_its_root_with_its_manifest_facts() {
+        let dir = project(&[
+            ("boogy.toml", "[frontend]\nroot = \"web\"\nbuild = \"source\"\n[boards]\nbackground = \"board\"\n"),
+            ("web/index.html", "<p>x</p>"),
+            ("web/main.ts", MAIN),
+            ("web/app.css", "a { padding: 12px }"),
         ]);
-        assert_eq!(out.len(), 2, "{out:?}");
-        assert!(out.iter().any(|m| m.starts_with("web/app.css:1")));
-        assert!(out.iter().any(|m| m.starts_with("web/app.tsx:1")));
+        let r = frontend_report(&dir.path().join("boogy.toml")).unwrap().unwrap();
+        let got: Vec<(&str, &str)> = r.findings.iter().map(|f| (f.rule, f.path.as_str())).collect();
+        assert_eq!(got, vec![("fixed-size", "app.css")], "{r:?}");
     }
 
     #[test]
-    fn a_clean_project_has_no_findings() {
-        let out = layout_findings(&[f("web/app.css", ".x { padding: var(--space-3); border: 1px solid; }")]);
-        assert!(out.is_empty(), "{out:?}");
-    }
-
-    #[test]
-    fn html_and_js_are_not_linted() {
-        let out = layout_findings(&[f("web/index.html", "<style>@media print {}</style>"), f("web/vendor.js", "x='12px'")]);
-        assert!(out.is_empty(), "{out:?}");
-    }
-
-    #[test]
-    fn sizes_and_media_inside_comments_are_not_findings() {
-        let out = layout_findings(&[
-            f("web/app.css", "/* a 12px seam,\n   and @media (min-width: 40rem) was here */\n.x { gap: 0; } /* 24px */"),
-            f("web/app.tsx", "// a 12px seam\n/** floor minmax(400px, 1fr) */\nconst u = 'https://example.com/12px';"),
+    fn a_dist_build_is_checked_from_its_declared_source_and_never_from_dist() {
+        let dir = project(&[
+            ("boogy.toml", "[frontend]\nroot = \"dist\"\nbuild = \"dist\"\nsource = [\"index.html\", \"web\"]\nframe_options = \"deny\"\n"),
+            ("index.html", "<p>x</p>"),
+            ("web/main.ts", MAIN),
+            ("dist/assets/a.css", "a { padding: 12px }"),
         ]);
-        assert!(out.is_empty(), "{out:?}");
+        assert!(frontend_report(&dir.path().join("boogy.toml")).unwrap().unwrap().is_clean());
     }
 
     #[test]
-    fn a_user_preference_media_query_is_allowed_but_a_layout_one_is_not() {
-        let out = layout_findings(&[f(
-            "web/app.css",
-            "@media (prefers-reduced-motion: reduce) { .x { transition: none; } }\n@media (prefers-color-scheme: dark) {}\n@media (min-width: 48rem) {}",
-        )]);
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].starts_with("web/app.css:3"), "{out:?}");
+    fn a_dist_build_without_source_or_with_a_missing_source_path_is_an_error_naming_it() {
+        let dir = project(&[("boogy.toml", "[frontend]\nroot = \"dist\"\nbuild = \"dist\"\n")]);
+        let e = frontend_report(&dir.path().join("boogy.toml")).unwrap_err().to_string();
+        assert!(e.contains("source"), "{e}");
+        let dir = project(&[("boogy.toml", "[frontend]\nroot = \"dist\"\nbuild = \"dist\"\nsource = [\"web\"]\n")]);
+        let e = frontend_report(&dir.path().join("boogy.toml")).unwrap_err().to_string();
+        assert!(e.contains("web"), "{e}");
     }
 
     #[test]
-    fn a_device_capability_query_is_allowed() {
-        let out = layout_findings(&[f(
-            "web/app.css",
-            "@media (pointer: coarse) {}\n@media (hover: hover) {}\n@media (any-pointer: fine) {}\n@media (max-width: 30rem) {}",
-        )]);
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].starts_with("web/app.css:4"), "{out:?}");
-    }
-
-    #[test]
-    fn multiplying_the_unit_is_for_token_definitions_only() {
-        let out = layout_findings(&[f(
-            "web/app.css",
-            ":root, [data-u-policy] {\n  --panel-w: calc(var(--u) * 28);\n}\n.x { padding: calc(var(--u) * 0.6); gap: var(--space-2); }",
-        )]);
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].starts_with("web/app.css:4"), "{out:?}");
-        assert!(out[0].contains("--space"), "the finding should point at the scale: {out:?}");
+    fn no_frontend_section_means_nothing_to_check() {
+        let dir = project(&[("boogy.toml", "[service]\nid = \"x\"\n")]);
+        assert!(frontend_report(&dir.path().join("boogy.toml")).unwrap().is_none());
     }
 }

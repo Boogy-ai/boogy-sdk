@@ -21,6 +21,7 @@ anyhow = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 boogy-seal = { path = "../boogy-seal" }
 boogy-conventions = { path = "../boogy-conventions" }
+boogy-web-sdk-conventions = { path = "../boogy-web-sdk-conventions" }
 base64 = "0.22"
 dirs = "5"
 tar = "0.4"

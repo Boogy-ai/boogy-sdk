@@ -30,12 +30,35 @@ pub fn tar_gz_dir(root: &Path) -> Result<Vec<u8>> {
     if !root.is_dir() {
         anyhow::bail!("frontend root is not a directory: {}", root.display());
     }
-
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     collect_files(root, root, true, &mut files)?;
+    tar_gz_files(files)
+}
+
+/// A gzipped tar of the listed paths — files, or directories walked whole —
+/// each keyed by its path relative to `base`: the shape of `[frontend]
+/// source`, sent as the check-only `frontend_source` part.
+pub fn tar_gz_paths(base: &Path, entries: &[String]) -> Result<Vec<u8>> {
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries {
+        let p = base.join(entry);
+        if p.is_dir() {
+            let mut inner = Vec::new();
+            collect_files(&p, &p, true, &mut inner)?;
+            let prefix = entry.trim_end_matches('/');
+            files.extend(inner.into_iter().map(|(rel, abs)| (format!("{prefix}/{rel}"), abs)));
+        } else if p.is_file() {
+            files.push((entry.clone(), p));
+        } else {
+            anyhow::bail!("[frontend] source names `{entry}`, which does not exist");
+        }
+    }
+    tar_gz_files(files)
+}
+
+fn tar_gz_files(mut files: Vec<(String, PathBuf)>) -> Result<Vec<u8>> {
     // Stable, reproducible ordering regardless of filesystem iteration order.
     files.sort_by(|a, b| a.0.cmp(&b.0));
-
     let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
     for (rel, abs) in files {
         let mut f = std::fs::File::open(&abs)
@@ -44,12 +67,8 @@ pub fn tar_gz_dir(root: &Path) -> Result<Vec<u8>> {
             .append_file(&rel, &mut f)
             .with_context(|| format!("failed to add to bundle: {rel}"))?;
     }
-
-    let gz = builder
-        .into_inner()
-        .context("failed to finalize frontend tar")?;
-    let bytes = gz.finish().context("failed to gzip frontend tar")?;
-    Ok(bytes)
+    let gz = builder.into_inner().context("failed to finalize frontend tar")?;
+    gz.finish().context("failed to gzip frontend tar")
 }
 
 /// Recursively collect regular files under `dir`, recording each as

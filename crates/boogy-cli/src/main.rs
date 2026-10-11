@@ -70,10 +70,14 @@ enum Commands {
         /// version without a bump. Fails if a live service still references it.
         #[arg(long)]
         replace: bool,
-        /// After deploy, load the live deployed URL in a headless browser and
-        /// assert it renders with a clean console (best-effort: no browser ⇒
-        /// a warning, never a failure). Frontend deployments only.
+        /// Skip the post-deploy smoke. By default, after deploy, the live URL is
+        /// loaded in a headless browser and must render with a clean console
+        /// (best-effort: no browser ⇒ a note, never a failure). Frontend
+        /// deployments only.
         #[arg(long)]
+        no_smoke: bool,
+        /// Accepted for older scripts: the smoke is the default now.
+        #[arg(long, hide = true)]
         smoke: bool,
         /// CSS selector(s) expected to render non-empty content (smoke).
         /// Comma-separated; the page passes if any one matches.
@@ -97,9 +101,12 @@ enum Commands {
         /// (re-publish the same version without a bump). See `deploy --replace`.
         #[arg(long)]
         replace: bool,
-        /// Post-deploy headless-browser smoke (requires `--provision`). See
-        /// `deploy --smoke`.
+        /// Skip the post-deploy smoke, which runs by default with `--provision`.
+        /// See `deploy --no-smoke`.
         #[arg(long)]
+        no_smoke: bool,
+        /// Accepted for older scripts: the smoke is the default now.
+        #[arg(long, hide = true)]
         smoke: bool,
         /// CSS selector(s) expected to render non-empty content (smoke).
         /// Comma-separated; the page passes if any one matches.
@@ -162,14 +169,11 @@ enum Commands {
         action: SkillsAction,
     },
     /// Lint a service crate for Boogy conventions (transactions, typed DTOs,
-    /// Model schemas, annotated routes) before you deploy
+    /// Model schemas, annotated routes), and its frontend for the @boogy/web
+    /// conventions publish enforces, before you deploy
     Check {
         /// Path to scan (default: current directory)
         path: Option<String>,
-        /// Also enforce the @boogy/web layout conventions (no media queries,
-        /// no sqrt(pow()), no pixel sizes outside theme.css)
-        #[arg(long)]
-        layout: bool,
     },
     /// Manage custom domains for your services
     Domain(domain::DomainArgs),
@@ -233,14 +237,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::Deploy {
             manifest,
             replace,
-            smoke,
+            no_smoke,
+            smoke: _,
             smoke_selector,
             smoke_path,
             smoke_timeout,
         } => {
             let token = resolve_token(&cli.token)?;
             let smoke_opts = smoke::SmokeOptions {
-                enabled: smoke,
+                enabled: !no_smoke,
                 selector: smoke_selector,
                 path: smoke_path,
                 timeout_ms: smoke_timeout,
@@ -251,14 +256,15 @@ async fn main() -> anyhow::Result<()> {
             manifest,
             provision,
             replace,
-            smoke,
+            no_smoke,
+            smoke: _,
             smoke_selector,
             smoke_path,
             smoke_timeout,
         } => {
             let token = resolve_token(&cli.token)?;
             let smoke_opts = smoke::SmokeOptions {
-                enabled: smoke,
+                enabled: !no_smoke && provision,
                 selector: smoke_selector,
                 path: smoke_path,
                 timeout_ms: smoke_timeout,
@@ -326,7 +332,7 @@ async fn main() -> anyhow::Result<()> {
                 skills::run(dest.as_deref(), "updated", agent)?
             }
         },
-        Commands::Check { path, layout } => check::run(path.as_deref(), layout)?,
+        Commands::Check { path } => check::run(path.as_deref())?,
         Commands::New { name, upgrade, build, template_dir, dir } => {
             if upgrade {
                 new::run_upgrade(cli.host.clone(), template_dir, dir).await?
@@ -397,11 +403,12 @@ mod tests {
     /// `deploy --smoke` flags: defaults present, overrides parsed.
     #[test]
     fn deploy_smoke_flags_parse() {
-        // Default: smoke off, the three common app roots, mount root, 10000ms.
+        // Default: smoke ON (skipped with a note when no browser is found), the
+        // three common app roots, mount root, 10000ms.
         let cli = Cli::try_parse_from(["boogy", "deploy", "app.boogy.toml"]).expect("parse");
         match cli.command {
-            Commands::Deploy { smoke, smoke_selector, smoke_path, smoke_timeout, .. } => {
-                assert!(!smoke, "smoke must default off (explicit opt-in)");
+            Commands::Deploy { no_smoke, smoke_selector, smoke_path, smoke_timeout, .. } => {
+                assert!(!no_smoke, "the smoke runs by default");
                 assert_eq!(smoke_selector, "#app,#root,#__next");
                 assert_eq!(smoke_path, "/");
                 assert_eq!(smoke_timeout, 10_000);
@@ -412,12 +419,12 @@ mod tests {
         // Overrides.
         let cli = Cli::try_parse_from([
             "boogy", "deploy", "app.boogy.toml",
-            "--smoke", "--smoke-selector", "#root", "--smoke-timeout", "20000",
+            "--no-smoke", "--smoke-selector", "#root", "--smoke-timeout", "20000",
         ])
         .expect("parse");
         match cli.command {
-            Commands::Deploy { smoke, smoke_selector, smoke_path, smoke_timeout, .. } => {
-                assert!(smoke);
+            Commands::Deploy { no_smoke, smoke_selector, smoke_path, smoke_timeout, .. } => {
+                assert!(no_smoke);
                 assert_eq!(smoke_selector, "#root");
                 assert_eq!(smoke_path, "/");
                 assert_eq!(smoke_timeout, 20_000);
@@ -434,9 +441,10 @@ mod tests {
         ])
         .expect("parse");
         match cli.command {
-            Commands::Publish { provision, smoke, smoke_selector, .. } => {
+            // `--smoke` is still accepted (the smoke is the default now).
+            Commands::Publish { provision, no_smoke, smoke_selector, .. } => {
                 assert!(provision);
-                assert!(smoke);
+                assert!(!no_smoke);
                 assert_eq!(smoke_selector, "#app,#root,#__next");
             }
             other => panic!("expected Publish, got {other:?}"),

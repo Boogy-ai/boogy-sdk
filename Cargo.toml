@@ -4,6 +4,7 @@ members = [
     "crates/boogy-wit",
     "crates/boogy-auth-core",
     "crates/boogy-conventions",
+    "crates/boogy-web-sdk-conventions",
     "crates/boogy-sdk-macros",
     "crates/boogy-sdk",
     "crates/boogy-cli",

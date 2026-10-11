@@ -26,6 +26,10 @@ struct PublishArtifacts {
     /// Gzipped tarball of `[frontend].root`, when a `[frontend]` section is
     /// present.
     frontend_tar_gz: Option<Vec<u8>>,
+    /// Gzipped tarball of a pre-built frontend's `[frontend] source` paths,
+    /// sent as the check-only `frontend_source` part. `None` for a source
+    /// build, and when the source is the root itself.
+    frontend_source_tar_gz: Option<Vec<u8>>,
     /// Compiled protobuf `FileDescriptorSet` bytes
     /// (`DESCRIPTOR_REL_PATH`, written by `boogy_proto_build::compile` at the
     /// author's build time), when `[grpc]` is declared with a non-empty
@@ -96,6 +100,25 @@ fn read_publish_artifacts(manifest_path: &str) -> Result<PublishArtifacts> {
         None => None,
     };
 
+    // A pre-built frontend's authored source, for the publish check only. A
+    // source equal to the root is the root itself, already uploaded.
+    let frontend_source_tar_gz = match manifest.get("frontend") {
+        Some(fe) if matches!(fe.get("build").and_then(|b| b.as_str()), Some("dist" | "none")) => {
+            let root = fe.get("root").and_then(|r| r.as_str()).unwrap_or_default().to_string();
+            let source: Vec<String> = fe
+                .get("source")
+                .and_then(|s| s.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            if source.is_empty() || source == [root] {
+                None
+            } else {
+                Some(crate::frontend::tar_gz_paths(manifest_dir, &source)?)
+            }
+        }
+        _ => None,
+    };
+
     if wasm.is_none() && frontend_tar_gz.is_none() {
         anyhow::bail!(
             "manifest has neither a [service] wasm nor a [frontend] section — \
@@ -140,6 +163,7 @@ fn read_publish_artifacts(manifest_path: &str) -> Result<PublishArtifacts> {
         manifest_content,
         wasm,
         frontend_tar_gz,
+        frontend_source_tar_gz,
         descriptor,
     })
 }
@@ -213,10 +237,21 @@ pub async fn publish(
     replace: bool,
     smoke: crate::smoke::SmokeOptions,
 ) -> Result<()> {
+    // The @boogy/web conventions, before anything is uploaded: the same rules
+    // `boogy check` reports and publish enforces. No flag skips them.
+    if let Some(report) = crate::check::frontend_report(Path::new(manifest_path))? {
+        crate::check::print_frontend_report(&report);
+        anyhow::ensure!(
+            report.is_clean(),
+            "{} frontend finding(s): fix each, or waive it next to the code with `boogy-allow <rule>: <reason>`. Nothing was uploaded.",
+            report.findings.len()
+        );
+    }
     let PublishArtifacts {
         manifest_content,
         wasm,
         frontend_tar_gz,
+        frontend_source_tar_gz,
         descriptor,
     } = read_publish_artifacts(manifest_path)?;
     // Capture before the bundle is consumed into the multipart form — the smoke
@@ -262,6 +297,15 @@ pub async fn publish(
                 .file_name("frontend.tar.gz")
                 .mime_str("application/gzip")
                 .context("failed to set frontend part mime")?,
+        );
+    }
+    if let Some(src) = frontend_source_tar_gz {
+        form = form.part(
+            "frontend_source",
+            multipart::Part::bytes(src)
+                .file_name("frontend-source.tar.gz")
+                .mime_str("application/gzip")
+                .context("failed to set frontend_source part mime")?,
         );
     }
     if let Some(bytes) = descriptor {
@@ -718,5 +762,36 @@ mod tests {
         // treated as grpc-enabled, this would fail with the missing-descriptor error.
         let arts = read_publish_artifacts(manifest.to_str().unwrap()).expect("must succeed");
         assert!(arts.descriptor.is_none());
+    }
+
+    #[test]
+    fn a_dist_build_uploads_its_source_as_a_check_only_part_and_a_source_build_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |p: &str, s: &str| { let p = dir.path().join(p); std::fs::create_dir_all(p.parent().unwrap()).unwrap(); std::fs::write(p, s).unwrap(); };
+        w("boogy.toml", "[service]\nid = \"a\"\nname = \"a\"\nversion = \"0.1.0\"\n[frontend]\nroot = \"dist\"\nbuild = \"dist\"\nsource = [\"index.html\", \"web\"]\n");
+        w("dist/index.html", "<p>built</p>");
+        w("index.html", "<p>source</p>");
+        w("web/main.ts", "export {};");
+        let a = read_publish_artifacts(dir.path().join("boogy.toml").to_str().unwrap()).unwrap();
+        assert!(a.frontend_source_tar_gz.is_some());
+        w("boogy.toml", "[service]\nid = \"a\"\nname = \"a\"\nversion = \"0.1.0\"\n[frontend]\nroot = \"dist\"\nbuild = \"dist\"\nsource = [\"dist\"]\n");
+        assert!(read_publish_artifacts(dir.path().join("boogy.toml").to_str().unwrap()).unwrap().frontend_source_tar_gz.is_none(), "source == [root]: the root is the source");
+    }
+
+    #[tokio::test]
+    async fn publish_stops_before_uploading_a_frontend_that_breaks_the_conventions() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |p: &str, s: &str| { let p = dir.path().join(p); std::fs::create_dir_all(p.parent().unwrap()).unwrap(); std::fs::write(p, s).unwrap(); };
+        w("boogy.toml", "[service]\nid = \"a\"\nname = \"a\"\nversion = \"0.1.0\"\n[routing]\npath = \"/\"\nmethods = [\"GET\"]\n[ingress]\nmode = \"public\"\n[frontend]\nroot = \"web\"\nbuild = \"source\"\nframe_options = \"deny\"\n");
+        w("web/index.html", "<p>x</p>");
+        w("web/main.ts", "import { installFoundation } from '@boogy/web';\ninstallFoundation();");
+        w("web/app.css", "a { padding: 12px }");
+        let smoke = crate::smoke::SmokeOptions { enabled: false, selector: String::new(), path: "/".into(), timeout_ms: 1 };
+        // An address nothing listens on: the refusal must come before any connection.
+        let err = publish("http://127.0.0.1:9", "t", dir.path().join("boogy.toml").to_str().unwrap(), false, false, smoke)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Nothing was uploaded"), "{err}");
     }
 }
