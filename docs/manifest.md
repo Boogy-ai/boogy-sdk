@@ -168,6 +168,28 @@ site). See the `boogy-serving-frontends` skill.
 
 ---
 
+## `[boards]` — in a Boards pane
+
+Optional. Needs a `[frontend]` block.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `background` | string | `"app"` | `"app"`: the app paints its own background. `"board"`: in a Boards pane the app draws no page background and the board's shows through; the app renders in the board's colour scheme (Boards is dark), whatever the viewer's system setting. |
+
+```toml
+[frontend]
+root = "web"
+
+[boards]
+background = "board"
+```
+
+With `"board"`, paint your page background with `var(--ground)` from `@boogy/web`, or redefine your own background token under `:root[data-board-background]`. Redefine only a token used as page paint: a token also used as a colour (an ink, a solid ground) must stay opaque, or everything it colours disappears with the page. The SDK's own rule sits in its cascade layer, so an app's own (unlayered) `body` or `--ground` rule outranks it: a page that sets its own background elsewhere keeps it. Covering surfaces keep the app's own colour: an SDK sheet covers with the opaque `--ground-solid` unless the app sets `--sheet-ground`, and full-page popovers use `--ground-solid` too. An app that wants them see-through sets `--sheet-ground: transparent` and hides what they cover.
+
+In a board your page renders in the board's colour scheme — your text and controls must read in that scheme (an opaque light page background with default dark-scheme text will be unreadable). Outside a board the app is unchanged.
+
+---
+
 ## `[ingress]`
 
 Controls who can call your service. **The section is required, and it must state
