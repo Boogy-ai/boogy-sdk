@@ -141,6 +141,9 @@ enum Commands {
         /// instance's own (omit to keep them; an empty file clears them)
         #[arg(long)]
         overrides: Option<String>,
+        /// Upgrade without asking for confirmation
+        #[arg(long)]
+        yes: bool,
     },
     /// List your deployed services (owner-scoped; any signed-in user)
     List {
@@ -286,9 +289,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?
         }
-        Commands::Upgrade { service_id, to, overrides } => {
+        Commands::Upgrade { service_id, to, overrides, yes } => {
             let token = resolve_token(&cli.token)?;
-            provision::upgrade(&cli.host, &token, &service_id, &to, overrides.as_deref()).await?
+            provision::upgrade(&cli.host, &token, &service_id, &to, overrides.as_deref(), yes).await?
         }
         Commands::List { all } => {
             let token = resolve_token(&cli.token)?;

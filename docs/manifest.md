@@ -67,7 +67,8 @@ Top-level service identity. All fields in this section are **required** unless m
 |---|---|---|---|
 | `id` | string | **required** | Stable identifier for this service. ASCII alphanumeric, `-`, `_`; max 64 chars; no leading `-`; no dots or slashes. Used in URLs and on-disk paths. |
 | `name` | string | **required** | Human-readable display name. |
-| `version` | string | **required** | SemVer string (e.g. `"0.2.0"`). Stored with the deployment; not used for routing. |
+| `version` | string | **required** | Must be semver (`MAJOR.MINOR.PATCH`, e.g. `"0.2.0"`), refused otherwise at publish. Stored with the deployment; not used for routing. |
+| `release_notes` | string | optional, `null` | What changed in this version, shown as plain text to an owner offered the update. Max 2000 characters. |
 | `wasm` | string | optional, `""` | Path to the compiled `.wasm` file, relative to the manifest (typically `target/wasm32-wasip2/release/<crate_name>.wasm`). **Omit it for a frontend-only (`Frontend` shape) deployment** — it runs no wasm. A `Service`/`FullStack` deploy with no wasm *and* no `[frontend]` is rejected ("nothing to deploy"). |
 | `description` | string | optional, `null` | One-paragraph description. Max 2000 chars. |
 | `keywords` | string array | optional, `[]` | Searchable tags. At most 40 entries; each ≤ 64 chars. |

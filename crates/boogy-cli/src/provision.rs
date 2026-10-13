@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -509,14 +510,111 @@ fn upgrade_body(to: &str, overrides: Option<String>) -> serde_json::Value {
     body
 }
 
+/// `text` with every control character except a newline and a tab replaced
+/// by U+FFFD, so text a module author wrote reaches the terminal as text: an
+/// escape sequence in it cannot recolour, hide or overwrite the lines around it.
+fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() && c != '\n' && c != '\t' { '\u{fffd}' } else { c })
+        .collect()
+}
+
+/// The line printed when `--overrides` replaces the instance's overrides: the
+/// platform computed the preview from the ones it has now.
+const OVERRIDES_PREVIEW_LINE: &str =
+    "This preview uses the instance's current overrides; the new ones apply when it upgrades.\n";
+
+/// Render what an upgrade changes, from the platform's update body. Pure.
+/// Every string in the body is printed through [`terminal_safe`].
+/// `overrides_replaced` adds a line saying the preview does not reflect new
+/// overrides.
+pub fn render_plan(service_id: &str, body: &serde_json::Value, overrides_replaced: bool) -> String {
+    let text = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).map(terminal_safe);
+    let current = text(body.get("current")).unwrap_or_else(|| "?".into());
+    let mut out = String::new();
+    match body.get("update").filter(|u| !u.is_null()) {
+        None => out.push_str("No version change; this applies the overrides only.\n"),
+        Some(update) => {
+            let version = text(update.get("version")).unwrap_or_else(|| "?".into());
+            out.push_str(&format!("Update {service_id}: {current} \u{2192} {version}\n"));
+            if let Some(notes) = text(update.get("notes")).filter(|n| !n.is_empty()) {
+                out.push('\n');
+                out.push_str(&notes);
+                out.push('\n');
+            }
+            out.push('\n');
+            let items = update.get("items").and_then(|i| i.as_array()).map(Vec::as_slice).unwrap_or_default();
+            if items.is_empty() {
+                out.push_str("Nothing else changes.\n");
+            }
+            for item in items {
+                let label = text(item.get("label")).unwrap_or_default();
+                let marker = if item.get("tone").and_then(|v| v.as_str()) == Some("attention") { "!" } else { "\u{b7}" };
+                match text(item.get("detail")).filter(|d| !d.is_empty()) {
+                    Some(detail) => out.push_str(&format!("{marker} {label}: {detail}\n")),
+                    None => out.push_str(&format!("{marker} {label}\n")),
+                }
+            }
+        }
+    }
+    if overrides_replaced {
+        out.push_str(OVERRIDES_PREVIEW_LINE);
+    }
+    out
+}
+
+/// Whether the upgrade may go ahead: `--yes` always; otherwise only a
+/// terminal user answering `y`/`yes`. Without a terminal and without `--yes`
+/// there is nobody to ask, so it refuses.
+pub fn may_proceed(yes: bool, is_tty: bool, answer: Option<&str>) -> Result<bool, &'static str> {
+    if yes {
+        return Ok(true);
+    }
+    if !is_tty {
+        return Err("pass --yes to upgrade without a prompt");
+    }
+    let a = answer.unwrap_or("").trim().to_ascii_lowercase();
+    Ok(a == "y" || a == "yes")
+}
+
 /// Upgrade a provisioned service to a module version (the current one, to
 /// change only its overrides). `overrides_path`, when given, REPLACES the
 /// instance's overrides; otherwise they carry forward.
-pub async fn upgrade(host: &str, token: &str, service_id: &str, to: &str, overrides_path: Option<&str>) -> Result<()> {
+pub async fn upgrade(host: &str, token: &str, service_id: &str, to: &str, overrides_path: Option<&str>, yes: bool) -> Result<()> {
     let overrides = match overrides_path {
         Some(p) => Some(std::fs::read_to_string(p).context("failed to read overrides file")?),
         None => None,
     };
+    let client = reqwest::Client::new();
+    match client
+        .get(format!("{host}/v1/registry/provisioned/{service_id}/update"))
+        .query(&[("to", to)])
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(plan) => print!("{}", render_plan(service_id, &plan, overrides.is_some())),
+            Err(_) => println!("Could not load what changes (unreadable answer)."),
+        },
+        Ok(r) => println!("Could not load what changes ({}).", r.status()),
+        Err(_) => println!("Could not load what changes (host unreachable)."),
+    }
+    let is_tty = std::io::stdin().is_terminal();
+    let answer = if !yes && is_tty {
+        use std::io::Write;
+        print!("Upgrade? [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        Some(line)
+    } else {
+        None
+    };
+    if !may_proceed(yes, is_tty, answer.as_deref()).map_err(|m| anyhow::anyhow!(m))? {
+        println!("Not upgraded.");
+        return Ok(());
+    }
     println!("Upgrading service...");
     println!("  Service: {service_id}");
     println!("  To version: {to}");
@@ -524,7 +622,6 @@ pub async fn upgrade(host: &str, token: &str, service_id: &str, to: &str, overri
         println!("  Overrides: replaced");
     }
 
-    let client = reqwest::Client::new();
     let resp = client
         .post(format!("{host}/v1/services/{service_id}/upgrade"))
         .header("Authorization", format!("Bearer {token}"))
@@ -568,6 +665,84 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    fn plan_body(items: serde_json::Value) -> serde_json::Value {
+        json!({"service_id":"polls","current":"0.1.0","update":{"version":"0.2.0","bump":"minor",
+            "published_at":"2026-10-01T00:00:00Z","notes":"Faster polls.","items":items}})
+    }
+
+    #[test]
+    fn the_plan_names_the_versions_notes_and_each_change() {
+        let out = render_plan("polls", &plan_body(json!([
+            {"kind":"capability","label":"New permission","detail":"web requests to other sites","tone":"attention"},
+            {"kind":"capability","label":"No longer uses","detail":"background jobs","tone":"info"}
+        ])), false);
+        assert!(out.contains("Update polls: 0.1.0 \u{2192} 0.2.0"), "{out}");
+        assert!(out.contains("Faster polls."), "{out}");
+        assert!(out.contains("! New permission: web requests to other sites"), "{out}");
+        assert!(out.contains("\u{b7} No longer uses: background jobs"), "{out}");
+        assert!(!out.contains("Nothing else changes."), "{out}");
+    }
+
+    #[test]
+    fn a_plan_with_no_items_says_nothing_else_changes() {
+        let out = render_plan("polls", &plan_body(json!([])), false);
+        assert!(out.contains("Nothing else changes."), "{out}");
+    }
+
+    #[test]
+    fn a_wire_shaped_item_has_its_label_alone_and_a_null_detail_is_not_printed() {
+        let out = render_plan("polls", &plan_body(json!([
+            {"kind":"capability","label":"New permission: web requests to other sites","detail":null,"tone":"attention"}
+        ])), false);
+        assert!(out.contains("! New permission: web requests to other sites\n"), "{out}");
+        assert!(!out.contains("null"), "{out}");
+    }
+
+    #[test]
+    fn no_update_means_overrides_only() {
+        let out = render_plan("polls", &json!({"service_id":"polls","current":"0.1.0","update":null}), false);
+        assert!(out.contains("No version change; this applies the overrides only."), "{out}");
+    }
+
+    /// The preview is computed from the overrides the instance has now; new
+    /// ones passed with `--overrides` replace them only when the upgrade runs.
+    #[test]
+    fn new_overrides_are_said_to_be_absent_from_the_preview() {
+        let line = "This preview uses the instance's current overrides; the new ones apply when it upgrades.";
+        let with = render_plan("polls", &plan_body(json!([])), true);
+        assert!(with.contains(line), "{with}");
+        let overrides_only = render_plan("polls", &json!({"service_id":"polls","current":"0.1.0","update":null}), true);
+        assert!(overrides_only.contains(line), "{overrides_only}");
+        assert!(!render_plan("polls", &plan_body(json!([])), false).contains(line));
+    }
+
+    /// The notes and every item are the module author's text: a terminal
+    /// escape in them must not reach the terminal, where it could hide the
+    /// lines that ask for attention.
+    #[test]
+    fn author_text_cannot_carry_terminal_controls() {
+        let body = json!({"service_id":"polls","current":"0.1.0","update":{"version":"0.2.0","bump":"minor",
+            "published_at":"2026-10-01T00:00:00Z","notes":"Faster.\u{1b}[8m\nline two\twith a tab\u{7f}\u{9b}31m\r",
+            "items":[{"kind":"capability","label":"New permission\u{1b}[8m","detail":"web\u{0}requests\u{85}","tone":"attention"}]}});
+        let out = render_plan("polls", &body, false);
+        for c in out.chars() {
+            assert!(!c.is_control() || c == '\n' || c == '\t', "a control character {c:?} reached the terminal: {out:?}");
+        }
+        assert!(out.contains("Faster.\u{fffd}[8m\nline two\twith a tab\u{fffd}\u{fffd}31m\u{fffd}"), "{out:?}");
+        assert!(out.contains("! New permission\u{fffd}[8m: web\u{fffd}requests\u{fffd}\n"), "{out:?}");
+    }
+
+    #[test]
+    fn upgrade_asks_unless_told_not_to() {
+        assert_eq!(may_proceed(true, false, None), Ok(true));
+        assert_eq!(may_proceed(false, false, None), Err("pass --yes to upgrade without a prompt"));
+        assert_eq!(may_proceed(false, true, Some("y")), Ok(true));
+        assert_eq!(may_proceed(false, true, Some("Y\n")), Ok(true));
+        assert_eq!(may_proceed(false, true, Some("")), Ok(false));
+        assert_eq!(may_proceed(false, true, Some("n")), Ok(false));
+        assert_eq!(may_proceed(false, true, None), Ok(false));
+    }
 
     /// The deploy output says why a service's address does not carry its
     /// name: `denied` (the name would impersonate the platform) or `empty`
