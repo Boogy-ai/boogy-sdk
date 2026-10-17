@@ -20,15 +20,16 @@ interface runtime {
     }
     self-identity: func() -> service-identity;
 
-    /// True iff the CALLER's owner account equals THIS service's owner — i.e.
-    /// the call is from the provisioner themselves (their agent token, resolved
-    /// host-side via the agents registry) or one of their own workloads
-    /// (`boogy://<owner>/...`). False for anonymous callers, a different owner,
-    /// or when the caller's account can't be resolved (FAIL-CLOSED). Host-
-    /// attested from the inbound identity — never guest-supplied — so it is safe
-    /// to authorize on (e.g. an owner-only `/admin` surface in a provisionable
-    /// module, which can't hardcode an owner identity in its manifest). Ungated,
-    /// like `self-identity`.
+    /// True iff the caller is THIS service's owner as a person: their agent
+    /// token, or their sign-in to this service, resolved host-side to their
+    /// account. A service is never the owner, not even one running under the
+    /// owner's account (every module the owner provisions does, a third-party
+    /// one included), and neither is a delegated call. False for anonymous
+    /// callers, a different owner, or when the caller's account can't be
+    /// resolved (FAIL-CLOSED). Host-attested from the inbound identity — never
+    /// guest-supplied — so it is safe to authorize on (e.g. an owner-only
+    /// `/admin` surface in a provisionable module, which can't hardcode an
+    /// owner identity in its manifest). Ungated, like `self-identity`.
     caller-is-service-owner: func() -> bool;
 
     /// What this invocation must do about the service's DECLARED schema

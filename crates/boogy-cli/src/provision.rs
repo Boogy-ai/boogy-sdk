@@ -389,8 +389,18 @@ pub async fn publish(
         // backend — indistinguishable, from the author's side, from their own
         // router being wrong. One probe turns hours of looking in the wrong
         // place into a line of output.
-        if provisioned {
-            match crate::smoke::probe_reachable(url).await {
+        let decision = crate::smoke::pin_plan(host, url);
+        let pins: Vec<crate::smoke::Pin> = match &decision {
+            crate::smoke::PinDecision::Pinned(p) => p.clone(),
+            _ => Vec::new(),
+        };
+        if !pins.is_empty() {
+            println!("{}", crate::smoke::pin_note(&pins));
+        }
+        if let crate::smoke::PinDecision::Refuse(why) = &decision {
+            println!("  Skipped the reachability check: {why}");
+        } else if provisioned {
+            match crate::smoke::probe_reachable(url, &pins).await {
                 crate::smoke::Reachability::PlatformAnswered => {}
                 crate::smoke::Reachability::AnsweredByNonPlatform { status } => {
                     println!("{}", crate::smoke::unreachable_advice(url));
@@ -408,7 +418,14 @@ pub async fn publish(
     // serving — i.e. provision succeeded. Best-effort otherwise.
     if smoke.enabled {
         if provision && provisioned {
-            crate::smoke::run_post_deploy_smoke(&smoke, service_url, has_frontend).await?;
+            let pins = match service_url.map(|u| crate::smoke::pin_plan(host, u)) {
+                Some(crate::smoke::PinDecision::Pinned(p)) => p,
+                Some(crate::smoke::PinDecision::Refuse(why)) => {
+                    anyhow::bail!("smoke not run: {why}");
+                }
+                _ => Vec::new(),
+            };
+            crate::smoke::run_post_deploy_smoke(&smoke, service_url, has_frontend, &pins).await?;
         } else {
             println!(
                 "  Smoke: skipped (requires a provisioned service — \

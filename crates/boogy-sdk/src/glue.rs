@@ -2452,11 +2452,12 @@ macro_rules! wit_glue {
         }
 
         #[allow(dead_code)]
-        /// True iff the CALLER is this service's owner — the provisioner's own
-        /// agent (their human/dashboard token, resolved host-side) or one of
-        /// their own workloads. False for anonymous, a different owner, or an
-        /// unresolvable caller (fail-closed). Host-attested — safe to authorize
-        /// on. Lets a provisionable module gate an owner-only surface (e.g.
+        /// True iff the CALLER is this service's owner as a person — their
+        /// sign-in to this service, or their own agent token, resolved
+        /// host-side to their account. No service is the owner, not even one
+        /// under the owner's account, and neither is a delegated call. False
+        /// for anonymous, a different owner, or an unresolvable caller
+        /// (fail-closed). Host-attested — safe to authorize on. Lets a provisionable module gate an owner-only surface (e.g.
         /// `/admin`) WITHOUT hardcoding an identity in its manifest:
         /// ```ignore
         /// if !crate::caller_is_service_owner() { return Err(ApiError::forbidden("operator only")); }

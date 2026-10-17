@@ -20,13 +20,78 @@ fn raw_controls_the_sdk_has_a_component_for_are_findings_naming_it() {
     assert!(m[0].contains("Button") && m[1].contains("TextArea") && m[2].contains("TextField") && m[3].contains("Switch") && m[4].contains("SearchField") && m[5].contains("ChoiceGroup"), "{m:?}");
 }
 
+// The SDK's own components, copied as they are: the spread is on the
+// `field()` wrapper, and the control inside it carries `data-slot="control"`,
+// directly or inside a `data-slot="group"`.
+const TEXT_FIELD: &str = include_str!("fixtures/text-field.tsx");
+const TEXT_AREA: &str = include_str!("fixtures/text-area.tsx");
+const COMPOSER: &str = include_str!("fixtures/composer.tsx");
+
 #[test]
-fn an_element_spreading_the_sdks_attrs_is_the_sdks_own_way() {
+fn the_sdks_own_text_field_text_area_and_composer_pass() {
+    for (path, src) in [("web/text-field.tsx", TEXT_FIELD), ("web/text-area.tsx", TEXT_AREA), ("web/composer.tsx", COMPOSER)] {
+        let r = check(path, src);
+        assert!(r.is_clean(), "{path}: {r:?}");
+    }
+}
+
+#[test]
+fn the_field_function_imported_under_another_name_counts() {
+    let aliased = TEXT_AREA.replace("import { field } from '@boogy/web';", "import { field as f } from '@boogy/web';").replace("{...field(", "{...f(");
+    assert!(aliased.contains("{...f({"), "the fixture changed shape");
+    assert!(check("web/text-area.tsx", &aliased).is_clean());
+    let group = "import { field as f } from '@boogy/web';\nconst c = <form {...f()}>\n  <div data-slot=\"group\">\n    <input type=\"search\" data-slot='control' />\n  </div>\n</form>;";
+    assert!(check("web/search.tsx", group).is_clean());
+}
+
+#[test]
+fn a_field_shaped_control_inside_an_expression_or_a_fragment_keeps_its_parent() {
     let r = check(
-        "web/app.tsx",
-        "import { button, field as fieldAttrs } from '@boogy/web';\nconst a = <button {...button({ variant: 'solid' })}>Go</button>;\nconst b = <input {...fieldAttrs()} />;",
+        "web/a.tsx",
+        "import { field } from '@boogy/web';\nconst a = <div {...field()}>{open && <textarea data-slot=\"control\" />}</div>;\nconst b = <div {...field()}><><input data-slot=\"control\" /></></div>;",
     );
     assert!(r.is_clean(), "{r:?}");
+}
+
+#[test]
+fn a_control_slot_with_no_field_parent_is_a_finding() {
+    let r = check(
+        "web/a.tsx",
+        concat!(
+            "import { field, stack } from '@boogy/web';\n",
+            "const a = <textarea data-slot=\"control\" />;\n",
+            "const b = <div {...stack()}><input data-slot=\"control\" /></div>;\n",
+            "const c = <div {...field()}><div><textarea data-slot=\"control\" /></div></div>;\n",
+            "const d = <div {...field()}><textarea /></div>;\n",
+            "const e = <div {...field()}><div data-slot=\"group\"><div data-slot=\"group\"><input data-slot=\"control\" /></div></div></div>;\n",
+            "const f = <div {...field()}><div data-slot={slot}><input data-slot=\"control\" /></div></div>;\n",
+            "const g = <div {...field()} />;\nconst h = <input data-slot=\"control\" />;\n",
+            "const i = <div {...field()}><span>{x}</span><input data-slot={kind} /></div>;",
+        ),
+    );
+    let got: Vec<(&str, usize)> = r.findings.iter().map(|f| (f.rule, f.line)).collect();
+    assert_eq!(got, [2, 3, 4, 5, 6, 7, 9, 10].map(|l| ("sdk-control", l)).to_vec(), "{r:?}");
+}
+
+#[test]
+fn spreading_some_other_sdk_function_onto_a_control_is_not_the_sdks_shape() {
+    let r = check(
+        "web/a.tsx",
+        "import { sheet, field, button } from '@boogy/web';\nconst a = <textarea {...sheet()} />;\nconst b = <input {...field()} />;\nconst c = <textarea {...button()} data-slot=\"control\" />;",
+    );
+    let got: Vec<(&str, usize)> = r.findings.iter().map(|f| (f.rule, f.line)).collect();
+    assert_eq!(got, vec![("sdk-control", 2), ("sdk-control", 3), ("sdk-control", 4)], "{r:?}");
+}
+
+#[test]
+fn a_button_passes_when_it_spreads_the_sdks_button_and_only_then() {
+    let ok = check("web/a.tsx", "import { button } from '@boogy/web';\nconst a = <button {...button({ variant: 'solid' })}>Go</button>;");
+    assert!(ok.is_clean(), "{ok:?}");
+    let aliased = check("web/a.tsx", "import { button as btn } from '@boogy/web';\nconst a = <button type=\"button\" {...btn()}>Go</button>;");
+    assert!(aliased.is_clean(), "{aliased:?}");
+    let bad = check("web/a.tsx", "import { button, field } from '@boogy/web';\nconst a = <button {...field()}>Go</button>;\nconst b = <div {...field()}><button data-slot=\"control\">Go</button></div>;");
+    let got: Vec<(&str, usize)> = bad.findings.iter().map(|f| (f.rule, f.line)).collect();
+    assert_eq!(got, vec![("sdk-control", 2), ("sdk-control", 3)], "{bad:?}");
 }
 
 #[test]
@@ -74,4 +139,18 @@ fn a_button_given_as_an_items_title_is_the_sdks_own_title_control() {
     );
     let got: Vec<(&str, usize)> = r.findings.iter().map(|f| (f.rule, f.line)).collect();
     assert_eq!(got, vec![("sdk-control", 6)], "{r:?}");
+}
+
+#[test]
+fn deep_unclosed_nesting_finishes() {
+    let n = 50_000;
+    for src in [
+        format!("{}{}", "<a>".repeat(n), "</b>".repeat(n)),
+        format!("const x = {}{}", "<>".repeat(n), "<input />".repeat(n)),
+        format!("const x = <div>{}{}", "{".repeat(n), "<input />".repeat(n)),
+    ] {
+        let started = std::time::Instant::now();
+        let _ = check("web/app.tsx", &src);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
 }

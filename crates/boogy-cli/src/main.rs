@@ -465,4 +465,12 @@ mod tests {
             "boogy --version should report the crate version"
         );
     }
+
+    /// A CLI older than 0.2.0 checks a frontend with fewer rules than publish
+    /// enforces; its version is how a person tells the two apart.
+    #[test]
+    fn the_cli_that_runs_the_full_frontend_conventions_is_at_least_0_2_0() {
+        let v: Vec<u64> = env!("CARGO_PKG_VERSION").split('.').map(|p| p.parse().unwrap()).collect();
+        assert!((v[0], v[1]) >= (0, 2), "boogy {} predates the full conventions", env!("CARGO_PKG_VERSION"));
+    }
 }

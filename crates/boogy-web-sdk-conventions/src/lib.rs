@@ -22,7 +22,7 @@ pub const RULES: &[(&str, &str)] = &[
     ("layout-media-query", "Size with the page scale and container units, and adapt with the SDK's layouts (FillGrid, CardGrid, Stack, Sheet)."),
     ("unit-multiple", "Use a size token (--space-*, --control-*, --icon-*, --fs-*), or define a named one: `--name: calc(var(--u) * n)`."),
     ("colour-literal", "Use an SDK colour token (--text-*, --accent, --edge*, --ground*) or a custom property you define."),
-    ("sdk-control", "Use the SDK component (Button, TextArea, TextField, SearchField, Switch, ChoiceGroup), or spread the SDK's attrs onto the element."),
+    ("sdk-control", "Use the SDK component (Button, TextArea, TextField, SearchField, Switch, ChoiceGroup), or write its shape: `<button {...button()}>`, or a text control with `data-slot=\"control\"` inside `<div {...field()}>`, directly or in its `<div data-slot=\"group\">`."),
     ("board-navigation", "Navigate with connectPane({ … }).navigate(path): in a board it moves the pane, not the board's history."),
     ("waiver", "Write a waiver as `boogy-allow <rule>: <reason>`, naming a rule and giving a reason."),
 ];

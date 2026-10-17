@@ -166,6 +166,7 @@ pub async fn run_post_deploy_smoke(
     opts: &SmokeOptions,
     service_url: Option<&str>,
     has_frontend: bool,
+    pins: &[Pin],
 ) -> anyhow::Result<()> {
     if !opts.enabled {
         return Ok(());
@@ -199,6 +200,7 @@ pub async fn run_post_deploy_smoke(
         &url,
         &selectors,
         Duration::from_millis(opts.timeout_ms),
+        pins,
     )
     .await?;
     println!("{}", report.render());
@@ -287,13 +289,18 @@ pub async fn run_smoke(
     url: &str,
     selectors: &[String],
     timeout: Duration,
+    pins: &[Pin],
 ) -> anyhow::Result<SmokeReport> {
-    let config = BrowserConfig::builder()
+    let mut config = BrowserConfig::builder()
         .chrome_executable(browser)
         .new_headless_mode()
         .no_sandbox()
         .arg("--disable-gpu")
-        .arg("--disable-dev-shm-usage")
+        .arg("--disable-dev-shm-usage");
+    for p in pins {
+        config = config.arg(format!("--host-resolver-rules=MAP {} {}", p.host, p.addr));
+    }
+    let config = config
         .build()
         .map_err(|e| anyhow::anyhow!("browser config: {e}"))?;
 
@@ -593,12 +600,12 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
         let timeout = Duration::from_secs(8);
 
-        let good = run_smoke(&browser, &format!("{base}/good"), &["#app".to_string()], timeout)
+        let good = run_smoke(&browser, &format!("{base}/good"), &["#app".to_string()], timeout, &[])
             .await
             .expect("run_smoke good");
         assert!(good.ok, "good page should pass, got: {good:?}");
 
-        let broken = run_smoke(&browser, &format!("{base}/broken"), &["#app".to_string()], timeout)
+        let broken = run_smoke(&browser, &format!("{base}/broken"), &["#app".to_string()], timeout, &[])
             .await
             .expect("run_smoke broken");
         assert!(!broken.ok, "broken page should fail");
@@ -626,6 +633,7 @@ mod tests {
             &format!("{base}/blank-framework"),
             &["#app".to_string()],
             timeout,
+            &[],
         )
         .await
         .expect("run_smoke blank");
@@ -722,6 +730,7 @@ mod tests {
     /// place or reads the wrong header name; this does.
     #[tokio::test]
     async fn the_probe_reads_the_deployment_header_off_the_wire() {
+        let _wire = WIRE_LOCK.lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
@@ -750,19 +759,185 @@ mod tests {
         });
         let base = format!("http://127.0.0.1:{port}");
         assert_eq!(
-            crate::smoke::probe_reachable(&format!("{base}/document")).await,
+            crate::smoke::probe_reachable(&format!("{base}/document"), &[]).await,
             crate::smoke::Reachability::PlatformAnswered,
             "a frontend document naming its deployment is the platform answering"
         );
         assert_eq!(
-            crate::smoke::probe_reachable(&format!("{base}/refused")).await,
+            crate::smoke::probe_reachable(&format!("{base}/refused"), &[]).await,
             crate::smoke::Reachability::PlatformAnswered,
             "an ingress refusal naming its deployment is the platform answering"
         );
         assert_eq!(
-            crate::smoke::probe_reachable(&format!("{base}/parked")).await,
+            crate::smoke::probe_reachable(&format!("{base}/parked"), &[]).await,
             crate::smoke::Reachability::AnsweredByNonPlatform { status: 200 },
             "the same page with no deployment named is something else answering"
+        );
+    }
+
+    #[test]
+    fn loopback_platform_hosts_are_recognised() {
+        for u in ["http://localhost:3000", "http://127.0.0.1:3000", "http://127.9.9.9", "http://[::1]:3000"] {
+            assert!(is_loopback_url(u), "{u}");
+        }
+        for u in ["https://api.example.com", "http://10.0.0.5:3000", "http://192.168.1.2", "not a url"] {
+            assert!(!is_loopback_url(u), "{u}");
+        }
+    }
+
+    fn pinned(d: PinDecision) -> Vec<Pin> {
+        match d {
+            PinDecision::Pinned(p) => p,
+            other => panic!("expected a pin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_loopback_platform_pins_the_label_to_loopback_on_the_urls_own_port() {
+        let p = pinned(decide_pin("http://127.0.0.1:3000", "https://rooms-dev.local.example.app", None));
+        assert_eq!(p, vec![Pin { host: "rooms-dev.local.example.app".into(), addr: "127.0.0.1:443".parse().unwrap() }]);
+        let p = pinned(decide_pin("http://localhost:3000", "https://x-1.local.example.app:8443/", None));
+        assert_eq!(p[0].addr, "127.0.0.1:8443".parse().unwrap());
+        let p = pinned(decide_pin("http://[::1]:3000", "https://x-1.local.example.app", None));
+        assert_eq!(p[0].addr, "[::1]:443".parse().unwrap());
+    }
+
+    #[test]
+    fn a_remote_platform_is_left_to_dns() {
+        assert_eq!(decide_pin("https://api.example.com", "https://x-1.example.app", None), PinDecision::Direct);
+        assert_eq!(decide_pin("http://127.0.0.1:3000", "https://127.0.0.1:8443", None), PinDecision::Direct);
+    }
+
+    #[test]
+    fn the_override_wins_over_the_automatic_pin() {
+        let p = pinned(decide_pin(
+            "http://127.0.0.1:3000",
+            "https://x-1.local.example.app",
+            Some("other:1:10.0.0.1, X-1.local.example.app:443:192.0.2.7"),
+        ));
+        assert_eq!(p, vec![Pin { host: "x-1.local.example.app".into(), addr: "192.0.2.7:443".parse().unwrap() }]);
+        // and it pins for a remote platform too
+        let p = pinned(decide_pin("https://api.example.com", "https://x-1.example.app", Some("x-1.example.app:443:[::1]")));
+        assert_eq!(p[0].addr, "[::1]:443".parse().unwrap());
+    }
+
+    #[test]
+    fn a_local_platform_whose_label_the_override_misses_is_refused() {
+        match decide_pin("http://127.0.0.1:3000", "https://x-1.local.example.app", Some("y-2.local.example.app:443:127.0.0.1")) {
+            PinDecision::Refuse(why) => assert!(why.contains("x-1.local.example.app") && why.contains("BOOGY_SMOKE_RESOLVE"), "{why}"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        // a remote platform just uses DNS
+        assert_eq!(
+            decide_pin("https://api.example.com", "https://x-1.example.app", Some("y-2.example.app:443:127.0.0.1")),
+            PinDecision::Direct
+        );
+    }
+
+    #[test]
+    fn a_malformed_override_is_refused_not_ignored() {
+        for bad in ["nonsense", "h:notaport:127.0.0.1", "h:443:notanip", ":443:127.0.0.1"] {
+            assert!(parse_resolve(bad).is_err(), "{bad}");
+            assert!(matches!(
+                decide_pin("http://127.0.0.1:3000", "https://x-1.local.example.app", Some(bad)),
+                PinDecision::Refuse(_)
+            ));
+        }
+        assert_eq!(parse_resolve("").unwrap(), vec![]);
+        assert_eq!(parse_resolve("a:1:::1").unwrap(), vec![("a".into(), 1, "::1".parse().unwrap())]);
+    }
+
+    #[test]
+    fn the_pin_note_says_a_browser_still_needs_dns() {
+        let n = pin_note(&[Pin { host: "x-1.local.example.app".into(), addr: "127.0.0.1:443".parse().unwrap() }]);
+        assert!(n.contains("x-1.local.example.app") && n.contains("browser still needs DNS"), "{n}");
+    }
+
+    #[tokio::test]
+    async fn a_pin_sends_the_request_to_the_pinned_address_not_dns() {
+        let _wire = WIRE_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nx-boogy-deployment-id: d\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        // A name that no resolver knows; only the pin can make it reachable.
+        let host = "pinned-label.invalid";
+        let pin = Pin { host: host.into(), addr };
+        assert_eq!(
+            probe_reachable(&format!("http://{host}:{}/", addr.port()), &[pin]).await,
+            Reachability::PlatformAnswered
+        );
+        assert!(matches!(
+            probe_reachable(&format!("http://{host}:{}/", addr.port()), &[]).await,
+            Reachability::Unreachable { .. }
+        ));
+    }
+
+    /// Proxy variables are process-wide; every test that probes over the wire
+    /// holds this so the proxy test cannot leak into it.
+    static WIRE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Serve one fixed raw response to every connection; returns the address.
+    async fn serve_raw(resp: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_pinned_request_ignores_proxy_environment() {
+        let _wire = WIRE_LOCK.lock().await;
+        let addr = serve_raw("HTTP/1.1 200 OK\r\nx-boogy-deployment-id: d\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        // A proxy that nothing listens on: if it were used, the probe would fail.
+        // SAFETY: no other test reads these variables.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
+            std::env::set_var("ALL_PROXY", "http://127.0.0.1:1");
+        }
+        let host = "proxied-label.invalid";
+        let r = probe_reachable(
+            &format!("http://{host}:{}/", addr.port()),
+            &[Pin { host: host.into(), addr }],
+        )
+        .await;
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("ALL_PROXY");
+        }
+        assert_eq!(r, Reachability::PlatformAnswered);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_request_does_not_follow_a_redirect_off_the_pin() {
+        let _wire = WIRE_LOCK.lock().await;
+        let addr = serve_raw("HTTP/1.1 302 Found\r\nLocation: http://elsewhere.invalid/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        let host = "redirecting-label.invalid";
+        // Followed, this would try to resolve elsewhere.invalid and be Unreachable.
+        assert_eq!(
+            probe_reachable(&format!("http://{host}:{}/", addr.port()), &[Pin { host: host.into(), addr }]).await,
+            Reachability::AnsweredByNonPlatform { status: 302 }
         );
     }
 
@@ -776,6 +951,184 @@ mod tests {
             "the whole point is to redirect the search: {a}"
         );
     }
+}
+
+// ─── Name pinning ───────────────────────────────────────────────────────────
+
+/// Env: curl `--resolve` form, `host:port:addr[,host:port:addr…]`.
+const RESOLVE_ENV: &str = "BOOGY_SMOKE_RESOLVE";
+/// Env: a PEM file of an extra trusted root for the smoke's own requests.
+const CA_FILE_ENV: &str = "BOOGY_CA_FILE";
+
+/// One name pinned to one socket address, so a request for the name never
+/// asks DNS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub host: String,
+    pub addr: std::net::SocketAddr,
+}
+
+/// How the smoke should reach the printed service URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinDecision {
+    /// Use ordinary DNS.
+    Direct,
+    /// Send the request to these addresses instead of asking DNS.
+    Pinned(Vec<Pin>),
+    /// Do not send the request at all; the string says why.
+    Refuse(String),
+}
+
+enum UrlHost {
+    Domain(String),
+    V4(std::net::Ipv4Addr),
+    V6(std::net::Ipv6Addr),
+}
+
+fn url_host(u: &reqwest::Url) -> Option<UrlHost> {
+    let h = u.host_str()?.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(a) = h.parse() {
+        return Some(UrlHost::V4(a));
+    }
+    if let Ok(a) = h.parse() {
+        return Some(UrlHost::V6(a));
+    }
+    Some(UrlHost::Domain(h.to_ascii_lowercase()))
+}
+
+/// Whether a platform URL's host is the local machine: `localhost`, anything
+/// in `127.0.0.0/8`, or `::1`.
+pub fn is_loopback_url(url: &str) -> bool {
+    use reqwest::Url;
+    match Url::parse(url).ok().as_ref().and_then(url_host) {
+        Some(UrlHost::Domain(d)) => d == "localhost",
+        Some(UrlHost::V4(a)) => a.is_loopback(),
+        Some(UrlHost::V6(a)) => a.is_loopback(),
+        None => false,
+    }
+}
+
+/// Parse `host:port:addr[,…]`. An IPv6 address may be bracketed.
+pub fn parse_resolve(raw: &str) -> Result<Vec<(String, u16, std::net::IpAddr)>, String> {
+    let mut out = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let mut parts = entry.splitn(3, ':');
+        let (host, port, addr) = (parts.next(), parts.next(), parts.next());
+        let (Some(host), Some(port), Some(addr)) = (host, port, addr) else {
+            return Err(format!("{RESOLVE_ENV}: \"{entry}\" is not host:port:addr"));
+        };
+        let port: u16 = port
+            .parse()
+            .map_err(|_| format!("{RESOLVE_ENV}: \"{port}\" in \"{entry}\" is not a port"))?;
+        let ip: std::net::IpAddr = addr
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .map_err(|_| format!("{RESOLVE_ENV}: \"{addr}\" in \"{entry}\" is not an IP address"))?;
+        if host.is_empty() {
+            return Err(format!("{RESOLVE_ENV}: \"{entry}\" has no host"));
+        }
+        out.push((host.to_ascii_lowercase(), port, ip));
+    }
+    Ok(out)
+}
+
+/// Decide how to reach `label_url`, given the platform URL the CLI talks to
+/// and the optional override. Pure: no environment, no network.
+///
+/// - An override wins. It pins the label when it names the label's host and
+///   port; when it does not, a local platform is refused (the label would
+///   otherwise be looked up in public DNS) and any other platform is left to DNS.
+/// - With no override, a local platform pins the label to the local machine on
+///   the label URL's own port.
+pub fn decide_pin(platform_url: &str, label_url: &str, resolve_override: Option<&str>) -> PinDecision {
+    use reqwest::Url;
+    let Ok(label) = Url::parse(label_url) else { return PinDecision::Direct };
+    let (Some(host), Some(port)) = (url_host(&label), label.port_or_known_default()) else {
+        return PinDecision::Direct;
+    };
+    let name = match host {
+        UrlHost::Domain(d) => d,
+        // An address literal needs no lookup.
+        _ => return PinDecision::Direct,
+    };
+    let local = is_loopback_url(platform_url);
+    if name == "localhost" {
+        return PinDecision::Direct;
+    }
+
+    if let Some(raw) = resolve_override.map(str::trim).filter(|r| !r.is_empty()) {
+        let entries = match parse_resolve(raw) {
+            Ok(e) => e,
+            Err(e) => return PinDecision::Refuse(e),
+        };
+        let pins: Vec<Pin> = entries
+            .into_iter()
+            .filter(|(h, p, _)| *h == name && *p == port)
+            .map(|(h, p, ip)| Pin { host: h, addr: std::net::SocketAddr::new(ip, p) })
+            .collect();
+        if !pins.is_empty() {
+            return PinDecision::Pinned(pins);
+        }
+        if local {
+            return PinDecision::Refuse(format!(
+                "{RESOLVE_ENV} does not cover {name}:{port}, and the platform is on this machine, \
+                 so a public lookup of {name} could send the request off it. \
+                 Add {name}:{port}:127.0.0.1 to {RESOLVE_ENV}, or unset it."
+            ));
+        }
+        return PinDecision::Direct;
+    }
+
+    if local {
+        let ip: std::net::IpAddr = match Url::parse(platform_url).ok().as_ref().and_then(url_host) {
+            Some(UrlHost::V6(_)) => std::net::Ipv6Addr::LOCALHOST.into(),
+            _ => std::net::Ipv4Addr::LOCALHOST.into(),
+        };
+        return PinDecision::Pinned(vec![Pin { host: name, addr: std::net::SocketAddr::new(ip, port) }]);
+    }
+    PinDecision::Direct
+}
+
+/// `decide_pin` with the override read from the environment.
+pub fn pin_plan(platform_url: &str, label_url: &str) -> PinDecision {
+    decide_pin(platform_url, label_url, std::env::var(RESOLVE_ENV).ok().as_deref())
+}
+
+/// The one line printed when a name is pinned: the smoke reached it without
+/// DNS, which a browser cannot do.
+pub fn pin_note(pins: &[Pin]) -> String {
+    let list = pins
+        .iter()
+        .map(|p| format!("{} -> {}", p.host, p.addr))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "  Note: the smoke reached {list} without DNS; a browser still needs DNS (or a hosts entry) for that name."
+    )
+}
+
+/// A client for the smoke's own requests: names pinned, and the root named by
+/// `BOOGY_CA_FILE` trusted when set.
+fn smoke_client(pins: &[Pin], timeout: Duration) -> anyhow::Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder().timeout(timeout);
+    if !pins.is_empty() {
+        // A pin only holds for a direct connection to the pinned name. A proxy
+        // would be handed the name and look it up itself, and a redirect would
+        // follow to a name that is not pinned; either could leave the machine.
+        // Redirects count as an answer (see `classify_probe`), so none is followed.
+        b = b.no_proxy().redirect(reqwest::redirect::Policy::none());
+    }
+    for p in pins {
+        b = b.resolve(&p.host, p.addr);
+    }
+    if let Some(path) = std::env::var_os(CA_FILE_ENV).filter(|p| !p.is_empty()) {
+        let pem = std::fs::read(&path).with_context(|| format!("reading {CA_FILE_ENV} {}", Path::new(&path).display()))?;
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .with_context(|| format!("{CA_FILE_ENV} is not a PEM certificate"))?;
+        b = b.add_root_certificate(cert);
+    }
+    Ok(b.build()?)
 }
 
 // ─── Edge reachability ──────────────────────────────────────────────────────
@@ -842,13 +1195,10 @@ pub fn unreachable_advice(url: &str) -> String {
 /// are all successes for this question. Only "the platform never saw it" is a
 /// failure, because that is the one condition the author cannot diagnose from
 /// their own code.
-pub async fn probe_reachable(url: &str) -> Reachability {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
+pub async fn probe_reachable(url: &str, pins: &[Pin]) -> Reachability {
+    let client = match smoke_client(pins, std::time::Duration::from_secs(10)) {
         Ok(c) => c,
-        Err(e) => return Reachability::Unreachable { detail: e.to_string() },
+        Err(e) => return Reachability::Unreachable { detail: format!("{e:#}") },
     };
     match client.get(url).send().await {
         Ok(resp) => classify_probe(
@@ -858,7 +1208,19 @@ pub async fn probe_reachable(url: &str) -> Reachability {
         Err(e) => Reachability::Unreachable {
             // The TLS/connect cause is the actionable half — a hostname
             // mismatch here names a missing certificate directly.
-            detail: e.to_string(),
+            detail: error_chain(&e),
         },
     }
+}
+
+/// An error and every cause beneath it, so a certificate or connect failure
+/// is named instead of hidden behind "error sending request".
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(c) = cur {
+        out.push_str(&format!(": {c}"));
+        cur = c.source();
+    }
+    out
 }
