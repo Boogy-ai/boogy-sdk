@@ -494,12 +494,12 @@ The SDK wraps most of this so handler code stays plain (`now_millis()`, `random_
 crate-type = ["cdylib"]     # cdylib ONLY — see below
 
 [dependencies]
-wit-bindgen = "0.46"
+wit-bindgen = "0.63"
 serde = { version = "1", features = ["derive"] }
 # Required, not optional: `wit_glue!` expands to `::serde_json` absolute
 # paths that resolve in YOUR crate's scope.
 serde_json = "1"
-schemars = { version = "0.8", default-features = false, features = ["derive"] }
+schemars = "1"
 
 [build-dependencies]
 boogy-wit = { git = "https://github.com/Boogy-ai/boogy-sdk" }

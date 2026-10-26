@@ -143,12 +143,14 @@ pub struct ApiError {
 /// without parsing `detail` prose — see
 /// `docs/superpowers/audits/2026-08-platform-audit.md` F-07/F-08.
 ///
-/// All five causes below render as HTTP 503 with the SAME
+/// Five causes below render as HTTP 503 with the SAME
 /// `kind = "/errors/service_unavailable"` — that collapse, with nothing
 /// distinguishing the causes on the wire, is exactly the defect this
 /// module fixes. Four are per-request store congestion (routed through
 /// [`StoreError`](crate::store::StoreError)); the fifth is the host's fair
-/// scheduler shedding a request before it ever reaches store code.
+/// scheduler shedding a request before it ever reaches store code. The
+/// sixth, [`STORAGE_GROWTH_RATE`](cause::STORAGE_GROWTH_RATE), is a 429:
+/// too fast, not unavailable.
 pub mod cause {
     /// The host-wide cap on concurrently open cross-service transactions
     /// was hit (`begin_transaction` admission). Not a data-model problem —
@@ -175,6 +177,10 @@ pub mod cause {
     /// guest at all — no instance slot was available under contention.
     /// Pure capacity signal; back off and retry.
     pub const SCHEDULER_SHED: &str = "scheduler_shed";
+    /// The service's stored data is growing faster than its storage growth
+    /// rate allows: too fast, not out of space. A 429, not a 503, with the
+    /// time until the growth budget covers the write as `Retry-After`.
+    pub const STORAGE_GROWTH_RATE: &str = "storage_growth_rate";
 }
 
 impl ApiError {

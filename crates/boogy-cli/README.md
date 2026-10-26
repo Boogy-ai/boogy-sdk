@@ -10,7 +10,7 @@ cargo install --path crates/boogy-cli
 cargo run -p boogy-cli -- <command>
 ```
 
-Default host URL is `http://localhost:3000`. Override per-command with `--host <url>` or persist via the env var `BOOGY_HOST_URL`.
+Default host URL is `https://api.boogy.ai`, the hosted platform. Against your own host (local development: `http://localhost:3000`), pass `--host <url>` per command or set the env var `BOOGY_HOST_URL`.
 
 ## Common workflows
 

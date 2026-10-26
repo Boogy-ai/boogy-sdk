@@ -24,7 +24,6 @@
 //! held outside the DB) is supported via [`hash_with_pepper`] —
 //! deployers who want it can configure their store accordingly.
 
-use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -156,8 +155,8 @@ pub fn hash(s: &str) -> String {
 /// in isolation: an attacker who steals only the DB cannot brute-force
 /// keys against the hashes without also stealing the pepper.
 pub fn hash_with_pepper(s: &str, pepper: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(pepper)
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(pepper)
         .expect("HMAC accepts any key length");
     mac.update(s.as_bytes());
     hex_encode(&mac.finalize().into_bytes())
@@ -208,14 +207,14 @@ fn random_base62(n: usize) -> String {
     // values [0, 248) and taking mod 62 gives a uniform distribution
     // across the 62 buckets — no modulo bias. The expected reroll
     // rate is 8/256 ≈ 3.1%, which is negligible compared to the
-    // OsRng cost we'd pay anyway.
+    // OS RNG cost we'd pay anyway.
     const ACCEPT_THRESHOLD: u8 = 248;
     let mut out = String::with_capacity(n);
     let mut buf = [0u8; 64];
     let mut idx = buf.len();
     while out.len() < n {
         if idx >= buf.len() {
-            OsRng.fill_bytes(&mut buf);
+            getrandom::fill(&mut buf).expect("OS RNG unavailable");
             idx = 0;
         }
         let b = buf[idx];

@@ -73,7 +73,7 @@ fn check_or_store_pin(fingerprint: &str) -> Result<()> {
 
 /// Fetch + validate the host's public seal key. Returns the DER bytes.
 async fn fetch_seal_key(host: &str) -> Result<Vec<u8>> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .get(format!("{host}/v1/seal-pubkey"))
         .send()
@@ -129,7 +129,7 @@ pub async fn set(
     let sealed = envelope.to_json_bytes();
 
     let url = format!("{host}/v1/services/{service}/secrets/{name}");
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .put(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -165,7 +165,7 @@ pub async fn set(
 /// Remove a secret binding from a service.
 pub async fn rm(host: &str, token: &str, service: &str, name: &str) -> Result<()> {
     let url = format!("{host}/v1/services/{service}/secrets/{name}");
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .delete(&url)
         .header("Authorization", format!("Bearer {token}"))

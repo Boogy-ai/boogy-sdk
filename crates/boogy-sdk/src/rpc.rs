@@ -88,6 +88,20 @@ impl From<&str> for RpcError {
 }
 
 /// Build a JSON-RPC success response.
+/// Response header [`Dispatcher::handle`] sets to the method that answered,
+/// so the platform can name it on the request's usage record (the request
+/// log shows it beside the mount's path). Set only for a method the
+/// dispatcher knows (a registered one, or `rpc.discover`): an unknown name
+/// is the caller's text, never recorded. The platform caps and sanitizes the
+/// value and never forwards the header to the client.
+pub const RPC_TELEMETRY_HEADER: &str = "x-boogy-rpc";
+
+/// `resp` with [`RPC_TELEMETRY_HEADER`] naming `method`.
+fn named_method(mut resp: response::HttpResponse, method: &str) -> response::HttpResponse {
+    resp.headers.push((RPC_TELEMETRY_HEADER.to_string(), method.to_string()));
+    resp
+}
+
 pub fn success_response<T: Serialize>(id: Option<&Value>, result: &T) -> response::HttpResponse {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -245,10 +259,12 @@ impl Dispatcher {
         // `rpc.discover` wins over the built-in.
         for (name, handler) in &self.handlers {
             if name == &envelope.method {
-                return match handler(envelope.params.clone()) {
+                crate::route_report::report(crate::route_report::RouteKind::JsonRpc, None, name);
+                let resp = match handler(envelope.params.clone()) {
                     Ok(v) => success_response(id, &v),
                     Err(e) => error_response(id, &e),
                 };
+                return named_method(resp, name);
             }
         }
 
@@ -258,8 +274,9 @@ impl Dispatcher {
         // is the default here by necessity: at dispatch time only the
         // Dispatcher survives — the Router (and its doc_info) is gone.
         if envelope.method == "rpc.discover" {
+            crate::route_report::report(crate::route_report::RouteKind::JsonRpc, None, "rpc.discover");
             let doc = crate::spec::build_openrpc(&crate::spec::DocInfo::default(), &self.specs);
-            return success_response(id, &doc);
+            return named_method(success_response(id, &doc), "rpc.discover");
         }
 
         error_response(id, &RpcError::method_not_found(envelope.method.clone()))
@@ -284,6 +301,26 @@ mod tests {
             method: "POST".into(), path: "/rpc".into(), headers: vec![],
             body: Some(body.as_bytes().to_vec()), path_params: vec![], query_params: vec![],
         }
+    }
+
+    fn rpc_header(resp: &response::HttpResponse) -> Option<&str> {
+        resp.headers.iter().find(|(k, _)| k == RPC_TELEMETRY_HEADER).map(|(_, v)| v.as_str())
+    }
+
+    /// The method that answered is named on the response, a registered
+    /// method or `rpc.discover`, whatever it returned; an unknown method and
+    /// a request that names none are not.
+    #[test]
+    fn a_known_method_is_named_on_its_response() {
+        fn fails(_: EchoParams) -> Result<EchoResult, RpcError> { Err(RpcError::invalid_params("no")) }
+        let d = Dispatcher::new().method("echo", echo).method("fails", fails);
+        let named = |body: &str| rpc_header(&d.handle(&rpc_req(body))).map(str::to_string);
+        assert_eq!(named(r#"{"jsonrpc":"2.0","method":"echo","params":{"msg":"hi"},"id":1}"#).as_deref(), Some("echo"));
+        assert_eq!(named(r#"{"jsonrpc":"2.0","method":"fails","params":{"msg":"hi"},"id":1}"#).as_deref(), Some("fails"));
+        assert_eq!(named(r#"{"jsonrpc":"2.0","method":"rpc.discover","id":1}"#).as_deref(), Some("rpc.discover"));
+        assert_eq!(named(r#"{"jsonrpc":"2.0","method":"nope<script>","id":1}"#), None, "the caller's text is never named");
+        assert_eq!(named("not json"), None);
+        assert_eq!(rpc_header(&d.handle(&crate::Request { body: None, ..rpc_req("") })), None);
     }
 
     #[test]

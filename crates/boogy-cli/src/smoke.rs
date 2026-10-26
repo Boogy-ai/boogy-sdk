@@ -1111,7 +1111,7 @@ pub fn pin_note(pins: &[Pin]) -> String {
 /// A client for the smoke's own requests: names pinned, and the root named by
 /// `BOOGY_CA_FILE` trusted when set.
 fn smoke_client(pins: &[Pin], timeout: Duration) -> anyhow::Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder().timeout(timeout);
+    let mut b = crate::http::client_builder().timeout(timeout);
     if !pins.is_empty() {
         // A pin only holds for a direct connection to the pinned name. A proxy
         // would be handed the name and look it up itself, and a redirect would

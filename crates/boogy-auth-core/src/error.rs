@@ -14,6 +14,18 @@ pub enum AuthError {
     #[error("token not yet valid")]
     NotYetValid,
 
+    /// The token is genuine and unexpired, but the account it names ended every
+    /// session issued before a later moment (a password change). Refused like an
+    /// expired token.
+    #[error("session ended")]
+    SessionRevoked,
+
+    /// Whether the account ended its earlier sessions could not be checked right
+    /// now (a store outage). The token is NOT judged: a caller answers 503, never
+    /// 401, so an outage signs nobody out.
+    #[error("session state could not be checked")]
+    SessionCheckUnavailable,
+
     #[error("token audience mismatch: expected {expected:?}, got {actual:?}")]
     AudienceMismatch { expected: String, actual: Option<String> },
 

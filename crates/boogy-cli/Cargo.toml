@@ -18,17 +18,20 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-reqwest = { version = "0.12", features = ["json", "multipart"] }
+# rustls with no built-in provider (reqwest's `rustls` feature would build
+# aws-lc-rs); `http::client_builder` installs `ring` before any client.
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "query", "rustls-no-provider", "http2", "charset", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 boogy-seal = { path = "../boogy-seal" }
 boogy-conventions = { path = "../boogy-conventions" }
 boogy-web-sdk-conventions = { path = "../boogy-web-sdk-conventions" }
-base64 = "0.22"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 dirs = "5"
 tar = "0.4"
 flate2 = "1"
 # Headless-browser deploy smoke (`boogy deploy --smoke`): drives a detected,
 # externally-installed Chrome/Chromium over CDP. Does not bundle a browser.
-chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+chromiumoxide = "0.9"
 futures = "0.3"
 
 [dev-dependencies]

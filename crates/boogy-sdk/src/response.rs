@@ -167,8 +167,8 @@ pub fn raw(status: u16, body: &[u8], content_type: &str) -> HttpResponse {
 /// shape lands in the generated `…/openapi.json`. If you hit
 /// `the trait bound …: JsonSchema is not satisfied` on a handler
 /// registration, add `#[derive(schemars::JsonSchema)]` to the payload
-/// struct (one line; `schemars = { workspace = true }` or `"0.8"` in
-/// your Cargo.toml).
+/// struct (one line; `schemars = { workspace = true }` or `"1"` in
+/// your Cargo.toml — a 0.x `schemars` derives a different trait).
 pub trait IntoResponse {
     fn into_response(self) -> HttpResponse;
 

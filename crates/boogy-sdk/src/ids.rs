@@ -51,7 +51,7 @@
 //! encode/decode at the API boundary" is the right pattern.
 
 use aes::Aes128;
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -73,18 +73,17 @@ impl IdCodec {
     /// secret: never log, never commit.
     pub fn new(secret: [u8; 16]) -> Self {
         Self {
-            cipher: Aes128::new(GenericArray::from_slice(&secret)),
+            cipher: Aes128::new(&secret.into()),
         }
     }
 
     /// Encode a `u64` as an opaque 22-char URL-safe base64 string.
     /// Stable across calls for a given key+id pair.
     pub fn encode(&self, id: u64) -> String {
-        let mut block = [0u8; 16];
+        let mut block = aes::Block::default();
         block[..8].copy_from_slice(MAGIC);
         block[8..].copy_from_slice(&id.to_be_bytes());
-        self.cipher
-            .encrypt_block(GenericArray::from_mut_slice(&mut block));
+        self.cipher.encrypt_block(&mut block);
         URL_SAFE_NO_PAD.encode(block)
     }
 
@@ -94,9 +93,8 @@ impl IdCodec {
     /// the magic prefix (i.e. wrong key or garbage input).
     pub fn decode(&self, opaque: &str) -> Option<u64> {
         let bytes = URL_SAFE_NO_PAD.decode(opaque.as_bytes()).ok()?;
-        let mut block: [u8; 16] = bytes.as_slice().try_into().ok()?;
-        self.cipher
-            .decrypt_block(GenericArray::from_mut_slice(&mut block));
+        let mut block = aes::Block::try_from(bytes.as_slice()).ok()?;
+        self.cipher.decrypt_block(&mut block);
         if &block[..8] != MAGIC {
             return None;
         }
@@ -108,6 +106,28 @@ impl IdCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FIPS-197, appendix C.1: AES-128 through the calls the codec makes.
+    #[test]
+    fn kat_aes_128_matches_fips_197() {
+        let key: Vec<u8> = (0u8..16).collect();
+        let cipher = Aes128::new(&aes::cipher::Array::try_from(key.as_slice()).unwrap());
+        let mut block = aes::cipher::Array::from([0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        cipher.encrypt_block(&mut block);
+        assert_eq!(block.as_slice(), &[0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a]);
+        cipher.decrypt_block(&mut block);
+        assert_eq!(block[15], 0xff);
+    }
+
+    /// RECORDED before the RustCrypto upgrade: the opaque id a fixed secret
+    /// gives a row id. Clients hold these ids; they must never change.
+    #[test]
+    fn kat_an_opaque_id_is_as_recorded() {
+        let codec = IdCodec::new([42u8; 16]);
+        assert_eq!(codec.encode(1), "Xl10wTr5zOenu8S8I_u3LA");
+        assert_eq!(codec.encode(u64::MAX - 7), "NoOb4let465yyEa4TTUz4Q");
+        assert_eq!(codec.decode("Xl10wTr5zOenu8S8I_u3LA"), Some(1));
+    }
 
     fn test_secret() -> [u8; 16] {
         *b"test-secret-16!!"

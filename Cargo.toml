@@ -14,14 +14,14 @@ members = [
 ]
 
 [workspace.dependencies]
-wit-bindgen = "0.46"
+wit-bindgen = "0.63"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-matchit = "0.8"
+sha2 = "0.11"
+matchit = "0.9"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 garde = { version = "0.22", default-features = false, features = ["derive"] }
-schemars = { version = "0.8", default-features = false, features = ["derive"] }
+schemars = { version = "1.2", default-features = false, features = ["derive", "std"] }
 serde_urlencoded = "0.7"
 # Protobuf RPC: the wasm-safe runtime `boogy-sdk`'s `grpc` module and every
 # generated message type depend on. `boogy-sdk` declares it `workspace = true`,
@@ -30,10 +30,10 @@ buffa = "0.9.2"
 # `boogy-proto-build`'s three dependencies. It is a BUILD-dependency crate --
 # it compiles a service's .proto at build time so an author needs no protobuf
 # toolchain -- and none of these ever enter a wasm's own dependency graph.
-protox = "0.9.1"
+protox = "0.10"
 prost = "0.14"
 connectrpc-build = "0.9.0"
 clap = { version = "4", features = ["derive", "env"] }
-toml = "0.8"
+toml = "1.1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"

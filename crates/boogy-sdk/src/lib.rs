@@ -65,6 +65,7 @@ pub mod mcp;
 pub mod pagination;
 pub mod peer;
 pub mod pricing;
+pub mod route_report;
 pub mod query;
 pub mod random;
 pub mod relations;

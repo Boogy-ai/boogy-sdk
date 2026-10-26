@@ -150,7 +150,7 @@ pub async fn run(host: &str, token: &str, args: DomainArgs) -> Result<()> {
 
 async fn add(host: &str, token: &str, fqdn: &str, service: &str) -> Result<()> {
     let url = domains_url(host);
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -192,7 +192,7 @@ async fn add(host: &str, token: &str, fqdn: &str, service: &str) -> Result<()> {
 
 async fn list(host: &str, token: &str) -> Result<()> {
     let url = domains_url(host);
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -259,7 +259,7 @@ async fn list(host: &str, token: &str) -> Result<()> {
 
 async fn remove(host: &str, token: &str, fqdn: &str) -> Result<()> {
     let url = domain_url(host, fqdn);
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .delete(&url)
         .header("Authorization", format!("Bearer {token}"))

@@ -25,7 +25,15 @@
 //!
 //! Path parameter syntax (matchit-flavoured):
 //! - `/{name}` — single-segment named parameter.
-//! - `/{*rest}` — catch-all, captures the remainder of the path.
+//! - `/{name}.png`, `/img-{name}` — a parameter with a static suffix or
+//!   prefix in its segment; at most one parameter per segment.
+//! - `/{*rest}` — catch-all, captures the remainder of the path (one or
+//!   more segments, never zero).
+//!
+//! On overlap a literal segment beats a parameter, and a suffixed or
+//! prefixed parameter beats a bare one. A bare parameter and a catch-all
+//! at the same position cannot both be registered: the later one is
+//! skipped and never matches (`route_pattern_pins` pins all of this).
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -603,6 +611,9 @@ macro_rules! guards {
 struct RouteEntry {
     handler: Handler,
     guards: Vec<Guard>,
+    /// A JSON-RPC, gRPC or MCP mount: its dispatcher names the route (the
+    /// method or tool), not the router.
+    mount: bool,
 }
 
 /// Per-path map from HTTP method to (handler + guards). BTreeMap so the
@@ -751,11 +762,21 @@ impl Router {
     /// Core route-insertion logic (no spec push). Called by `route()` and
     /// directly by `route_many()` / `rpc()` / `mcp()` so they can manage
     /// spec entries themselves without triggering a double-push.
-    fn route_inner(mut self, method: &str, path: &str, handler: Handler) -> Self {
+    fn route_inner(self, method: &str, path: &str, handler: Handler) -> Self {
+        self.route_entry(method, path, handler, false)
+    }
+
+    /// A JSON-RPC, gRPC or MCP mount (see [`RouteEntry::mount`]).
+    fn mount_inner(self, method: &str, path: &str, handler: Handler) -> Self {
+        self.route_entry(method, path, handler, true)
+    }
+
+    fn route_entry(mut self, method: &str, path: &str, handler: Handler, mount: bool) -> Self {
         let method = method.to_uppercase();
         let entry = RouteEntry {
             handler,
             guards: self.group_guards.clone(),
+            mount,
         };
         self.merge_route_entry(path, method, entry);
         self
@@ -1035,7 +1056,7 @@ impl Router {
             Err(_) => return self.serve_spec_doc_or_404(req),
         };
         let idx = *matched.value;
-        let mt = &self.routes_by_path[idx].1;
+        let (pattern, mt) = (&self.routes_by_path[idx].0, &self.routes_by_path[idx].1);
         let pairs: Vec<(String, String)> = matched
             .params
             .iter()
@@ -1054,6 +1075,11 @@ impl Router {
         };
 
         if let Some(entry) = mt.handlers.get(method_upper.as_str()) {
+            // Named before any guard or handler runs, so a request that fails
+            // still counts against its route.
+            if !entry.mount {
+                crate::route_report::report(crate::route_report::RouteKind::Http, Some(&method_upper), &crate::spec::openapi_path(pattern));
+            }
             for g in &entry.guards {
                 if let Err(resp) = g(&mut req_obj) {
                     return resp;
@@ -1066,6 +1092,9 @@ impl Router {
         // headers but no body. Guards on the GET route still run.
         if method_upper == "HEAD" {
             if let Some(entry) = mt.handlers.get("GET") {
+                if !entry.mount {
+                    crate::route_report::report(crate::route_report::RouteKind::Http, Some("GET"), &crate::spec::openapi_path(pattern));
+                }
                 for g in &entry.guards {
                     if let Err(resp) = g(&mut req_obj) {
                         return resp;
@@ -1115,7 +1144,9 @@ impl Router {
 
     /// Set the identity block for generated spec documents
     /// (`…/openapi.json`, `…/openrpc.json`). Optional — defaults to a
-    /// generic title and version 0.0.0.
+    /// generic title and version 0.0.0. As served, `info.version` is the
+    /// deployed `[service] version`; a different `version` here is kept
+    /// as `info.x-boogy-code-version`.
     pub fn info(mut self, title: &str, version: &str, description: Option<&str>) -> Self {
         self.doc_info = Some(crate::spec::DocInfo {
             title: title.to_string(),
@@ -1216,7 +1247,7 @@ impl Router {
         }
         let build_for_handler = build.clone();
         let handler: Handler = Rc::new(move |req: &mut Req<'_>| build_for_handler().handle(req.request));
-        self.route_inner("POST", path, handler)
+        self.mount_inner("POST", path, handler)
     }
 
     /// Mount a protobuf service. The wire path is `/{service_name}/{method}`
@@ -1261,7 +1292,7 @@ impl Router {
         }
         let build_for_handler = build.clone();
         let handler: Handler = Rc::new(move |req: &mut Req<'_>| build_for_handler().handle(req));
-        self.route_inner("POST", &path, handler)
+        self.mount_inner("POST", &path, handler)
     }
 
     /// Mount an MCP dispatch handler at `path` (registered as POST) and
@@ -1300,7 +1331,7 @@ impl Router {
         if !self.undocumented {
             self.specs.push(crate::spec::SpecEntry::Mcp { path: path.to_string(), guarded });
         }
-        self.route_inner("POST", path, handler.into_handler())
+        self.mount_inner("POST", path, handler.into_handler())
     }
 
     /// Unmatched request fallback: serve a generated spec document when
@@ -2911,5 +2942,164 @@ mod route_precedence_tests {
         r.insert("/l/api", "literal").unwrap();
         r.insert("/l/{slug}", "param").unwrap();
         assert_eq!(*r.at("/l/api").unwrap().value, "literal");
+    }
+}
+
+/// What the route matcher does with every pattern shape a service's routes
+/// use, pinned through `Router::handle` (the path a request takes): which
+/// route answers on overlap, how a parameter and a catch-all capture, and
+/// what misses. A matcher upgrade that moves any of these changes which
+/// handler a deployed service runs.
+#[cfg(test)]
+mod route_pattern_pins {
+    use super::*;
+    use crate::Request;
+    use crate::response;
+
+    fn req(path: &str) -> Request {
+        Request {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            headers: vec![],
+            body: None,
+            path_params: vec![],
+            query_params: vec![],
+        }
+    }
+
+    /// Answers with the route it is mounted at and every captured parameter.
+    fn route(at: &'static str) -> impl Fn(&mut Req<'_>) -> response::HttpResponse {
+        move |r: &mut Req<'_>| {
+            let params: serde_json::Map<String, serde_json::Value> =
+                r.params.as_pairs().iter().map(|(k, v)| (k.clone(), v.clone().into())).collect();
+            response::ok(&serde_json::json!({ "route": at, "params": params }))
+        }
+    }
+
+    fn answer(r: &Router, path: &str) -> String {
+        let resp = r.handle(&req(path));
+        if resp.status != 200 {
+            return format!("{}", resp.status);
+        }
+        let v: serde_json::Value = serde_json::from_slice(resp.body.as_deref().unwrap_or_default()).unwrap();
+        let params = v["params"].as_object().unwrap();
+        let mut out = v["route"].as_str().unwrap().to_string();
+        for (k, val) in params {
+            out.push_str(&format!(" {k}={}", val.as_str().unwrap()));
+        }
+        out
+    }
+
+    fn mounted(patterns: &[&'static str]) -> Router {
+        patterns.iter().fold(Router::new(), |r, p| r.get(p, route(p)))
+    }
+
+    #[test]
+    fn the_route_shapes_services_use_match_as_pinned() {
+        let r = mounted(&[
+            "/",
+            "/{id}",
+            "/api/notes",
+            "/api/notes/{id}",
+            "/api/notes/{id}/comments",
+            "/api/notes/search",
+            "/boards/{board}/panes/{pane}",
+            "/files/{*path}",
+            "/files/index",
+            "/static/{name}",
+            "/static/{*rest}",
+            "/img/{id}",
+            "/img/{id}.png",
+        ]);
+        let mut miss = Vec::new();
+        for (path, want) in [
+            ("/", "/"),
+            ("/abc", "/{id} id=abc"),
+            ("/api/notes", "/api/notes"),
+            ("/api/notes/7", "/api/notes/{id} id=7"),
+            // A literal beats a parameter at the same position, whatever the order.
+            ("/api/notes/search", "/api/notes/search"),
+            ("/api/notes/7/comments", "/api/notes/{id}/comments id=7"),
+            ("/boards/b1/panes/p2", "/boards/{board}/panes/{pane} board=b1 pane=p2"),
+            // A catch-all takes the rest, slashes included, and never zero segments.
+            ("/files/a/b.txt", "/files/{*path} path=a/b.txt"),
+            ("/files/index", "/files/index"),
+            ("/files", "/{id} id=files"),
+            ("/files/", "404"),
+            // A parameter and a catch-all at the same position conflict: the
+            // catch-all, registered second, is skipped and never matches.
+            ("/static/app.js", "/static/{name} name=app.js"),
+            ("/static/js/app.js", "404"),
+            // A suffixed parameter beats a bare one in the same position, and
+            // captures without its suffix.
+            ("/img/1.png", "/img/{id}.png id=1"),
+            ("/img/1.jpg", "/img/{id} id=1.jpg"),
+            // A parameter takes one whole segment, dots and dashes included;
+            // values arrive undecoded.
+            ("/api/notes/a.b-c", "/api/notes/{id} id=a.b-c"),
+            ("/api/notes/a%2Fb", "/api/notes/{id} id=a%2Fb"),
+            // No trailing-slash or empty-segment leniency.
+            ("/api/notes/", "404"),
+            ("/api/notes/7/", "404"),
+            ("/api//notes", "404"),
+            ("/api/notes/7/comments/x", "404"),
+        ] {
+            let got = answer(&r, path);
+            if got != want {
+                miss.push(format!("GET {path}: {got}, pinned {want}"));
+            }
+        }
+        assert!(miss.is_empty(), "{}", miss.join("\n"));
+    }
+
+    /// The router mounts each pattern the matcher accepts and skips one it
+    /// refuses (that route can never match; the others still serve), in
+    /// registration order. Pinned per pattern, against a router already holding `/a/{x}`:
+    /// `Ok`, or the matcher's refusal.
+    #[test]
+    fn the_matcher_accepts_and_refuses_these_patterns() {
+        let mut miss = Vec::new();
+        let outcome = |p: &str| {
+            let mut m = matchit::Router::new();
+            m.insert("/a/{x}", 0).unwrap();
+            match m.insert(p, 1) {
+                Ok(()) => "ok".to_string(),
+                Err(e) => e.to_string(),
+            }
+        };
+        for (pattern, want) in [
+            ("/a/b", "ok"),
+            ("/a/{x}/b", "ok"),
+            ("/a/{*rest}", "Insertion failed due to conflict with previously registered route: /a/{x}"),
+            ("/b/{x}/c/{y}", "ok"),
+            ("/{{literal}}", "ok"),
+            ("/a/{y}", "Insertion failed due to conflict with previously registered route: /a/{x}"),
+            ("/a/{x}", "Insertion failed due to conflict with previously registered route: /a/{x}"),
+            ("/b/pre-{x}", "ok"),
+            // A parameter with a static suffix in its segment (the matcher
+            // refused these before 0.9, so such a route never matched).
+            ("/b/{x}.json", "ok"),
+            ("/b/{x}-post", "ok"),
+            ("/b/{x}{y}", "Only one parameter is allowed per path segment"),
+            ("/b/{*rest}/c", "Catch-all parameters are only allowed at the end of a route"),
+            ("/b/{", "Parameters must be registered with a valid name"),
+            ("/b/{}", "Parameters must be registered with a valid name"),
+        ] {
+            let got = outcome(pattern);
+            if got != want {
+                miss.push(format!("insert {pattern}: {got}, pinned {want}"));
+            }
+        }
+        assert!(miss.is_empty(), "{}", miss.join("\n"));
+    }
+
+    /// Two routes the matcher cannot tell apart: the one registered first
+    /// serves, and the other never matches.
+    #[test]
+    fn of_two_indistinguishable_routes_the_first_registered_serves() {
+        let r = mounted(&["/a/{y}", "/a/{x}"]);
+        assert_eq!(answer(&r, "/a/1"), "/a/{y} y=1");
+        let r = mounted(&["/a/{x}", "/a/{y}"]);
+        assert_eq!(answer(&r, "/a/1"), "/a/{x} x=1");
     }
 }

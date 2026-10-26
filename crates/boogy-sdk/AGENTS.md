@@ -715,7 +715,7 @@ status the `From<StoreError> for ApiError` impl produces:
 
 | Variant | Status | Meaning |
 |---|---|---|
-| `QuotaExceeded(String)` | 507 | The service is over its storage quota. |
+| `QuotaExceeded(String)` | 507 | The account refuses growing writes: its storage grace window ended unpaid, or it reached its ceiling. Reads and deletes still pass; `GET /v1/storage` says which. |
 | `NotFound(String)` | 404 | No such table / row. |
 | `Conflict(String)` | 409 | **Serialization abort — nothing landed, safe to retry, and `tx` already retried it.** Reaching a handler means the platform has auto-retry switched off; otherwise persistent contention arrives as `TooContended`. |
 | `ConstraintViolation(String)` | 409 | A constraint was violated: unique index, foreign key, check, not-null, or "already exists" DDL. Deterministic — retrying never succeeds. |
@@ -724,7 +724,7 @@ status the `From<StoreError> for ApiError` impl produces:
 | `Timeout(String)` | 504 | The operation exceeded its deadline. |
 | `VersionMismatch(String)` | 409 | Stale read version. |
 | `CommitUnknown(String)` | 409 | Ambiguous commit — the write MAY or may not have landed. Do NOT blindly retry; reconcile state first. |
-| `ResourceExhausted(String)` | 503 | Transient: a platform concurrency cap was hit. Retry shortly. |
+| `ResourceExhausted(String)` | 503, or 429 | Transient: a platform concurrency cap was hit; retry shortly. **Or 429 with `cause: "storage_growth_rate"` and `Retry-After`**: the service's stored data is growing faster than its storage growth rate (10 MB/s unless your operator set another). Too fast, not out of space: wait `Retry-After` and retry. |
 | `Poisoned(String)` | 409 | The transaction was rolled back because a participant failed. NOT retryable — re-running re-executes the failed participant. |
 | `TooContended(String)` | 503 | Transient: the transaction ran out of retry attempts against a hot row. Retry shortly. |
 | `Internal(String)` | 500 | Unexpected store failure. |
@@ -1793,7 +1793,9 @@ fn create_note_tool(args: CreateNoteArgs) -> Result<NoteOut, ApiError> {
 ```
 
 `schemars` is a direct dep — add `schemars = { workspace = true }` in-repo
-(or `schemars = "0.8"` for external consumers) to your `Cargo.toml`.
+(or `schemars = "1"` for external consumers) to your `Cargo.toml`. A 0.x
+`schemars` does not work: its derive implements a different trait than the
+SDK requires; `boogy check` names the line.
 
 The legacy `tool(...)` registration with raw `Fn(Value) -> Result<ToolResult, RpcError>`
 is still available as the escape hatch for hand-rolled `ToolResult`

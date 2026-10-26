@@ -60,14 +60,14 @@ crate-type = ["cdylib"]
 
 [dependencies]
 boogy-sdk  = { git = "https://github.com/Boogy-ai/boogy-sdk", rev = "<pin-rev>" }
-wit-bindgen = "0.46"
+wit-bindgen = "0.63"
 serde       = { version = "1", features = ["derive"] }
 # Required: wit_glue! uses ::serde_json absolute paths; every service
 # crate must have it as a direct dependency.
 serde_json  = "1"
 # Required for spec generation: #[derive(JsonSchema)] on DTO types so
 # typed extractors and responses appear in the generated openapi.json.
-schemars    = "0.8"
+schemars    = "1"
 
 [build-dependencies]
 # build.rs copies the WIT files from this exact revision into wit/

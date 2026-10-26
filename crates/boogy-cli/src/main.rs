@@ -4,6 +4,7 @@ mod config;
 mod deploy;
 mod domain;
 mod frontend;
+mod http;
 mod login;
 mod manage;
 mod new;

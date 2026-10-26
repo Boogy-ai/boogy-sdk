@@ -484,6 +484,10 @@ impl RowPage {
 /// `{"items": [...], "next_cursor": "..."}` with `next_cursor`
 /// omitted when there is no next page (last-page marker).
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+// Named per item type (`CursorPage_for_NoteOut`), so a client generating
+// types from a document gets one model per page shape, not one name for all.
+// (A doc comment here would become every page schema's description.)
+#[schemars(rename = "CursorPage_for_{T}")]
 pub struct CursorPage<T: Serialize> {
     pub items: Vec<T>,
     #[serde(skip_serializing_if = "Option::is_none")]

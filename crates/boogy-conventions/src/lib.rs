@@ -108,6 +108,29 @@ fn starts_with_ident_char(s: &str) -> bool {
     s.bytes().next().map(is_ident_char).unwrap_or(false)
 }
 
+/// Why `value` is not an address a `[service]` link (`repository`,
+/// `homepage`, `documentation`) may hold, or `None` when it is: every
+/// place that shows the link makes it clickable, so it must be an
+/// `http://` or `https://` URL with a host, and no other scheme
+/// (`javascript:`, `data:`, `file:`) reaches a viewer through it.
+pub fn link_problem(value: &str) -> Option<&'static str> {
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("must not contain spaces or control characters");
+    }
+    let lower = value.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) else {
+        return Some("must be an http:// or https:// URL");
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.starts_with(':') {
+        return Some("must name a host after http:// or https://");
+    }
+    if authority.contains('@') {
+        return Some("must not carry a user name before the host");
+    }
+    None
+}
+
 /// Lint one source file. Pure (no I/O) so it is unit-testable.
 pub fn lint_file(file: &str, src: &str) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -634,6 +657,34 @@ fn is_ident_char(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_service_link_is_an_http_or_https_url_with_a_host() {
+        for ok in [
+            "https://github.com/x/y",
+            "http://example.com",
+            "HTTPS://Example.com/docs?x=1#y",
+            "https://example.com:8443/a",
+        ] {
+            assert_eq!(super::link_problem(ok), None, "{ok}");
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "file:///etc/passwd",
+            "ftp://example.com",
+            "//example.com",
+            "example.com",
+            "https://",
+            "https:///path",
+            "https://exa mple.com",
+            "https://example.com/\u{7}",
+            "https://user@example.com",
+            "",
+        ] {
+            assert!(super::link_problem(bad).is_some(), "{bad:?} must be refused");
+        }
+    }
 
     // -- check 6: counter-read-in-tx (guarantee-audit §1ap) ----------------
 

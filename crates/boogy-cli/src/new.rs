@@ -148,7 +148,7 @@ fn block_version(agents: &str) -> Option<String> {
 pub fn upgrade(dir: &Path, bundle: &TemplateBundle) -> anyhow::Result<UpgradeReport> {
     let manifest = std::fs::read_to_string(dir.join("boogy.toml"))
         .with_context(|| format!("{} has no boogy.toml — run this in a project boogy new created", dir.display()))?;
-    let doc: toml::Value = manifest.parse().context("boogy.toml is not valid TOML")?;
+    let doc: toml::Table = manifest.parse().context("boogy.toml is not valid TOML")?;
     let name = doc
         .get("service")
         .and_then(|s| s.get("id"))

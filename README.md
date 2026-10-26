@@ -58,7 +58,7 @@ See [`docs/quickstart.md`](docs/quickstart.md). The short version:
    ```toml
    [dependencies]
    boogy-sdk = { git = "https://github.com/Boogy-ai/boogy-sdk", rev = "<pin>" }
-   wit-bindgen = "0.46"
+   wit-bindgen = "0.63"
    serde = { version = "1", features = ["derive"] }
 
    [build-dependencies]

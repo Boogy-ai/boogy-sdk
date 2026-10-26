@@ -67,12 +67,13 @@ Top-level service identity. All fields in this section are **required** unless m
 |---|---|---|---|
 | `id` | string | **required** | Stable identifier for this service. ASCII alphanumeric, `-`, `_`; max 64 chars; no leading `-`; no dots or slashes. Used in URLs and on-disk paths. |
 | `name` | string | **required** | Human-readable display name. |
-| `version` | string | **required** | Must be semver (`MAJOR.MINOR.PATCH`, e.g. `"0.2.0"`), refused otherwise at publish. Stored with the deployment; not used for routing. |
+| `version` | string | **required** | Must be semver (`MAJOR.MINOR.PATCH`, e.g. `"0.2.0"`), refused otherwise at publish. Stored with the deployment; not used for routing. It is the `info.version` of the service's served `openapi.json` and `openrpc.json`. |
 | `release_notes` | string | optional, `null` | What changed in this version, shown as plain text to an owner offered the update. Max 2000 characters. |
 | `wasm` | string | optional, `""` | Path to the compiled `.wasm` file, relative to the manifest (typically `target/wasm32-wasip2/release/<crate_name>.wasm`). **Omit it for a frontend-only (`Frontend` shape) deployment** — it runs no wasm. A `Service`/`FullStack` deploy with no wasm *and* no `[frontend]` is rejected ("nothing to deploy"). |
 | `description` | string | optional, `null` | One-paragraph description. Max 2000 chars. |
 | `keywords` | string array | optional, `[]` | Searchable tags. At most 40 entries; each ≤ 64 chars. |
 | `category` | string | optional, `null` | Category tag for grouping. Max 64 chars. |
+| `repository`, `homepage`, `documentation` | string | optional, `null` | Links shown with your module (its source, its site, its docs). Each must be an `http://` or `https://` URL with a host, at most 1024 chars; publish refuses any other scheme (`javascript:`, `data:`, `file:` …), a URL with no host or a user name before the host, and `boogy check` names the field first. |
 | `thumbnails` | string array | optional, `[]` | Pictures of your app for its registry listing — an app picker shows them as the listing's cover, paged when there are several (an app with none gets a placeholder). At most 3. Each is a path **relative to `[frontend].root`** to a PNG, WebP, JPEG or AVIF file, so it ships in your frontend bundle; requires a `[frontend]` block. Publish refuses a thumbnail that is not in the bundle, is larger than 1 MiB, or whose bytes are not really one of those image types (the file's contents decide, not its name). Shown in order; they fill a wide, short frame, so keep the subject away from the edges. |
 | `owner` | string | optional, `""` | The owning user's handle, as a **bare key** (`owner = "alice"`), NOT a `[service.owner]` table. Normally **omit it** — you are authenticated when you deploy, so the platform sets the owner to your handle at publish/provision and overwrites any value here. Keep it only for local-dev/tests that provision under a fixed owner without the auth flow. Same character rules as `service.id`; not a platform-reserved name (`v1`, `healthz`, `_admin`, `_agents`, `_sys`). |
 
@@ -117,9 +118,11 @@ There is no capability for serving protobuf: it is an *inbound* surface that gra
 
 The `[limits]` section is **optional** — a missing or empty one takes the per-field defaults below.
 
-Storage capacity is **not** among them: it comes from your plan rather than being
-declared per service, and a `[limits] storage_mb` key is refused by name at
-publish. Check your usage with `GET /v1/quota`.
+Storage capacity is **not** among them: storage is set per account, not per
+service, and a `[limits] storage_mb` key is refused by name at publish. Every
+service you own shares one budget, tables and files together: a free allowance,
+paid growth above it, and a ceiling your operator can raise. Check it with
+`GET /v1/storage` (the account) and `GET /v1/quota` (each service).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -188,6 +191,30 @@ background = "board"
 With `"board"`, paint your page background with `var(--ground)` from `@boogy/web`, or redefine your own background token under `:root[data-board-background]`. Redefine only a token used as page paint: a token also used as a colour (an ink, a solid ground) must stay opaque, or everything it colours disappears with the page. The SDK's own rule sits in its cascade layer, so an app's own (unlayered) `body` or `--ground` rule outranks it: a page that sets its own background elsewhere keeps it. Covering surfaces keep the app's own colour: an SDK sheet covers with the opaque `--ground-solid` unless the app sets `--sheet-ground`, and full-page popovers use `--ground-solid` too. An app that wants them see-through sets `--sheet-ground: transparent` and hides what they cover.
 
 In a board your page renders in the board's colour scheme — your text and controls must read in that scheme (an opaque light page background with default dark-scheme text will be unreadable). Outside a board the app is unchanged.
+
+---
+
+## `[branding]` — the sign-in pages your app sends people to
+
+Optional. When your app sends someone to sign in, the platform's sign-in, consent and handle pages lead with your app: its logo and name sit at the top, and the heading names it ("Sign in to Pollster"). The platform appears once, in a strip at the bottom of every page that shows the page's own address. Without `[branding]` the pages use the platform's look: a calm blue, in the viewer's own light or dark preference.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `theme` | string | `"system"` | `"light"`, `"dark"`, or `"system"` to follow the viewer's light/dark setting. |
+| `logo` | string | none | A PNG, WebP, JPEG or AVIF file inside `[frontend].root`, checked like a `[service].thumbnails` entry: it must be in the bundle, at most 1 MiB, and really one of those image types. Shown in a fixed 56 px rounded square. Without one, the page shows your app's initials. Needs a `[frontend]` block. |
+| `accent` | string | calm blue | One hex colour, `"#1d5fd6"` or `"#15d"`, for the primary button, links, checkboxes and the focus ring. The platform adjusts it for each theme so text on it and links stay readable (at least 4.5:1), so a very light or very dark accent may come out darker or lighter than you wrote. |
+
+```toml
+[frontend]
+root = "web"
+
+[branding]
+theme  = "system"
+logo   = "assets/logo.png"
+accent = "#1d5fd6"
+```
+
+The name is your `[service].name`; there is no separate one. What you cannot change: the platform strip, the address it shows, the "by <owner>" line under your name, the fields and their wording, what is shared, error colours, fonts and shapes. The pages never carry your HTML, CSS or script. A publish that declares a bad `theme`, a malformed `accent`, or a `logo` that is missing, too large or not an image is refused, naming the key. `[branding]` belongs to the published module: a provision override cannot change it.
 
 ---
 

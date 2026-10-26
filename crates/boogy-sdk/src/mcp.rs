@@ -209,6 +209,21 @@ fn default_tool_input_schema() -> Value {
     serde_json::json!({ "type": "object" })
 }
 
+/// `T`'s JSON Schema as a tool's `inputSchema` / `outputSchema`: draft-07,
+/// every subschema inlined, no `$schema` key. A client reads each tool
+/// schema on its own, so a `$ref` into a `definitions` block the schema
+/// does not carry would dangle.
+fn tool_schema<T: schemars::JsonSchema>() -> Value {
+    schemars::generate::SchemaSettings::draft07()
+        .with(|s| {
+            s.inline_subschemas = true;
+            s.meta_schema = None;
+        })
+        .into_generator()
+        .into_root_schema_for::<T>()
+        .to_value()
+}
+
 /// Builder for [`Tool`]. `name` is required; everything else is optional.
 pub fn tool(name: impl Into<String>) -> Tool {
     Tool {
@@ -644,19 +659,13 @@ impl McpServer {
         // edge cases (richer descriptions, examples, vendor extensions)
         // while keeping the common case zero-effort.
         if descriptor.input_schema == default_tool_input_schema() {
-            descriptor.input_schema = serde_json::to_value(
-                schemars::schema_for!(P).schema,
-            )
-            .unwrap_or_else(|_| default_tool_input_schema());
+            descriptor.input_schema = tool_schema::<P>();
         }
 
         // Derive outputSchema from R unless the caller already provided one.
         // Same override-respect rule as input_schema above.
         if descriptor.output_schema.is_none() {
-            descriptor.output_schema = serde_json::to_value(
-                schemars::schema_for!(R).schema,
-            )
-            .ok();
+            descriptor.output_schema = Some(tool_schema::<R>());
         }
 
         // Erase the typed handler into the underlying `Fn(Value) ->
@@ -837,6 +846,7 @@ impl McpServer {
             );
             return inject_mcp_telemetry(resp, "tool", &name, start, "client_error");
         };
+        crate::route_report::report(crate::route_report::RouteKind::Mcp, None, &name);
 
         match (entry.handler)(args) {
             Ok(result) => {
@@ -1364,6 +1374,35 @@ mod tests {
     #[derive(serde::Serialize, schemars::JsonSchema)]
     struct GreetResult {
         message: String,
+    }
+
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Shelf {
+        books: Vec<Book>,
+    }
+
+    /// A struct nested inside a tool's result.
+    #[derive(serde::Serialize, schemars::JsonSchema)]
+    struct Book {
+        title: String,
+    }
+
+    /// A tool schema is read on its own, so a nested type is inlined:
+    /// a `$ref` would point into a `definitions` block it does not carry.
+    #[test]
+    fn tool_typed_inlines_a_nested_type_into_the_schema() {
+        let server = McpServer::new("typed", "0.1.0").tool_typed(
+            tool("shelf"),
+            |_: GreetArgs| -> Result<Shelf, crate::error::ApiError> { Ok(Shelf { books: vec![] }) },
+        );
+        let resp = server.handle(&req_with_body(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list"
+        })));
+        let schema = &parse_body(&resp)["result"]["tools"][0]["outputSchema"];
+        let text = schema.to_string();
+        assert!(!text.contains("$ref") && !text.contains("$schema"), "a self-contained schema: {schema}");
+        assert_eq!(schema["properties"]["books"]["items"]["properties"]["title"]["type"], "string", "{schema}");
+        assert_eq!(schema["properties"]["books"]["items"]["description"], "A struct nested inside a tool's result.");
     }
 
     #[test]

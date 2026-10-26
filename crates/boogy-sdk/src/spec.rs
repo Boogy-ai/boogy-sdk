@@ -30,12 +30,17 @@ impl Default for DocInfo {
 ///
 /// `inline_subschemas` keeps every schema self-contained — no
 /// `definitions`/`$defs` pointers, so values can be dropped anywhere in
-/// an OpenAPI or OpenRPC document without `$ref` rewriting.
+/// an OpenAPI or OpenRPC document without `$ref` rewriting. No `$schema`
+/// key: the value is a schema inside a document, not a document.
 pub fn schema_value<T: schemars::JsonSchema>() -> Value {
-    let mut settings = schemars::gen::SchemaSettings::openapi3();
-    settings.inline_subschemas = true;
-    let schema = settings.into_generator().into_root_schema_for::<T>().schema;
-    serde_json::to_value(schema).unwrap_or_else(|_| json!({ "type": "object" }))
+    schemars::generate::SchemaSettings::openapi3()
+        .with(|s| {
+            s.inline_subschemas = true;
+            s.meta_schema = None;
+        })
+        .into_generator()
+        .into_root_schema_for::<T>()
+        .to_value()
 }
 
 /// What one REST operation responds with on success.
@@ -340,11 +345,16 @@ fn push_object_params(out: &mut Vec<Value>, schema: &Value, location: &str, rout
     }
 }
 
-/// `/api/notes/{id}` → `Some("id")`; multi-param or no-param paths → None.
+/// `/api/notes/{id}` or `/img/{id}.png` → `Some("id")`; multi-param or
+/// no-param paths → None.
 fn single_path_param(path: &str) -> Option<String> {
-    let mut params = path.split('/')
-        .filter(|s| s.starts_with('{') && s.ends_with('}'))
-        .map(|s| s[1..s.len() - 1].trim_start_matches('*').to_string());
+    // A segment holds at most one `{name}`, whole (`{id}`, `{*rest}`) or
+    // with a static prefix or suffix (`{id}.png`); `{{` is an escaped brace.
+    let mut params = path.split('/').filter_map(|seg| {
+        let open = seg.find('{').filter(|&i| !seg[i + 1..].starts_with('{'))?;
+        let len = seg[open..].find('}')?;
+        Some(seg[open + 1..open + len].trim_start_matches('*').to_string())
+    });
     match (params.next(), params.next()) {
         (Some(p), None) => Some(p),
         _ => None,
@@ -352,7 +362,7 @@ fn single_path_param(path: &str) -> Option<String> {
 }
 
 /// matchit catch-all `{*rest}` → OpenAPI-legal `{rest}`.
-fn openapi_path(path: &str) -> String {
+pub(crate) fn openapi_path(path: &str) -> String {
     path.replace("{*", "{")
 }
 
@@ -473,6 +483,18 @@ mod tests {
         push_object_params(&mut params_two, &scalar, "path", "/a/{x}/{y}");
         assert!(params_two.is_empty(),
             "scalar path param on a two-segment route must emit no parameters (ambiguous)");
+    }
+
+    /// A parameter with a static suffix (`/img/{id}.png`) is still the
+    /// route's single parameter: the document declares it, or its path
+    /// template names a parameter it never declares.
+    #[test]
+    fn scalar_path_param_binds_to_a_suffixed_route_param() {
+        let scalar = serde_json::json!({ "type": "string" });
+        let mut params = Vec::new();
+        push_object_params(&mut params, &scalar, "path", "/img/{id}.png");
+        assert_eq!(params.len(), 1, "a suffixed parameter is the route's one parameter");
+        assert_eq!(params[0]["name"], "id");
     }
 
     /// Test 9: path containing a catch-all `{*path}` is converted to the

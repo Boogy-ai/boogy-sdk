@@ -61,4 +61,23 @@ interface runtime {
         apply-only,
     }
     current-schema-mode: func() -> schema-mode;
+
+    /// What kind of route a service's router matched.
+    enum route-kind {
+        /// A REST route: `method` is the HTTP method, `route` the pattern as
+        /// the served OpenAPI document writes it (`/notes/{id}`).
+        http,
+        /// A JSON-RPC method: `route` is the method name.
+        jsonrpc,
+        /// An MCP tool: `route` is the tool name.
+        mcp,
+        /// A gRPC method: `route` is `package.Service/Method`.
+        grpc,
+    }
+
+    /// Name the route this invocation matched, for the owner's totals per
+    /// route. Grants nothing and is never refused: the host keeps the first
+    /// call of an invocation, and counts a name its served API documents do
+    /// not list as `other`.
+    report-route: func(kind: route-kind, method: option<string>, route: string);
 }

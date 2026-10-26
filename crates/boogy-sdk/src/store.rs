@@ -171,7 +171,14 @@ pub mod resource_exhausted_tag {
         crate::error::cause::TX_ADMISSION_EXHAUSTED,
         crate::error::cause::STORE_OP_CEILING_EXCEEDED,
         crate::error::cause::STORE_OP_RATE_LIMITED,
+        crate::error::cause::STORAGE_GROWTH_RATE,
     ];
+
+    /// Host-side: embed `cause` and a wait in whole seconds, for a cause
+    /// whose wait the host computes (`storage_growth_rate`).
+    pub fn tag_retry(cause: &str, retry_after_secs: u64, msg: impl std::fmt::Display) -> String {
+        tag(cause, format!("{retry_after_secs}{SEP}{msg}"))
+    }
 
     /// Host-side: embed `cause` into a `ResourceExhausted` message.
     pub fn tag(cause: &str, msg: impl std::fmt::Display) -> String {
@@ -189,6 +196,17 @@ pub mod resource_exhausted_tag {
             }
         }
         (None, msg)
+    }
+
+    /// SDK-side: split the wait [`tag_retry`] put after the cause, if any.
+    pub fn untag_retry(rest: &str) -> (Option<u64>, &str) {
+        match rest.split_once(SEP) {
+            Some((secs, text)) => match secs.parse::<u64>() {
+                Ok(n) => (Some(n), text),
+                Err(_) => (None, rest),
+            },
+            None => (None, rest),
+        }
     }
 }
 
@@ -214,6 +232,14 @@ impl From<StoreError> for ApiError {
             StoreError::ResourceExhausted(m)   => {
                 let (cause, text) = resource_exhausted_tag::untag(&m);
                 match cause {
+                    // Too fast, not out of space: a 429, after the wait the
+                    // host computed from the growth budget.
+                    Some(c) if c == crate::error::cause::STORAGE_GROWTH_RATE => {
+                        let (secs, text) = resource_exhausted_tag::untag_retry(text);
+                        let mut e = ApiError::rate_limited(text, secs.unwrap_or(1).max(1));
+                        e.cause = Some(c.to_string());
+                        e
+                    }
                     // Retrying an IDENTICAL request trips the same
                     // per-request ceiling again — a retry hint here would be
                     // actively misleading.
@@ -1591,6 +1617,23 @@ mod tests {
         assert_eq!(api.status, 503);
         assert_eq!(api.cause, None);
         assert_eq!(api.detail.as_deref(), Some("some future message"));
+    }
+
+    /// Stored data growing faster than the service's growth rate is "too
+    /// fast", not "out of space": a 429 naming `storage_growth_rate`, with the
+    /// host's refill time as `Retry-After`.
+    #[test]
+    fn storage_growth_rate_is_a_429_with_the_hosts_retry_after() {
+        use crate::error::cause::STORAGE_GROWTH_RATE;
+        let tagged = resource_exhausted_tag::tag_retry(STORAGE_GROWTH_RATE, 7, "stored data is growing too fast");
+        let api: ApiError = StoreError::ResourceExhausted(tagged).into();
+        assert_eq!(api.status, 429);
+        assert_eq!(api.cause.as_deref(), Some(STORAGE_GROWTH_RATE));
+        assert_eq!(api.retry_after_secs, Some(7));
+        assert_eq!(api.detail.as_deref(), Some("stored data is growing too fast"));
+        // A missing or malformed wait still retries, after a second.
+        let api: ApiError = StoreError::ResourceExhausted(resource_exhausted_tag::tag(STORAGE_GROWTH_RATE, "x")).into();
+        assert_eq!((api.status, api.retry_after_secs), (429, Some(1)));
     }
 
     #[test]

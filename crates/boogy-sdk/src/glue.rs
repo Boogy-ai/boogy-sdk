@@ -174,6 +174,18 @@ macro_rules! wit_glue {
             )
         }
 
+        #[doc(hidden)]
+        fn __sdk_report_route(kind: $crate::route_report::RouteKind, method: ::core::option::Option<&str>, route: &str) {
+            use $bindings::boogy::platform::runtime::RouteKind as K;
+            let kind = match kind {
+                $crate::route_report::RouteKind::Http => K::Http,
+                $crate::route_report::RouteKind::JsonRpc => K::Jsonrpc,
+                $crate::route_report::RouteKind::Mcp => K::Mcp,
+                $crate::route_report::RouteKind::Grpc => K::Grpc,
+            };
+            $bindings::boogy::platform::runtime::report_route(kind, method, route);
+        }
+
         #[allow(unused_imports)]
         use $crate::json::{self, Deserialize, Serialize};
         #[allow(unused_imports)]
@@ -6206,6 +6218,7 @@ macro_rules! wit_glue {
                 }
                 $crate::log::_register_runtime_log(__sdk_runtime_log);
                 $crate::pricing::_register_report_units(__sdk_report_units);
+                $crate::route_report::_register_report_route(__sdk_report_route);
 
                 let request_id = req
                     .headers

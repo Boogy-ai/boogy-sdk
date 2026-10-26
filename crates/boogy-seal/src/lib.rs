@@ -101,21 +101,21 @@ use zeroize::Zeroizing;
 /// fresh AES-256 key + 12-byte nonce per call.
 pub fn seal(recipient_pub_der: &[u8], plaintext: &[u8]) -> Result<SealEnvelope, SealError> {
     let pubkey = RsaPublicKey::from_public_key_der(recipient_pub_der).map_err(|_| SealError::Crypto)?;
-    let mut rng = rand::thread_rng();
+    let mut rng = rsa::rand_core::OsRng;
     // Raw AES-256 key material — zeroed on drop so it does not linger as a residual.
     let mut key = Zeroizing::new([0u8; 32]);
     let mut nonce = [0u8; 12];
-    use rand::RngCore;
+    use rsa::rand_core::RngCore;
     rng.fill_bytes(&mut *key);
     rng.fill_bytes(&mut nonce);
     let cipher = Aes256Gcm::new_from_slice(&*key).map_err(|_| SealError::Crypto)?;
     // Interop: AAD MUST be empty (Web Crypto: omit `additionalData`); the GCM tag
     // is 128 bits / 16 bytes (default — do not override) and appended: c = ct || tag.
     let c = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: b"" })
+        .encrypt(&Nonce::from(nonce), Payload { msg: plaintext, aad: b"" })
         .map_err(|_| SealError::Crypto)?;
     let wrapped = pubkey
-        .encrypt(&mut rng, Oaep::new::<Sha256>(), &*key)
+        .encrypt(&mut rng, Oaep::new::<rsa::sha2::Sha256>(), &*key)
         .map_err(|_| SealError::Crypto)?;
     Ok(SealEnvelope { v: SCHEME_V1, k: wrapped, n: nonce.to_vec(), c })
 }
@@ -128,7 +128,7 @@ pub fn unseal(recipient_priv_der: &SecretBox<Vec<u8>>, env: &SealEnvelope) -> Re
     }
     let privkey = RsaPrivateKey::from_pkcs8_der(recipient_priv_der.expose_secret()).map_err(|_| SealError::Crypto)?;
     // Unwrapped raw AES-256 key material — zeroed on drop so it does not linger.
-    let key = Zeroizing::new(privkey.decrypt(Oaep::new::<Sha256>(), &env.k).map_err(|_| SealError::Crypto)?);
+    let key = Zeroizing::new(privkey.decrypt(Oaep::new::<rsa::sha2::Sha256>(), &env.k).map_err(|_| SealError::Crypto)?);
     if key.len() != 32 || env.n.len() != 12 {
         return Err(SealError::Crypto);
     }
@@ -136,7 +136,7 @@ pub fn unseal(recipient_priv_der: &SecretBox<Vec<u8>>, env: &SealEnvelope) -> Re
     // Interop: AAD MUST be empty (Web Crypto: omit `additionalData`); the GCM tag
     // is 128 bits / 16 bytes (default) and is the trailing 16 bytes of c = ct || tag.
     let pt = cipher
-        .decrypt(Nonce::from_slice(&env.n), Payload { msg: &env.c, aad: b"" })
+        .decrypt(&Nonce::try_from(env.n.as_slice()).map_err(|_| SealError::Crypto)?, Payload { msg: &env.c, aad: b"" })
         .map_err(|_| SealError::Crypto)?;
     Ok(SecretBox::new(Box::new(pt)))
 }
@@ -191,7 +191,7 @@ mod crypto_tests {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
     fn keypair() -> (Vec<u8>, SecretBox<Vec<u8>>) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rsa::rand_core::OsRng;
         let priv_key = RsaPrivateKey::new(&mut rng, 3072).unwrap();
         let pub_der = RsaPublicKey::from(&priv_key).to_public_key_der().unwrap().as_bytes().to_vec();
         let priv_der = priv_key.to_pkcs8_der().unwrap().as_bytes().to_vec();

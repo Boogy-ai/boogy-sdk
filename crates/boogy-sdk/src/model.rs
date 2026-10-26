@@ -330,23 +330,15 @@ impl<'de> serde::Deserialize<'de> for Decimal {
 }
 
 impl schemars::JsonSchema for Decimal {
-    fn schema_name() -> std::string::String {
-        "Decimal".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Decimal".into()
     }
-    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        schemars::schema::SchemaObject {
-            instance_type: Some(schemars::schema::InstanceType::String.into()),
-            format: Some("decimal".to_string()),
-            metadata: Some(std::boxed::Box::new(schemars::schema::Metadata {
-                description: Some(
-                    "Fixed-point decimal, exact to 6 places, as a string (e.g. \"19.990000\")"
-                        .to_string(),
-                ),
-                ..Default::default()
-            })),
-            ..Default::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "format": "decimal",
+            "description": "Fixed-point decimal, exact to 6 places, as a string (e.g. \"19.990000\")",
+        })
     }
 }
 

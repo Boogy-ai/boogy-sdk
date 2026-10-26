@@ -63,7 +63,7 @@ fn try_open_browser(url: &str) {
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 pub async fn run(host: &str) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
 
     // Step 1: obtain device + user code.
     let auth_resp: AuthorizeResponse = client

@@ -5,11 +5,10 @@ edition = "2021"
 
 [dependencies]
 rsa = { version = "0.9", features = ["sha2"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 sha2 = { workspace = true }
-rand = "0.8"
 secrecy = "0.10"
-base64 = "0.22"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = "2"

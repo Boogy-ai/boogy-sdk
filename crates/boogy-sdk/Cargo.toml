@@ -1,6 +1,6 @@
 [package]
 name = "boogy-sdk"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "SDK for building Boogy Wasm components"
 license = "MIT OR Apache-2.0"
@@ -28,8 +28,8 @@ schemars = { workspace = true }
 serde_urlencoded = { workspace = true }
 # Backs `boogy_sdk::ids::IdCodec` — deterministic u64↔opaque-string
 # codec via raw AES-128 single-block cipher. Pure-Rust, wasm-friendly.
-aes = "0.8"
-base64 = "0.22"
+aes = "0.9"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 boogy-sdk-macros = { path = "../boogy-sdk-macros" }
 # Protobuf RPC (Router::grpc / GrpcDispatcher). buffa is the wasm-safe
 # runtime generated message types depend on — never `connectrpc` from a

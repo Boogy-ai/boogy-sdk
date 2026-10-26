@@ -12,8 +12,8 @@ homepage = "https://boogy.ai"
 # these modules before the split.
 thiserror = "2"
 serde_json = { workspace = true }
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
 subtle = "2"
 crc32c = "0.6"
-rand_core = { version = "0.6", features = ["std"] }
+getrandom = "0.4"

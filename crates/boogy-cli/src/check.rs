@@ -119,6 +119,26 @@ pub fn run(root: Option<&str>) -> anyhow::Result<()> {
     // The @boogy/web conventions, whenever the project serves a frontend: the
     // same rules `boogy deploy` runs before uploading and the platform runs at
     // publish.
+    if let (Ok(cargo_toml), Ok(boogy_toml)) =
+        (fs::read_to_string(root.join("Cargo.toml")), fs::read_to_string(root.join("boogy.toml")))
+    {
+        for w in version_warnings(&cargo_toml, &boogy_toml) {
+            println!("  [warn] {w}");
+        }
+    }
+    if let Ok(boogy_toml) = fs::read_to_string(root.join("boogy.toml")) {
+        for e in link_findings(&boogy_toml) {
+            println!("  [FAIL] {e}");
+            fe_errors.push(e);
+        }
+    }
+    if let Ok(cargo_toml) = fs::read_to_string(root.join("Cargo.toml")) {
+        let cargo_lock = fs::read_to_string(root.join("Cargo.lock")).ok();
+        for e in schemars_findings(&cargo_toml, cargo_lock.as_deref()) {
+            println!("  [FAIL] {e}");
+            fe_errors.push(e);
+        }
+    }
     match frontend_report(&root.join("boogy.toml")) {
         Ok(Some(report)) => {
             print_frontend_report(&report);
@@ -191,7 +211,7 @@ pub fn frontend_report(manifest: &Path) -> anyhow::Result<Option<FrontendReport>
         Ok(raw) => raw,
         Err(_) => return Ok(None),
     };
-    let doc: toml::Value = raw.parse().context("parsing boogy.toml")?;
+    let doc: toml::Table = raw.parse().context("parsing boogy.toml")?;
     let Some(fe) = doc.get("frontend") else { return Ok(None) };
     let s = |v: Option<&toml::Value>| v.and_then(|v| v.as_str()).map(str::to_string);
     let root = s(fe.get("root")).context("[frontend] has no `root`")?;
@@ -256,6 +276,98 @@ pub fn print_frontend_report(r: &FrontendReport) {
 /// a warning (the platform serves `.js`); a reference with no matching source of
 /// any of those extensions is an error. The authoritative full-bundle check runs
 /// at publish.
+/// A `schemars` dependency older than 1 in the crate's `Cargo.toml`, named
+/// with the line to change, when the crate's SDK is on schemars 1: the
+/// SDK's `JsonSchema` bound is then schemars 1's trait, a 0.x derive
+/// implements a different one, and the crate does not compile (the compiler
+/// says so in terms of the SDK's internals). A crate pinned to an SDK
+/// revision still on 0.x builds with 0.x and is left alone.
+pub fn schemars_findings(cargo_toml: &str, cargo_lock: Option<&str>) -> Vec<String> {
+    let Ok(doc) = cargo_toml.parse::<toml::Table>() else { return Vec::new() };
+    if sdk_schemars_major(&doc, cargo_lock) != Some(1) {
+        return Vec::new();
+    }
+    let tables = [doc.get("dependencies"), doc.get("workspace").and_then(|w| w.get("dependencies"))];
+    let mut out = Vec::new();
+    for deps in tables.into_iter().flatten() {
+        let req = match deps.get("schemars") {
+            Some(toml::Value::String(v)) => v.as_str(),
+            Some(toml::Value::Table(t)) => match t.get("version") {
+                Some(toml::Value::String(v)) => v.as_str(),
+                _ => continue, // `workspace = true`, a path or a git dependency
+            },
+            _ => continue,
+        };
+        let major = req.trim_start_matches(|c: char| "=^~<> ".contains(c)).split('.').next().unwrap_or("");
+        if major == "0" {
+            out.push(format!(
+                "Cargo.toml: schemars {req} — the Boogy SDK derives JSON schemas with schemars 1, and \
+                 a 0.x derive implements a different `JsonSchema` trait, so this crate does not compile \
+                 against the SDK. Change the line to `schemars = \"1\"`."
+            ));
+        }
+    }
+    out
+}
+
+/// A `[service]` link (`repository`, `homepage`, `documentation`) that the
+/// platform refuses at publish: anything but an http(s) URL with a host
+/// (`boogy_conventions::link_problem`, the rule publish applies).
+pub fn link_findings(boogy_toml: &str) -> Vec<String> {
+    let Ok(doc) = boogy_toml.parse::<toml::Table>() else { return Vec::new() };
+    let Some(service) = doc.get("service").and_then(|s| s.as_table()) else { return Vec::new() };
+    ["repository", "homepage", "documentation"]
+        .into_iter()
+        .filter_map(|field| {
+            let v = service.get(field)?.as_str()?;
+            let why = boogy_conventions::link_problem(v)?;
+            Some(format!("boogy.toml: service.{field}: {why} (got {v:?}); publish refuses it"))
+        })
+        .collect()
+}
+
+/// `Cargo.toml`'s `version` against `boogy.toml`'s `[service] version`.
+/// The platform deploys and serves the manifest's version; the code's own
+/// (`Router::info(…, env!("CARGO_PKG_VERSION"), …)`) drifts from it unless
+/// both are bumped together. A warning: nothing fails to deploy.
+pub fn version_warnings(cargo_toml: &str, boogy_toml: &str) -> Vec<String> {
+    let read = |src: &str, table: &str| -> Option<String> {
+        let doc = src.parse::<toml::Table>().ok()?;
+        doc.get(table)?.get("version")?.as_str().map(str::to_string)
+    };
+    match (read(cargo_toml, "package"), read(boogy_toml, "service")) {
+        (Some(code), Some(deployed)) if code != deployed => vec![format!(
+            "Cargo.toml's version is {code} and boogy.toml's [service] version is {deployed}: \
+             the platform serves {deployed} in openapi.json / openrpc.json, and code that reads \
+             CARGO_PKG_VERSION says {code}. Bump them together."
+        )],
+        _ => Vec::new(),
+    }
+}
+
+/// The major version of the schemars the crate's `boogy-sdk` uses: from the
+/// lock when there is one, else 1 for an SDK that follows the latest (a path,
+/// or git with no `rev`, `tag` or `branch`), else unknown.
+fn sdk_schemars_major(doc: &toml::Table, cargo_lock: Option<&str>) -> Option<u64> {
+    let major = |v: &str| v.split('.').next()?.parse::<u64>().ok();
+    if let Some(lock) = cargo_lock.and_then(|l| l.parse::<toml::Table>().ok()) {
+        let packages = lock.get("package")?.as_array()?;
+        let named = |n: &str| packages.iter().find(|p| p.get("name").and_then(|v| v.as_str()) == Some(n));
+        let sdk = named("boogy-sdk")?;
+        let dep = sdk.get("dependencies")?.as_array()?.iter().filter_map(|d| d.as_str()).find(|d| {
+            *d == "schemars" || d.starts_with("schemars ")
+        })?;
+        return match dep.strip_prefix("schemars ") {
+            Some(v) => major(v.split(' ').next()?),
+            None => major(named("schemars")?.get("version")?.as_str()?),
+        };
+    }
+    let sdk = doc.get("dependencies")?.get("boogy-sdk")?.as_table()?;
+    let follows_latest = sdk.contains_key("path")
+        || (sdk.contains_key("git") && !["rev", "tag", "branch"].iter().any(|k| sdk.contains_key(*k)));
+    follows_latest.then_some(1)
+}
+
 pub fn check_frontend_refs(files: &[(String, String)]) -> (Vec<String>, Vec<String>) {
     use std::collections::BTreeSet;
     // Source file set, normalized: strip a leading "./", index by stem-equivalence
@@ -366,7 +478,7 @@ fn report(findings: &[Finding], scanned: usize, frontend_errors: usize) {
         } else {
             let s = if frontend_errors == 1 { "" } else { "s" };
             println!(
-                "boogy check: {scanned} file(s) scanned —                  {frontend_errors} frontend issue{s} above, no Rust issues."
+                "boogy check: {scanned} file(s) scanned — {frontend_errors} frontend or manifest issue{s} above, no Rust issues."
             );
         }
         return;
@@ -377,7 +489,7 @@ fn report(findings: &[Finding], scanned: usize, frontend_errors: usize) {
         println!("boogy check: {total} issue(s) across {scanned} file(s)\n");
     } else {
         println!(
-            "boogy check: {total} issue(s) across {scanned} file(s)              ({frontend_errors} frontend, listed above)\n"
+            "boogy check: {total} issue(s) across {scanned} file(s) ({frontend_errors} frontend or manifest, listed above)\n"
         );
     }
     for (id, title) in ORDER {
@@ -433,6 +545,79 @@ mod fe_tests {
                 "ORDER names `{id}`, which the lint engine never emits — a group \
                  that can never render is a claim the check exists",
             );
+        }
+    }
+
+    #[test]
+    fn a_service_link_that_publish_refuses_is_named() {
+        let found = link_findings("[service]\nid = \"x\"\nhomepage = \"javascript:alert(1)\"\nrepository = \"https://github.com/x/y\"\n");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("service.homepage") && found[0].contains("http"), "{}", found[0]);
+        assert!(link_findings("[service]\nid = \"x\"\ndocumentation = \"https://docs.example.com\"\n").is_empty());
+        assert!(link_findings("not toml [").is_empty());
+    }
+
+    #[test]
+    fn a_cargo_version_unlike_the_manifests_is_a_warning() {
+        let boogy = "[service]\nid = \"rooms\"\nversion = \"0.9.5\"\n";
+        let found = version_warnings("[package]\nname = \"rooms\"\nversion = \"0.4.2\"\n", boogy);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("0.4.2") && found[0].contains("0.9.5"), "names both: {}", found[0]);
+        for cargo in [
+            "[package]\nname = \"rooms\"\nversion = \"0.9.5\"\n",
+            "[package]\nname = \"rooms\"\nversion.workspace = true\n",
+            "[workspace]\nmembers = []\n",
+        ] {
+            assert!(version_warnings(cargo, boogy).is_empty(), "{cargo}");
+        }
+        assert!(version_warnings("[package]\nversion = \"0.4.2\"\n", "[service]\nid = \"x\"\n").is_empty());
+    }
+
+    /// A lock whose `boogy-sdk` depends on schemars `sdk`.
+    fn lock_with_sdk_on(sdk: &str) -> String {
+        format!(
+            "[[package]]\nname = \"boogy-sdk\"\nversion = \"0.1.0\"\ndependencies = [\"schemars\"]\n\n\
+             [[package]]\nname = \"schemars\"\nversion = \"{sdk}\"\n"
+        )
+    }
+
+    /// Only an SDK on schemars 1 makes a 0.x pin wrong: a crate pinned to an
+    /// older SDK revision builds with the schemars that revision uses.
+    #[test]
+    fn a_schemars_0_pin_is_named_only_against_an_sdk_on_schemars_1() {
+        let pinned = "[dependencies]\nboogy-sdk = { git = \"https://example.com/sdk\", rev = \"abc\" }\nschemars = \"0.8\"\n";
+        assert!(schemars_findings(pinned, Some(&lock_with_sdk_on("0.8.22"))).is_empty(), "an older SDK, as locked");
+        assert_eq!(schemars_findings(pinned, Some(&lock_with_sdk_on("1.2.3"))).len(), 1, "a current SDK, as locked");
+        assert!(schemars_findings(pinned, None).is_empty(), "no lock and a pinned SDK: unknown, so not named");
+        let tracking = "[dependencies]\nboogy-sdk = { git = \"https://example.com/sdk\" }\nschemars = \"0.8\"\n";
+        assert_eq!(schemars_findings(tracking, None).len(), 1, "no lock, the SDK's latest: on schemars 1");
+        let two = "[[package]]\nname = \"boogy-sdk\"\nversion = \"0.1.0\"\ndependencies = [\"schemars 1.2.3\"]\n\n\
+                   [[package]]\nname = \"schemars\"\nversion = \"0.8.22\"\n\n\
+                   [[package]]\nname = \"schemars\"\nversion = \"1.2.3\"\n";
+        assert_eq!(schemars_findings(pinned, Some(two)).len(), 1, "a lock holding both reads the SDK's own");
+    }
+
+    #[test]
+    fn a_schemars_older_than_1_is_named_with_the_line_to_change() {
+        for (manifest, old) in [
+            ("[dependencies]\nschemars = \"0.8\"\n", "0.8"),
+            ("[dependencies]\nschemars = { version = \"0.8.22\", features = [\"derive\"] }\n", "0.8.22"),
+            ("[dependencies]\nschemars = \"=0.8\"\n", "=0.8"),
+            ("[workspace.dependencies]\nschemars = \"^0.9\"\n", "^0.9"),
+        ] {
+            let found = schemars_findings(manifest, Some(&lock_with_sdk_on("1.2.3")));
+            assert_eq!(found.len(), 1, "{manifest}: {found:?}");
+            assert!(found[0].contains(&format!("schemars {old}")), "{}", found[0]);
+            assert!(found[0].contains("schemars = \"1\""), "names the line to change: {}", found[0]);
+        }
+        for manifest in [
+            "[dependencies]\nschemars = \"1\"\n",
+            "[dependencies]\nschemars = { version = \"1.2\", features = [\"derive\"] }\n",
+            "[dependencies]\nschemars = { workspace = true }\n",
+            "[dependencies]\nserde = \"1\"\n",
+            "not toml at all [",
+        ] {
+            assert!(schemars_findings(manifest, Some(&lock_with_sdk_on("1.2.3"))).is_empty(), "{manifest}");
         }
     }
 
@@ -571,7 +756,7 @@ mod fe_tests {
 /// reporting on the wrong thing.
 fn routing_path(root: &std::path::Path) -> Option<String> {
     let raw = fs::read_to_string(root.join("boogy.toml")).ok()?;
-    let doc: toml::Value = raw.parse().ok()?;
+    let doc: toml::Table = raw.parse().ok()?;
     doc.get("routing")?.get("path")?.as_str().map(str::to_string)
 }
 
@@ -590,6 +775,17 @@ mod frontend_rules_tests {
     }
 
     const MAIN: &str = "import { installFoundation, connectPane } from '@boogy/web';\ninstallFoundation();\nconnectPane({ service: 'x' });";
+
+    /// The key-route lint reads the manifest's `[routing] path`, and a
+    /// manifest it cannot read makes it abstain (`None`), so a manifest
+    /// that parses must give the path, or the lint goes quiet unnoticed.
+    #[test]
+    fn routing_path_reads_the_manifests_routing_path() {
+        let dir = project(&[("boogy.toml", "[service]\nid = \"x\"\n[routing]\npath = \"/api\"\n")]);
+        assert_eq!(routing_path(dir.path()).as_deref(), Some("/api"));
+        let none = project(&[("boogy.toml", "not = toml = at all")]);
+        assert_eq!(routing_path(none.path()), None, "a malformed manifest abstains");
+    }
 
     #[test]
     fn a_source_build_is_checked_from_its_root_with_its_manifest_facts() {

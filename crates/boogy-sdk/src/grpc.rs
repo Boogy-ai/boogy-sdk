@@ -513,6 +513,7 @@ impl GrpcDispatcher {
         let Some((_, handler)) = self.methods.iter().find(|(m, _)| *m == name) else {
             return finish(Vec::new(), self.status_for_missing_method(&name));
         };
+        crate::route_report::report(crate::route_report::RouteKind::Grpc, None, &format!("{}/{name}", self.service));
 
         // Owned copy: `handler` needs `&mut req` below, which would
         // otherwise conflict with a borrow of `req.body()` still live.

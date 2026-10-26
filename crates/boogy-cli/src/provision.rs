@@ -197,7 +197,7 @@ fn module_name_version(manifest_content: &str) -> Result<(String, String)> {
 /// reported. Hits the owner-scoped `DELETE /v1/modules/{name}/{version}`.
 async fn delete_module_version(host: &str, token: &str, name: &str, version: &str) -> Result<()> {
     let url = format!("{host}/v1/modules/{name}/{version}");
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .delete(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -319,7 +319,7 @@ pub async fn publish(
         form = form.text("provision", "true");
     }
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .post(format!("{host}/v1/modules"))
         .header("Authorization", format!("Bearer {token}"))
@@ -454,7 +454,7 @@ pub async fn provision(
     println!("  Module: {module}");
     println!("  Service: {service_id}");
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .post(format!("{host}/v1/services"))
         .header("Authorization", format!("Bearer {token}"))
@@ -602,7 +602,7 @@ pub async fn upgrade(host: &str, token: &str, service_id: &str, to: &str, overri
         Some(p) => Some(std::fs::read_to_string(p).context("failed to read overrides file")?),
         None => None,
     };
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     match client
         .get(format!("{host}/v1/registry/provisioned/{service_id}/update"))
         .query(&[("to", to)])
