@@ -230,6 +230,13 @@ pub enum ColumnAction {
     /// no value for it. Clearing the tombstone alone would leave those rows
     /// resolving a required column against nothing.
     Revive { column: String, default: Option<Val> },
+    /// Declared with a format the stored column does not have yet —
+    /// `declare-column-format`. Only ever an ADDITION: the stored values are
+    /// already what the format describes (a `Decimal` field written before
+    /// formats existed stored the same minor units), so only how the platform
+    /// shows them changes. Removing or changing a format is a
+    /// [`ColumnAction::Conflict`].
+    SetFormat { column: String, format: String },
     /// A change `add-column`/`set-default` cannot express, or a stored column
     /// that is undeclared AND required — so the table refuses every write.
     /// `reason` is developer-facing prose.
@@ -257,6 +264,7 @@ impl ColumnAction {
             ColumnAction::Rename { to, .. } => to,
             ColumnAction::SoftDrop(n) => n,
             ColumnAction::Revive { column, .. } => column,
+            ColumnAction::SetFormat { column, .. } => column,
             ColumnAction::Conflict { column, .. } => column,
             ColumnAction::Warn { column, .. } => column,
         }
@@ -289,6 +297,9 @@ pub fn plan_column_reconcile(
     // Actual-column names already accounted for by a rename or a compare arm,
     // so the leftover pass below doesn't also treat them as orphans.
     let mut consumed: Vec<&str> = Vec::new();
+    // Format additions for columns compared in place, appended after the rest
+    // (see the compare arm).
+    let mut formats_after: Vec<(String, String)> = Vec::new();
 
     for d in desired {
         // A rename claims the OLD name, so it must be resolved before the
@@ -296,9 +307,18 @@ pub fn plan_column_reconcile(
         // column look like an orphan and the new one look like an add, which
         // is exactly the data-losing misread this function exists to prevent.
         if let Some(old) = d.renamed_from.as_deref() {
-            if actual.iter().any(|a| a.name == old) && !actual.iter().any(|a| a.name == d.name) {
-                out.push(ColumnAction::Rename { from: old.to_string(), to: d.name.clone() });
+            if let Some(a_old) = actual.iter().find(|a| a.name == old).filter(|_| !actual.iter().any(|a| a.name == d.name)) {
                 consumed.push(old);
+                // The rename carries the stored format, so the renamed column
+                // is held to the same rule as one compared in place.
+                if let Some(reason) = format_conflict(d, a_old) {
+                    out.push(ColumnAction::Conflict { column: d.name.clone(), reason });
+                    continue;
+                }
+                out.push(ColumnAction::Rename { from: old.to_string(), to: d.name.clone() });
+                if let Some(format) = format_to_add(d, a_old) {
+                    out.push(ColumnAction::SetFormat { column: d.name.clone(), format });
+                }
                 continue;
             }
         }
@@ -324,9 +344,17 @@ pub fn plan_column_reconcile(
             }
             Some(a) => {
                 consumed.push(a.name.as_str());
-                if let Some(reason) = shape_conflict(d, a) {
+                if let Some(reason) = shape_conflict(d, a).or_else(|| format_conflict(d, a)) {
                     out.push(ColumnAction::Conflict { column: d.name.clone(), reason });
-                } else if a.dropped {
+                    continue;
+                }
+                if let Some(format) = format_to_add(d, a) {
+                    // Appended after every other action, so the stable sort
+                    // keeps it after this column's `Revive`:
+                    // `declare-column-format` refuses a column that is not live.
+                    formats_after.push((d.name.clone(), format));
+                }
+                if a.dropped {
                     // Would the revive have to synthesise a value? The same
                     // question the `Add` arm asks, and it has the same two
                     // answers — including the same refusal. A foreign key is the
@@ -373,6 +401,7 @@ pub fn plan_column_reconcile(
             }
         }
     }
+    out.extend(formats_after.into_iter().map(|(column, format)| ColumnAction::SetFormat { column, format }));
 
     for a in actual {
         if a.dropped || consumed.contains(&a.name.as_str()) {
@@ -413,6 +442,44 @@ pub fn plan_column_reconcile(
     out.sort_by(|x, y| x.column_name().cmp(y.column_name()));
     out
 }
+
+// claimlock:begin column-format-rule
+/// A declared format the stored column cannot take: a different one, or none
+/// where the store has one. A format describes the values already stored, so
+/// it is never changed in place; the one move allowed is adding a format to a
+/// column that has none (see [`format_to_add`]).
+fn format_conflict(d: &ColDef, a: &ColumnInfo) -> Option<String> {
+    match (d.format.as_deref(), a.format.as_deref()) {
+        (Some(want), Some(have)) if want != have => Some(format!(
+            "the model shows `{}` as {want} and the store holds it as {have}. A \
+             column's format is never changed in place, because every stored value \
+             was written under {have}. Restore the field's type, or add a NEW field \
+             with the format you want, deploy, copy the values across in a \
+             migration, and remove this one with `dropped(\"{}\")`.",
+            d.name, d.name
+        )),
+        (None, Some(have)) => Some(format!(
+            "the store holds `{}` as {have} (it was declared from a `Decimal` \
+             field) and the model declares it without a format. Its stored values \
+             are minor units, so reading them as plain integers would scale every \
+             one. Restore the `Decimal` field, or add a NEW field of the type you \
+             want, deploy, copy the values across in a migration, and remove this \
+             one with `dropped(\"{}\")`.",
+            d.name, d.name
+        )),
+        _ => None,
+    }
+}
+
+/// The format to declare on a stored column that has none yet, when the model
+/// declares one.
+fn format_to_add(d: &ColDef, a: &ColumnInfo) -> Option<String> {
+    match (&d.format, &a.format) {
+        (Some(want), None) => Some(want.clone()),
+        _ => None,
+    }
+}
+// claimlock:end column-format-rule
 
 /// The refusal the `Add` and `Revive` arms share.
 ///
@@ -856,14 +923,14 @@ mod tests {
         ColDef {
             name: name.into(), col_type: ty, nullable, unique: false,
             references: None, counter: false, counter_max: false,
-            default: None, renamed_from: None,
+            default: None, renamed_from: None, format: None,
         }
     }
     fn info(name: &str, ty: CT, nullable: bool) -> ColumnInfo {
         ColumnInfo {
             name: name.into(), col_type: ty, nullable, unique: false,
             counter: false, counter_max: false, dropped: false, dropped_at: None,
-            has_references: false, default: None,
+            has_references: false, default: None, format: None,
         }
     }
 
@@ -872,6 +939,90 @@ mod tests {
         let d = vec![col("a", CT::Text, true)];
         assert!(matches!(plan_column_reconcile(&d, &[], &[]).as_slice(),
             [ColumnAction::Add(c)] if c.name == "a"));
+    }
+
+    fn dec(mut c: ColDef) -> ColDef {
+        c.format = Some("decimal(6)".into());
+        c
+    }
+    fn dec_info(mut a: ColumnInfo, f: &str) -> ColumnInfo {
+        a.format = Some(f.into());
+        a
+    }
+
+    #[test]
+    fn a_new_decimal_column_is_added_with_its_format() {
+        let d = vec![dec(col("total", CT::Integer, true))];
+        assert!(matches!(plan_column_reconcile(&d, &[], &[]).as_slice(),
+            [ColumnAction::Add(c)] if c.format.as_deref() == Some("decimal(6)")));
+    }
+
+    /// A `Decimal` field deployed before formats existed: the stored column
+    /// has none, and the next resolution adds it.
+    #[test]
+    fn a_format_is_added_to_a_column_that_has_none() {
+        let d = vec![dec(col("total", CT::Integer, true))];
+        let a = vec![info("total", CT::Integer, true)];
+        assert_eq!(plan_column_reconcile(&d, &a, &[]),
+            vec![ColumnAction::SetFormat { column: "total".into(), format: "decimal(6)".into() }]);
+    }
+
+    #[test]
+    fn a_column_already_in_its_format_plans_nothing() {
+        let d = vec![dec(col("total", CT::Integer, true))];
+        let a = vec![dec_info(info("total", CT::Integer, true), "decimal(6)")];
+        assert!(plan_column_reconcile(&d, &a, &[]).is_empty());
+    }
+
+    /// The field changed from `Decimal` to `i64`: every stored value would read
+    /// a million times too large.
+    #[test]
+    fn removing_a_format_is_a_conflict() {
+        let d = vec![col("total", CT::Integer, true)];
+        let a = vec![dec_info(info("total", CT::Integer, true), "decimal(6)")];
+        assert!(matches!(plan_column_reconcile(&d, &a, &[]).as_slice(),
+            [ColumnAction::Conflict { column, reason }] if column == "total" && reason.contains("Decimal")));
+    }
+
+    #[test]
+    fn changing_a_format_is_a_conflict() {
+        let d = vec![dec(col("total", CT::Integer, true))];
+        let a = vec![dec_info(info("total", CT::Integer, true), "decimal(2)")];
+        assert!(matches!(plan_column_reconcile(&d, &a, &[]).as_slice(),
+            [ColumnAction::Conflict { column, reason }] if column == "total" && reason.contains("never changed in place")));
+    }
+
+    /// A rename carries the stored format, and is held to the same rule.
+    #[test]
+    fn a_rename_keeps_the_format_and_the_rule() {
+        let mut d = dec(col("amount", CT::Integer, true));
+        d.renamed_from = Some("total".into());
+        let kept = vec![dec_info(info("total", CT::Integer, true), "decimal(6)")];
+        assert_eq!(plan_column_reconcile(&[d.clone()], &kept, &[]),
+            vec![ColumnAction::Rename { from: "total".into(), to: "amount".into() }]);
+        let none = vec![info("total", CT::Integer, true)];
+        assert_eq!(plan_column_reconcile(&[d.clone()], &none, &[]), vec![
+            ColumnAction::Rename { from: "total".into(), to: "amount".into() },
+            ColumnAction::SetFormat { column: "amount".into(), format: "decimal(6)".into() },
+        ]);
+        d.format = None;
+        assert!(matches!(plan_column_reconcile(&[d], &kept, &[]).as_slice(),
+            [ColumnAction::Conflict { column, .. }] if column == "amount"));
+    }
+
+    /// A soft-dropped column keeps its format; a revive adds one it lacked
+    /// only after the column is live again.
+    #[test]
+    fn a_revived_column_gets_its_format_after_the_revive() {
+        let d = vec![dec(col("total", CT::Integer, true))];
+        let mut a = info("total", CT::Integer, true);
+        a.dropped = true;
+        assert_eq!(plan_column_reconcile(&d, &[a.clone()], &[]), vec![
+            ColumnAction::Revive { column: "total".into(), default: None },
+            ColumnAction::SetFormat { column: "total".into(), format: "decimal(6)".into() },
+        ]);
+        assert_eq!(plan_column_reconcile(&d, &[dec_info(a, "decimal(6)")], &[]),
+            vec![ColumnAction::Revive { column: "total".into(), default: None }]);
     }
 
     #[test]

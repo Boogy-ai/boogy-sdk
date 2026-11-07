@@ -72,7 +72,7 @@ fn check_or_store_pin(fingerprint: &str) -> Result<()> {
 }
 
 /// Fetch + validate the host's public seal key. Returns the DER bytes.
-async fn fetch_seal_key(host: &str) -> Result<Vec<u8>> {
+pub(crate) async fn fetch_seal_key(host: &str) -> Result<Vec<u8>> {
     let client = crate::http::client();
     let resp = client
         .get(format!("{host}/v1/seal-pubkey"))

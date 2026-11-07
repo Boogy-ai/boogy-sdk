@@ -27,6 +27,12 @@ pub trait Field: Sized {
     fn nullable() -> bool {
         false
     }
+    /// How the platform shows the column, beside its type: `Some("decimal(6)")`
+    /// for [`Decimal`], so the platform's views of the data (the console's
+    /// rows, the schema read) show `65.20` rather than the stored `65200000`.
+    /// Declared once, when the schema is resolved; what this service reads is
+    /// unaffected. Only `Decimal` (and `Option<Decimal>`) sets one.
+    const FORMAT: Option<&'static str> = None;
     /// Encode for writes.
     fn to_val(&self) -> Val;
     /// Decode for reads. Infallible — a missing/`Null`/malformed value
@@ -68,6 +74,7 @@ impl Field for f64 {
 impl<T: Field> Field for Option<T> {
     fn col_type() -> ColType { T::col_type() }
     fn nullable() -> bool { true }
+    const FORMAT: Option<&'static str> = T::FORMAT;
     fn to_val(&self) -> Val {
         match self {
             Some(t) => t.to_val(),
@@ -342,11 +349,15 @@ impl schemars::JsonSchema for Decimal {
     }
 }
 
+// claimlock:begin decimal-format
 impl Field for Decimal {
     fn col_type() -> ColType { ColType::Integer }
+    /// Six places: [`Decimal::SCALE`] is 10^6.
+    const FORMAT: Option<&'static str> = Some("decimal(6)");
     fn to_val(&self) -> Val { Val::Integer(self.minor) }
     fn from_val(v: &Val) -> Self { Decimal { minor: v.as_int() } }
 }
+// claimlock:end decimal-format
 
 /// A unix-millis timestamp stored as an integer column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -624,6 +635,7 @@ pub fn col_def_for_accum<T: Field>(
         counter_max,
         default,
         renamed_from: None,
+        format: T::FORMAT.map(str::to_string),
     }
 }
 
@@ -631,6 +643,17 @@ pub fn col_def_for_accum<T: Field>(
 mod tests {
     use super::*;
     use crate::store::ColType;
+
+    /// A `Decimal` field's column declares `decimal(6)`, through `Option` too;
+    /// no other field type declares a format.
+    #[test]
+    fn only_a_decimal_column_declares_a_format() {
+        assert_eq!(col_def_for::<Decimal>("t", false, false, None).format.as_deref(), Some("decimal(6)"));
+        assert_eq!(col_def_for::<Option<Decimal>>("t", false, false, None).format.as_deref(), Some("decimal(6)"));
+        assert_eq!(col_def_for::<i64>("t", false, false, None).format, None);
+        assert_eq!(col_def_for::<Timestamp>("t", false, false, None).format, None);
+        assert_eq!(Decimal::SCALE, 10i64.pow(6), "the format's scale is the type's");
+    }
 
     #[test]
     fn primitive_roundtrips() {

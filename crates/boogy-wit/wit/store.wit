@@ -749,6 +749,27 @@ interface store {
     revive-column: func(table: string, name: string, default: option<value>) -> result<_, store-error>;
     list-columns: func(table: string) -> result<list<column-info>, store-error>;
 
+    /// Declare how the platform shows a column: its logical format, beside its
+    /// type. Shown in the platform's views of the data (the rows a console
+    /// browses, the schema read), never in what the service itself reads.
+    ///
+    /// One format exists: `decimal(<scale>)`, scale 0 to 18, on an `integer`
+    /// column holding minor units (the value is `stored / 10^scale`). It is a
+    /// string so that a later format changes no type here.
+    ///
+    /// Refused: an unknown or malformed format, or one for another column type
+    /// (`invalid-argument`); a column that is not live (`not-found`); a column
+    /// that already shows in another format (`conflict`), because a format is
+    /// never changed in place: the stored values were written under it.
+    /// Declaring the format a column already has is a no-op. A rename keeps the
+    /// format, and so does a soft drop.
+    declare-column-format: func(table: string, column: string, format: string) -> result<_, store-error>;
+
+    /// Each column of `table` that has a declared format, with that format,
+    /// soft-dropped columns included. What a schema pass compares a model's
+    /// declaration against.
+    list-column-formats: func(table: string) -> result<list<tuple<string, string>>, store-error>;
+
     // -- Raw SQL (parameterized) --
     execute: func(sql: string, params: list<value>) -> result<u64, store-error>;
     query: func(sql: string, params: list<value>) -> result<list<row>, store-error>;

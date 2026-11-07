@@ -62,6 +62,7 @@ pub mod json;
 pub mod model;
 pub mod log;
 pub mod mcp;
+pub mod outbound;
 pub mod pagination;
 pub mod peer;
 pub mod pricing;

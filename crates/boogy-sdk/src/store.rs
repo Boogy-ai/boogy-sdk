@@ -392,6 +392,12 @@ pub struct ColDef {
     /// `schema_resolve::plan_column_reconcile` and does not appear in
     /// `column-def`.
     pub renamed_from: Option<String>,
+    /// How the platform shows the column (`decimal(6)`), from
+    /// [`Field::FORMAT`](crate::model::Field::FORMAT). Declared to the store
+    /// with `declare-column-format` once the column exists, not in
+    /// `column-def`, and part of what the schema pass reconciles: a format is
+    /// added to a column that has none, and never removed or changed.
+    pub format: Option<String>,
 }
 
 /// Index definition for a table.
@@ -735,37 +741,37 @@ impl Table {
     }
 
     pub fn text(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None, format: None });
         self
     }
 
     pub fn integer(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None, format: None });
         self
     }
 
     pub fn real(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Real, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Real, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None, format: None });
         self
     }
 
     pub fn boolean(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Boolean, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Boolean, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None, format: None });
         self
     }
 
     pub fn blob(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Blob, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Blob, nullable: false, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None, format: None });
         self
     }
 
     pub fn nullable_text(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Text, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None, format: None });
         self
     }
 
     pub fn nullable_integer(mut self, col: &str) -> Self {
-        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None });
+        self.columns.push(ColDef { name: col.to_string(), col_type: ColType::Integer, nullable: true, unique: false, references: None, counter: false, counter_max: false, default: None, renamed_from: None, format: None });
         self
     }
 
@@ -1067,6 +1073,9 @@ pub struct ColumnInfo {
     pub dropped_at: Option<i64>,
     pub has_references: bool,
     pub default: Option<Val>,
+    /// How the platform shows the column, if a format was declared for it
+    /// (`list-column-formats`; `column-info` carries none).
+    pub format: Option<String>,
 }
 
 impl ColumnInfo {
@@ -1098,6 +1107,7 @@ impl ColumnInfo {
             counter_max: self.counter_max,
             default: self.default.clone(),
             renamed_from: None,
+            format: self.format.clone(),
         }
     }
 }

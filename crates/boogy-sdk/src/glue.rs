@@ -160,6 +160,13 @@ macro_rules! wit_glue {
         #[allow(unused_imports)]
         use $bindings::boogy::platform::pricing as pricing_bindings;
 
+        /// The SDK's log hook, registered on every entry point (HTTP and job)
+        /// so `log::info!` and friends reach the host's `runtime::log`.
+        #[doc(hidden)]
+        fn __sdk_runtime_log(level: &str, msg: &str) {
+            $bindings::boogy::platform::runtime::log(&level.to_string(), &msg.to_string());
+        }
+
         #[doc(hidden)]
         fn __sdk_report_units(
             unit: &str,
@@ -435,6 +442,23 @@ macro_rules! wit_glue {
                             );
                         }
                     });
+                // claimlock:begin new-table-declares-formats
+                // `column-def` carries no format, so a new table's are declared
+                // now that its columns exist. Identical on a concurrent create,
+                // so only a real refusal is recorded (and refuses the deploy).
+                for c in table.columns.iter() {
+                    if let ::core::option::Option::Some(f) = c.format.as_deref() {
+                        if let ::core::result::Result::Err(e) =
+                            $bindings::boogy::platform::store::declare_column_format(&table.name, &c.name, f)
+                        {
+                            let msg = ::std::string::String::from(e);
+                            if !msg.contains("not granted") {
+                                __boogy_note_schema_conflict(::std::format!("{}.{}: {}", &table.name, &c.name, msg));
+                            }
+                        }
+                    }
+                }
+                // claimlock:end new-table-declares-formats
             } else {
                 __boogy_reconcile_columns(table, &__resolved);
             }
@@ -587,7 +611,8 @@ macro_rules! wit_glue {
                     | CA::SetDefault { .. }
                     | CA::Rename { .. }
                     | CA::SoftDrop(_)
-                    | CA::Revive { .. } => {}
+                    | CA::Revive { .. }
+                    | CA::SetFormat { .. } => {}
                 }
             }
             if __conflicted || __earlier_table_conflicted {
@@ -606,8 +631,20 @@ macro_rules! wit_glue {
                         if r.is_ok() {
                             __boogy_warn_if_indexed(&table.name, &c.name, resolved);
                         }
-                        r
+                        // claimlock:begin reconcile-declares-formats
+                        // `column-def` carries no format, so a new column's is
+                        // declared once the column exists.
+                        match (r, c.format.as_deref()) {
+                            (::core::result::Result::Ok(()), ::core::option::Option::Some(f)) =>
+                                $bindings::boogy::platform::store::declare_column_format(&table.name, &c.name, f)
+                                    .map_err(::std::string::String::from),
+                            (r, _) => r,
+                        }
                     }
+                    CA::SetFormat { column, format } =>
+                        $bindings::boogy::platform::store::declare_column_format(&table.name, column, format)
+                            .map_err(::std::string::String::from),
+                        // claimlock:end reconcile-declares-formats
                     CA::SetDefault { column, value } => {
                         // `add-column` on a column whose name, type and
                         // nullability already match replaces the default in
@@ -701,6 +738,11 @@ macro_rules! wit_glue {
                 // match "is not a dropped column", which means the name is
                 // absent entirely: that is a real conflict, not convergence.
                 CA::Revive { .. } => msg.contains("not dropped"),
+                // NOTHING: declaring the format a column already has is Ok, so
+                // a concurrent host's identical declaration never fails here.
+                // What does is a column already shown another way, which is the
+                // conflict this action must never swallow.
+                CA::SetFormat { .. } => false,
                 // Never reached: both reporting arms return Ok.
                 CA::Conflict { .. } | CA::Warn { .. } => false,
             }
@@ -1039,6 +1081,9 @@ macro_rules! wit_glue {
                 dropped_at,
                 has_references,
                 default: default.as_ref().map(__boogy_wit_to_val),
+                // `column-info` has no format field (a new record field would
+                // stop deployed guests type-checking); `list_columns` fills it.
+                format: ::core::option::Option::None,
             }
         }
 
@@ -1054,7 +1099,15 @@ macro_rules! wit_glue {
             table: &str,
         ) -> ::core::result::Result<::std::vec::Vec<$crate::store::ColumnInfo>, ::std::string::String> {
             let wit_cols = $bindings::boogy::platform::store::list_columns(table)?;
-            Ok(wit_cols.into_iter().map(__boogy_to_sdk_column_info).collect())
+            let formats = $bindings::boogy::platform::store::list_column_formats(table)?;
+            Ok(wit_cols
+                .into_iter()
+                .map(__boogy_to_sdk_column_info)
+                .map(|mut c| {
+                    c.format = formats.iter().find(|(n, _)| *n == c.name).map(|(_, f)| f.clone());
+                    c
+                })
+                .collect())
         }
 
         /// List the current indexes on a table, returning [`IndexInfo`] for
@@ -6210,12 +6263,6 @@ macro_rules! wit_glue {
             fn handle(
                 req: $bindings::exports::boogy::platform::http_handler::HttpRequest,
             ) -> $bindings::exports::boogy::platform::http_handler::HttpResponse {
-                fn __sdk_runtime_log(level: &str, msg: &str) {
-                    $bindings::boogy::platform::runtime::log(
-                        &level.to_string(),
-                        &msg.to_string(),
-                    );
-                }
                 $crate::log::_register_runtime_log(__sdk_runtime_log);
                 $crate::pricing::_register_report_units(__sdk_report_units);
                 $crate::route_report::_register_report_route(__sdk_report_route);
@@ -6371,6 +6418,9 @@ macro_rules! wit_glue {
                 ::std::vec::Vec<u8>,
                 $bindings::exports::boogy::platform::job_handler::HandlerError,
             > {
+                // A job runs in a fresh store, so it inherits no registration
+                // from a request: without this, `log::info!` in a job is dropped.
+                $crate::log::_register_runtime_log(__sdk_runtime_log);
                 $crate::pricing::_register_report_units(__sdk_report_units);
 
                 // Same per-request state setup as the HTTP path so identity-scoped

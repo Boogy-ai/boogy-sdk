@@ -10,6 +10,7 @@ mod manage;
 mod new;
 mod provision;
 mod secret;
+mod signing;
 mod skills;
 mod smoke;
 
@@ -166,6 +167,11 @@ enum Commands {
         #[command(subcommand)]
         action: SecretAction,
     },
+    /// Bring your own signing key to a service (sealed before it leaves this machine)
+    Signing {
+        #[command(subcommand)]
+        action: SigningAction,
+    },
     /// Vendor the Boogy skills into this project (flat into .claude/skills/)
     /// so coding agents pick them up automatically
     Skills {
@@ -204,6 +210,29 @@ enum SecretAction {
         service: String,
         /// Secret name
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SigningAction {
+    /// Import a private signing key from a file (an Apple .p8 works as downloaded)
+    Import {
+        /// Service id the key is for
+        service: String,
+        /// Label the service signs with
+        label: String,
+        /// Key algorithm: ecdsa-p256, ed25519 or ecdsa-secp256k1
+        #[arg(long)]
+        alg: String,
+        /// File holding the private key: PEM (PKCS#8 or SEC1), DER, or a raw
+        /// 32-byte key. File only, so the key never lands in shell history.
+        #[arg(long)]
+        key_file: std::path::PathBuf,
+    },
+    /// List a service's signing keys (label, algorithm, public key)
+    List {
+        /// Service id
+        service: String,
     },
 }
 
@@ -326,6 +355,16 @@ async fn main() -> anyhow::Result<()> {
             SecretAction::Rm { service, name } => {
                 let token = resolve_token(&cli.token)?;
                 secret::rm(&cli.host, &token, &service, &name).await?
+            }
+        },
+        Commands::Signing { action } => match action {
+            SigningAction::Import { service, label, alg, key_file } => {
+                let token = resolve_token(&cli.token)?;
+                signing::import(&cli.host, &token, &service, &label, &alg, &key_file).await?
+            }
+            SigningAction::List { service } => {
+                let token = resolve_token(&cli.token)?;
+                signing::list(&cli.host, &token, &service).await?
             }
         },
         Commands::Skills { action } => match action {

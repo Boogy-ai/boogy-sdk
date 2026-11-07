@@ -9,6 +9,7 @@ members = [
     "crates/boogy-sdk",
     "crates/boogy-cli",
     "crates/boogy-seal",
+    "crates/boogy-stripe-sig",
     "crates/boogy-proto-build",
     "smoke",
 ]

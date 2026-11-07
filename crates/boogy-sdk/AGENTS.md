@@ -81,9 +81,9 @@ Two worlds available in `wit_bindgen::generate!`:
 
 ### Cargo.toml conventions
 
-Example crates use `[lib] crate-type = ["cdylib"]` — wasm component output only. **Do not add `rlib`** to a wasm-target lib: `wit_bindgen::generate!` emits wasm-component-only symbols (e.g. `boogy:platform/http-handler@0.1.0#handle`) that don't host-link, and `cargo test --workspace` fails at link time when cargo tries to build the rlib variant for the host triple.
+Example crates use `[lib] crate-type = ["cdylib"]` (some add `"rlib"` so a sibling can depend on them). Either way the crate's own `#[cfg(test)]` tests build and run on the host (`cargo test -p <crate> --lib`): off wasm, `wit_bindgen::generate!` emits a stub for every platform import that panics when called. So a pure function in the crate can be tested where it is, but a handler, a guard or anything that reaches a platform call cannot, and request/param types are host-constructed, so no test can build one.
 
-**Convention for host-testable pure logic:** extract it into a sibling `*-core` crate that has no `wit_bindgen` / `boogy-sdk` deps. The wasm crate depends on the core crate; tests live on the core crate where `cargo test --workspace` runs them cleanly.
+**Convention for host-testable pure logic:** extract it into a sibling `*-core` crate that has no `wit_bindgen` / `boogy-sdk` deps. The wasm crate depends on the core crate; tests live on the core crate, where nothing can reach a panicking platform stub.
 
 ```
 crates/examples/myapp/         # cdylib only; depends on myapp-core

@@ -23,6 +23,8 @@ anyhow = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "query", "rustls-no-provider", "http2", "charset", "system-proxy"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 boogy-seal = { path = "../boogy-seal" }
+# The imported signing key is wiped from memory once it is sealed.
+zeroize = "1"
 boogy-conventions = { path = "../boogy-conventions" }
 boogy-web-sdk-conventions = { path = "../boogy-web-sdk-conventions" }
 base64 = { version = "0.23", default-features = false, features = ["std"] }

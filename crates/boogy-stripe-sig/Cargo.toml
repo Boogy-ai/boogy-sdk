@@ -1,0 +1,9 @@
+[package]
+name = "boogy-stripe-sig"
+version = "0.1.0"
+edition = "2021"
+description = "Parser for the Stripe-Signature webhook header: timestamp, replay tolerance, and every v1 signature."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Boogy-ai/boogy-sdk"
+
+[dependencies]

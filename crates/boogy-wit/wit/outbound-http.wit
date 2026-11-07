@@ -31,11 +31,17 @@ interface outbound-http {
         /// accepted; other schemes return `invalid-url`. URL length
         /// is hard-capped at 8 KiB.
         url: string,
-        /// Headers to attach. Reserved headers (authorization,
-        /// cookie, x-boogy-caller, x-boogy-workload,
-        /// x-boogy-request-id, host) are stripped. Header names
-        /// and values are validated against HTTP token / value rules;
-        /// CRLF in either is rejected.
+        /// Headers to attach, sent as written. `cookie`, `host` and every
+        /// `x-boogy-*` name are the platform's and refuse the request (nothing
+        /// is sent). `authorization` (a token the component made itself, for
+        /// instance a JWT signed with `signing`) goes out as written, unless the
+        /// platform injects one on this request (`secret-headers` names it, or
+        /// `connection-auth` is set): then the request is refused rather than
+        /// one value replacing the other. The same holds for any header a
+        /// `secret-headers` entry names. A refusal is `request-too-large` with
+        /// `"header-refused: <header>: <reason>"`. Header names and values are
+        /// validated against HTTP token / value rules; CRLF in either is
+        /// rejected.
         headers: list<tuple<string, string>>,
         /// Optional request body. Capped at the manifest's
         /// `max_request_bytes`; over-cap returns
@@ -110,7 +116,14 @@ interface outbound-http {
         rate-limited,
         /// Request body, header set, or URL exceeded the manifest's
         /// `max_request_bytes` / hard URL length / hard header
-        /// total. The string identifies which limit was hit.
+        /// total, or a header broke the platform's header rule (see
+        /// `outbound-request.headers`). The string identifies which: a header
+        /// refusal is `"header-refused: <header>: <reason>"`, a stable format
+        /// (the SDK's `outbound::header_refused` parses it). Known limitation:
+        /// a header refusal has no arm of its own because adding a case to
+        /// this variant would stop every deployed component's import from
+        /// type-checking; a versioned `outbound-http` with a dedicated arm is
+        /// the remedy.
         request-too-large(string),
         /// Caller referenced a secret name not declared in the
         /// manifest's `[secrets]` block, or the named secret has no

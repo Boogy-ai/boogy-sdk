@@ -126,7 +126,7 @@ paid growth above it, and a ceiling your operator can raise. Check it with
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `memory_mb` | u32 | `32` | Per-request Wasm linear memory cap in MiB. |
+| `memory_mb` | u32 | `32` | Per-request Wasm linear memory cap in MiB. The platform sets a maximum (64 MiB on the hosted platform); a manifest above it is refused at deploy with a 400 naming the cap. |
 | `timeout_ms` | u64 | `5000` | Legacy wall-clock timeout in ms. |
 | `cpu_deadline_ms` | u64 | `30000` | Per-request wall-clock budget `B_req` in ms. The scheduler uses this as the slot-holding ceiling. Epoch deadline traps a CPU-bound guest; an outer timeout returns HTTP 504. Range: 1–600000. |
 
